@@ -1,6 +1,7 @@
 # Publish only application and runtime/install files. Keep project records local.
 /*
 !/.gitignore
+!/README.md
 !/.dockerignore
 !/.env.example
 !/Dockerfile
