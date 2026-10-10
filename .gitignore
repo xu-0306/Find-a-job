@@ -1,4 +1,4 @@
-# Publish only application and runtime/install files. Keep project records local.
+# Publish reviewed runtime, development and CI files. Keep project records local.
 /*
 !/.gitignore
 !/README.md
@@ -10,10 +10,57 @@
 !/requirements.lock
 !/setup.cmd
 !/start.cmd
+!/dev.cmd
 !/app/
 !/scripts/
 /scripts/*
 !/scripts/setup.ps1
+!/scripts/dev.py
+!/scripts/check.py
+
+# Reviewed, synthetic offline checks only; keep local probes and reports private.
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/ci.yml
+!/tests/
+/tests/*
+!/tests/test_dev.py
+!/tests/test_accounts_isolation.py
+!/tests/test_chat_edit.py
+!/tests/test_chat_files.py
+!/tests/test_chat_retry.py
+!/tests/test_conversations.py
+!/tests/test_m1.py
+!/tests/test_m2_cards.js
+!/tests/test_m2_chat_sse.js
+!/tests/test_m2_chat.py
+!/tests/test_m2_job_normalize.py
+!/tests/test_m2_llm_wire.py
+!/tests/test_m2_review_parse.py
+!/tests/test_m2_reviews.py
+!/tests/test_m2_source_chat.py
+!/tests/test_m2_source518.py
+!/tests/test_m2_sources.py
+!/tests/test_m3_admin.js
+!/tests/test_m3_backup_verify.py
+!/tests/test_m3_common.js
+!/tests/test_m3_daily.py
+!/tests/test_m3_home.js
+!/tests/test_m3_integration.py
+!/tests/test_m3_maintenance.py
+!/tests/test_m3_push_transport.py
+!/tests/test_m3_sprite_validation.py
+!/tests/test_m3_sprite.js
+!/tests/test_m3_sw.js
+!/tests/test_m4_deployment.py
+!/tests/test_ports.py
+!/tests/test_resume_chat.py
+!/tests/test_search_workspace.py
+!/tests/test_sharing.py
+!/tests/test_start_restart.py
+!/tests/test_web.py
 
 # Never publish generated data or credentials, even under an allowed directory.
 __pycache__/
