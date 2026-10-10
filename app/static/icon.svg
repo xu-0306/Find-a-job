@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title>薄荷小屋</title>
+  <rect width="128" height="128" rx="28" fill="#F6F3E8"/>
+  <path d="M20 59 64 24l44 35v42a7 7 0 0 1-7 7H27a7 7 0 0 1-7-7Z" fill="#E3F0E8" stroke="#3F7465" stroke-width="6" stroke-linejoin="round"/>
+  <path d="m16 61 48-39 48 39" fill="none" stroke="#3F7465" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M52 108V77h24v31M37 69h10M81 69h10" fill="none" stroke="#3F7465" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="42" cy="69" r="3" fill="#3F7465"/><circle cx="86" cy="69" r="3" fill="#3F7465"/>
+</svg>

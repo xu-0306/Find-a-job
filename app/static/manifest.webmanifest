@@ -1,0 +1,18 @@
+{
+  "name": "找工作小幫手",
+  "short_name": "求職小幫手",
+  "lang": "zh-Hant",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#3F7465",
+  "background_color": "#F6F3E8",
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

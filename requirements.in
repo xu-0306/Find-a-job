@@ -1,0 +1,10 @@
+# Application, same-process 104 MCP, and offline TestClient checks.
+fastapi
+uvicorn
+httpx
+job104-mcp==0.1.8
+APScheduler>=3.11,<4
+Pillow
+pypdf==6.19.0
+tzdata
+pywebpush==2.5.0

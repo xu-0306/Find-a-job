@@ -1,0 +1,31 @@
+# Publish only application and runtime/install files. Keep project records local.
+/*
+!/.gitignore
+!/.dockerignore
+!/.env.example
+!/Dockerfile
+!/compose.yaml
+!/requirements.in
+!/requirements.lock
+!/setup.cmd
+!/start.cmd
+!/app/
+!/scripts/
+/scripts/*
+!/scripts/setup.ps1
+
+# Never publish generated data or credentials, even under an allowed directory.
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!/.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.pfx
+*.p12
+*.log

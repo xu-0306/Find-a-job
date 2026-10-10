@@ -1,0 +1,20 @@
+name: job-companion
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: job-companion:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8041:8000"
+    environment:
+      JOB_COMPANION_DATA: /app/data
+      JOB_COMPANION_PUBLIC_ORIGIN: ${JOB_COMPANION_PUBLIC_ORIGIN:?Set an explicit HTTPS public IP:port origin}
+      JOB_COMPANION_LOCAL_PEERS: ${JOB_COMPANION_LOCAL_PEERS:-}
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
