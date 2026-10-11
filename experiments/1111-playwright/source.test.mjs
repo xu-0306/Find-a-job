@@ -4,7 +4,20 @@ import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
 import { runSource, resolveArea } from './source.mjs';
 let browser;
-before(async () => { browser = await chromium.launch(); });
+before(async () => {
+  browser = await chromium.launch();
+  // Initialize Chinese text/layout before the bounded checks; browser.close cleans up this page.
+  const readyPage = await browser.newPage();
+  await readyPage.goto('about:blank', { waitUntil: 'load', timeout: 30000 });
+  await readyPage.setContent('<h1>採購：合成測試職缺</h1>', { waitUntil: 'load', timeout: 30000 });
+  await readyPage.waitForFunction(() => {
+    const heading = document.querySelector('h1');
+    return document.readyState === 'complete' && document.fonts.status === 'loaded'
+      && heading.innerText === '採購：合成測試職缺'
+      && heading.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+      && heading.getBoundingClientRect().width > 0;
+  }, null, { timeout: 30000 });
+}, { timeout: 30000 });
 after(async () => { await browser?.close(); });
 const catalogue = [
   { code: 100100, level: 2, name: '台北市' }, { code: 100101, level: 3, parentCode: 100100, name: '中正區' },

@@ -10,7 +10,20 @@ assert.ok(['playwright', 'patchright'].includes(driverName), 'unknown PROBE_DRIV
 const { chromium } = await import(driverName);
 
 let browser;
-before(async () => { browser = await chromium.launch(driverName === 'patchright' ? { channel: 'chrome' } : {}); });
+before(async () => {
+  browser = await chromium.launch(driverName === 'patchright' ? { channel: 'chrome' } : {});
+  // Initialize Chinese text/layout before the bounded checks; browser.close cleans up this page.
+  const readyPage = await browser.newPage();
+  await readyPage.goto('about:blank', { waitUntil: 'load', timeout: 30000 });
+  await readyPage.setContent('<h1>採購：合成測試職缺</h1>', { waitUntil: 'load', timeout: 30000 });
+  await readyPage.waitForFunction(() => {
+    const heading = document.querySelector('h1');
+    return document.readyState === 'complete' && document.fonts.status === 'loaded'
+      && heading.innerText === '採購：合成測試職缺'
+      && heading.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+      && heading.getBoundingClientRect().width > 0;
+  }, null, { timeout: 30000 });
+}, { timeout: 30000 });
 after(async () => { await browser?.close(); });
 
 // Synthetic DOM based on observed anchors, headings and pagination; never visits the live site.
