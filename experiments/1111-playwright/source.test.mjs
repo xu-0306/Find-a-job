@@ -35,7 +35,8 @@ async function fixture(input, options = {}) {
     const detail = `<h1>${options.wrongTitle ? '另一職缺' : '測試職缺 501'}</h1><a href="/corp/123">測試公司</a><h2>工作內容</h2><h3>職缺描述</h3><p>合成職缺說明，負責資料整理。</p><h3>工作待遇</h3><p>測試薪資</p>`;
     return route.fulfill({ contentType: 'text/html; charset=utf-8', body: options.blocked ? '<title>Loading...</title><body></body>' : url.pathname === '/search/job' ? search : detail });
   });
-  const result = await runSource(wrapper, input, 400);
+  // DOM correctness must not depend on sub-second CI browser startup.
+  const result = await runSource(wrapper, input, 5000);
   assert.equal(closed, true);
   return { result, requests };
 }

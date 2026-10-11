@@ -86,7 +86,8 @@ async function fixtureRun(options = {}) {
     return route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
   });
   try {
-    const report = await runProbe(context, { keyword: '採購', outputDir, timeoutMs: 800, pauseMs: 0, runtime: { driver: driverName, browserVersion: browser.version() } });
+    // Allow cold CI browsers; the dedicated stalled-read test verifies the short deadline.
+    const report = await runProbe(context, { keyword: '採購', outputDir, timeoutMs: 5000, pauseMs: 0, runtime: { driver: driverName, browserVersion: browser.version() } });
     assert.deepEqual(JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8')), report);
     if (existingPage) assert.equal(existingPage.isClosed(), true, 'the existing page must be used and closed');
     return { report, requests };
