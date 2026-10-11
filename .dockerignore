@@ -6,6 +6,8 @@
 .worktree-ports.json
 .github
 dev.cmd
+experiments
+experiments/**
 __pycache__
 **/__pycache__
 *.py[cod]

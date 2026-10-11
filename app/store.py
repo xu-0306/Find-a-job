@@ -35,7 +35,7 @@ class Criteria(Input):
 
 
 class Job(Input):
-    source: Literal["104", "518"]
+    source: Literal["104", "518", "1111"]
     source_job_id: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=500)
     company_name: str = Field(min_length=1, max_length=500)
@@ -59,12 +59,12 @@ class Job(Input):
 
 
 class Store:
-    def __init__(self, directory=None, *, target_version=6):
+    def __init__(self, directory=None, *, target_version=7):
         self.path = Path(directory or os.environ.get("JOB_COMPANION_DATA", "data")) / "app.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if target_version not in (4, 5, 6) or version not in range(target_version + 1):
+            if target_version not in (4, 5, 6, 7) or version not in range(target_version + 1):
                 raise RuntimeError("資料庫版本不支援；請使用相容程式，勿覆蓋資料。")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
@@ -164,7 +164,7 @@ class Store:
                     COMMIT;
                 """)
 
-            if version < 6 and target_version == 6:
+            if version < 6 and target_version >= 6:
                 # Accounts: every existing row belongs to the built-in 'default' (owner) account.
                 db.executescript("""
                     BEGIN IMMEDIATE;
@@ -207,6 +207,30 @@ class Store:
                     ALTER TABLE daily_jobs_v6 RENAME TO daily_jobs;
                     PRAGMA user_version = 6;
                     COMMIT;
+                """)
+
+            if version < 7 and target_version >= 7:
+                # Rebuild only the two finite source checks; preserve IDs and referencing rows.
+                db.executescript("""
+                    PRAGMA foreign_keys = OFF;
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE jobs_v7(
+                        id TEXT PRIMARY KEY, source TEXT NOT NULL CHECK(source IN ('104','518','1111')),
+                        source_job_id TEXT NOT NULL, payload_json TEXT NOT NULL, fetched_at TEXT NOT NULL,
+                        UNIQUE(source,source_job_id));
+                    INSERT INTO jobs_v7 SELECT * FROM jobs;
+                    DROP TABLE jobs;
+                    ALTER TABLE jobs_v7 RENAME TO jobs;
+                    CREATE TABLE preference_baselines_v7(
+                        preference_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+                        source TEXT NOT NULL CHECK(source IN ('104','518','1111')), completed_at TEXT NOT NULL,
+                        PRIMARY KEY(preference_id,revision,source));
+                    INSERT INTO preference_baselines_v7 SELECT * FROM preference_baselines;
+                    DROP TABLE preference_baselines;
+                    ALTER TABLE preference_baselines_v7 RENAME TO preference_baselines;
+                    PRAGMA user_version = 7;
+                    COMMIT;
+                    PRAGMA foreign_keys = ON;
                 """)
 
     @contextmanager

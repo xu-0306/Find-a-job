@@ -105,7 +105,7 @@ class ConversationChecks(unittest.TestCase):
         backup=backups.create_backup(self.store)
         with self.store.connect() as db: schema=backups.schema_catalog(db)
         with tempfile.TemporaryDirectory() as directory:
-            validate_backup(self.store.path.parent/'backups'/(backup['id']+'.zip'),Path(directory),{6:schema})
+            validate_backup(self.store.path.parent/'backups'/(backup['id']+'.zip'),Path(directory),{7:schema})
             backups.restore_backup(self.store,directory)
         self.assertEqual(len(self.store.messages(conversation_id=ident)['items']),2)
 
@@ -121,11 +121,11 @@ class ConversationChecks(unittest.TestCase):
             with upgraded.connect() as db:
                 after=[tuple(row) for row in db.execute('SELECT rowid,id,request_id,role,content_json,created_at FROM messages')]
                 self.assertEqual(before,after)
-                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
-                schema6=backups.schema_catalog(db)
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
+                schema7=backups.schema_catalog(db)
             self.assertEqual(upgraded.messages(conversation_id='legacy')['items'][0]['content']['text'],'保留的舊訊息')
             stage=Path(directory)/'stage';stage.mkdir()
-            validate_backup(source.path.parent/'backups'/(old_backup['id']+'.zip'),stage,{4:schema4,6:schema6})
+            validate_backup(source.path.parent/'backups'/(old_backup['id']+'.zip'),stage,{4:schema4,7:schema7})
             Store(stage)
             backups.restore_backup(upgraded,stage)
             self.assertEqual(upgraded.messages(conversation_id='legacy')['items'][0]['id'],'original')
@@ -133,5 +133,5 @@ class ConversationChecks(unittest.TestCase):
             archive=(source.path.parent/'backups'/(old_backup['id']+'.zip')).read_bytes()
             result=self.client.post('/api/admin/restore',data={'confirm':'true'},files={'file':('old.zip',archive,'application/zip')},headers={'X-CSRF-Token':security.csrf(self.admin_token)})
             self.assertEqual(result.status_code,200,result.text)
-            with self.store.connect() as db: self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
+            with self.store.connect() as db: self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
             self.assertEqual(self.store.messages(conversation_id='legacy')['items'][0]['id'],'original')

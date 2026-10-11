@@ -13,23 +13,25 @@ from pydantic import Field, StrictInt
 
 from .job_normalize import normalize_jobs
 from .source518 import parse_search_response, parse_detail_response
+from .source1111 import Browser1111, BrowserError, search_rows, job_url, company_id
 from .store import Criteria, Input, Job
 
 
 def enabled_sources(services):
-    """104 is always on; 518 follows the admin switch, and a missing value means on."""
-    return ['104', '518'] if services.get('source_518_enabled') is not False else ['104']
+    """104 is always on; 518 defaults on and experimental 1111 defaults off."""
+    return (['104'] + (['518'] if services.get('source_518_enabled') is not False else [])
+            + (['1111'] if services.get('source_1111_enabled') is True else []))
 
 
 class SearchInput(Input):
     criteria: Criteria
-    sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=2,
-        description='可選 104、518。104 涵蓋各類職缺，專業技術職通常只需 104；518 以基層、服務業為主。518 可能被使用者在後台停用，停用時只會查 104。')
+    sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=3,
+        description='可選 104、518、1111。1111 為實驗來源，預設停用；需後台啟用及 Node、Chrome 和實驗依賴，可因人機驗證受阻。104 涵蓋各類職缺，專業技術職通常只需 104；518 以基層、服務業為主。停用的來源不會查詢；未指定來源時依後台開關選擇。')
     limit: StrictInt = Field(default=20, ge=1, le=20)
     search_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     def model_post_init(self, context):
-        if any(x not in ('104', '518') for x in self.sources) or len(set(self.sources)) != len(self.sources):
+        if any(x not in ('104', '518', '1111') for x in self.sources) or len(set(self.sources)) != len(self.sources):
             raise ValueError('來源不符或重複')
 
 
@@ -215,7 +217,7 @@ def _load_continuation(arguments, continuation):
     if state.get('criteria') != _criteria_state(arguments):
         _cursor_error('續查條件已變更，請從新搜尋開始。')
     saved_sources = state.get('sources')
-    # A continuation may query fewer sources than were saved (518 disabled later), never a source it lacks state for.
+    # A continuation may query fewer sources than were saved (a source disabled later), never a source it lacks state for.
     if not isinstance(saved_sources, dict) or not set(arguments.sources) <= set(saved_sources):
         _cursor_error('續查來源已變更，請從新搜尋開始。')
     request_page_size = _page_size(arguments)
@@ -290,10 +292,11 @@ def _valid_518_cursor(url, page, keyword, areas, reference_url=None):
 
 
 class Sources:
-    def __init__(self, transport=None, mcp_call=None, interval=1):
+    def __init__(self, transport=None, mcp_call=None, interval=1, browser1111=None):
         self.transport, self.mcp_call, self.interval = transport, mcp_call, interval
         self.locks, self.last = {}, {}
         self.regions518 = None
+        self.browser1111 = browser1111 or Browser1111()
 
     async def request(self, method, url, *, host=None, max_retries=1, **kwargs):
         if type(max_retries) is not int or max_retries < 0:
@@ -511,7 +514,7 @@ class Sources:
                         diagnostic['quota_limited'] = True
                         break
                     page = page_state['next_page']
-                    page_cursor = str(page) if source == '104' else page_state['next_url']
+                    page_cursor = str(page) if source in ('104', '1111') else page_state['next_url']
                     if page_cursor in page_state['visited']:
                         warning('來源下一頁位置重複，已停止續查以避免重複請求。')
                         reliable = False
@@ -557,6 +560,24 @@ class Sources:
                         page_state['next_page'] = page + 1
                         page_state['next_url'] = None
                         page_state['has_next'] = payload.get('has_next') is True
+                    elif source == '1111':
+                        try:
+                            payload = await self.browser1111.call(dict(action='search', keyword=keyword, area_names=names, page=page))
+                            page_rows = search_rows(payload, page)
+                        except BrowserError as exc:
+                            raise SourceError(exc.status, exc.message) from None
+                        diagnostic['total_declared'] = payload['total']
+                        page_state['total_declared'] = payload['total']
+                        for limitation in payload.get('warnings', []):
+                            warning(limitation)
+                        page_state['next_page'] = page + 1
+                        page_state['next_url'] = None
+                        page_state['has_next'] = payload['has_next']
+                        if page >= 5 and page_state['has_next']:
+                            page_state['has_next'] = False
+                            diagnostic['truncated'] = True
+                            reliable = False
+                            warning('1111 實驗來源最多查五頁，仍可能有更多職缺，請調整條件或至來源網站查看。')
                     else:
                         response = await self.request('GET', page_state['next_url'], headers={'Referer': 'https://www.518.com.tw/'})
                         parsed = parse_search_response(response.status_code, response.text)
@@ -734,6 +755,32 @@ class Sources:
             has_content = any(detail.get(key) for key in ('summary', 'title', 'company_name', 'location', 'salary_text'))
             return dict(job_id=job.source_job_id, status='success' if has_content else 'failed',
                         identity_verified=verified, detail=detail, limitations=limits)
+        if job.source == '1111':
+            if not job_url(url, job.source_job_id) or not job.company_source_id:
+                raise SourceError('unsupported', '1111 職缺缺少可靠的公司識別資料，未請求詳細頁。')
+            try:
+                payload = await self.browser1111.call(dict(action='detail', job=dict(
+                    id=job.source_job_id, title=job.title, company=job.company_name, url=url,
+                    companyUrl=f'https://www.1111.com.tw/corp/{job.company_source_id}/')))
+            except BrowserError as exc:
+                raise SourceError(exc.status, exc.message) from None
+            detail = payload.get('detail')
+            if not isinstance(detail, dict):
+                raise SourceError('unsupported', '1111 詳細頁格式無法辨識。')
+            title, company = clean(detail.get('title')), clean(detail.get('company'))
+            text = clean(detail.get('description'))
+            links = detail.get('companyLinks', detail.get('companyUrls', []))
+            verified = (detail.get('id') == job.source_job_id and job_url(detail.get('url'), job.source_job_id)
+                        and title == job.title and company == job.company_name and isinstance(links, list)
+                        and any(company_id(link) == job.company_source_id for link in links))
+            limitations = [] if verified else ['1111 詳細頁職缺或公司識別與已保存職缺不符，未覆蓋已保存職缺。']
+            if text and len(text) > 20000:
+                text = text[:20000]
+                limitations.append('詳細內容較長，僅顯示前20000字。')
+            return dict(job_id=job.source_job_id, status='success' if text else 'failed', identity_verified=bool(verified and text),
+                        detail=dict(source_job_id=job.source_job_id, summary=text, title=title, company_name=company,
+                                    location=None, salary_text=None,
+                                    identity_evidence=dict(job_no=detail.get('id'), url=detail.get('url'))), limitations=limitations)
         if not safe_url(url, 'www.518.com.tw', f'/job-{job.source_job_id}.html'):
             raise SourceError('blocked')
         response = await self.request('GET', url)

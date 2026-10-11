@@ -1,4 +1,4 @@
-"""Normalize structured 104 and 518 rows into the shared :class:`Job` model."""
+"""Normalize structured 104, 518 and 1111 rows into the shared :class:`Job` model."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from .store import Job
 
 
-_SOURCES = {"104", "518"}
+_SOURCES = {"104", "518", "1111"}
 _MISSING = object()
 _HIGHLIGHTS = re.compile(r"\[\[\[(.*?)\]\]\]", re.DOTALL)
 _SPACE = re.compile(r"\s+")
@@ -196,7 +196,7 @@ def _source_fields(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
 def normalize_job(source: str, raw: Mapping[str, Any]) -> Job | None:
     """Convert one structured source row to ``Job``; return ``None`` for ads."""
     if source not in _SOURCES:
-        raise ValueError("source must be 104 or 518")
+        raise ValueError("source must be 104, 518 or 1111")
     if not isinstance(raw, Mapping):
         raise ValueError("job row must be an object")
 
@@ -241,7 +241,7 @@ def normalize_job(source: str, raw: Mapping[str, Any]) -> Job | None:
 def normalize_jobs(source: str, rows: Iterable[Mapping[str, Any]]) -> tuple[list[Job], list[str]]:
     """Normalize rows, remove source/ID duplicates, and return distinct warnings."""
     if source not in _SOURCES:
-        raise ValueError("source must be 104 or 518")
+        raise ValueError("source must be 104, 518 or 1111")
     if isinstance(rows, (str, bytes)):
         raise ValueError("job rows must be iterable objects")
     try:

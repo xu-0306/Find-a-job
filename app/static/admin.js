@@ -691,8 +691,23 @@ action($("#refresh-backups"), async () => {
 });
 formAction($("#restore-form"), submitRestore);
 action($("#search-test"), testSearchConnection);
+async function copyAccess() {
+  const input = $("#access-link");
+  const link = input.value;
+  if (!link) return;
+  try {
+    await navigator.clipboard.writeText(link);
+    if (input.value === link) $("#access-copy-status").textContent = "已複製完整連結。";
+  } catch (_) {
+    if (input.value !== link) return;
+    input.focus(); input.select();
+    $("#access-copy-status").textContent = "未能自動複製，已選取連結；請按 Ctrl+C，或長按文字複製。";
+  }
+}
 function hideAccess() {
   $("#access-link").value = "";
+  $("#copy-access").disabled = true;
+  $("#access-copy-status").textContent = "";
   $("#open-access").removeAttribute("href");
   $("#access-owner").textContent = "";
   $("#access-result").hidden = true;
@@ -744,6 +759,8 @@ async function loadUsers() {
 function showAccess(result, username, created) {
   const link = new URL(result.access_path, result.access_origin || window.location.origin).href;
   $("#access-link").value = link; $("#open-access").href = link;
+  $("#copy-access").disabled = !link;
+  $("#access-copy-status").textContent = "";
   $("#access-owner").textContent = `「${username}」的專屬連結`;
   $("#access-result").hidden = false;
   const funnelReady = sharingSnapshot?.state === "ready" && Boolean(sharingSnapshot.origin);
@@ -804,6 +821,10 @@ function signedOut() {
   $("#llm-status").textContent = "";
   $("#search-engine-name").textContent = ""; $("#search-status").textContent = "";
 }
+function setSourceSwitch(button, enabled) {
+  button.setAttribute("aria-checked", String(enabled));
+  button.textContent = enabled ? "開啟" : "關閉";
+}
 async function loadSettings() {
   const settings = await api("/api/admin/settings");
   const form = $("#services");
@@ -812,7 +833,8 @@ async function loadSettings() {
   form.elements.vapid_subject.value = settings.vapid_subject || "";
   form.elements.search_provider.value = settings.search_provider || "";
   form.elements.admin_local_only.checked = Boolean(settings.admin_local_only);
-  form.elements.source_518_enabled.checked = Boolean(settings.source_518_enabled);
+  setSourceSwitch(form.elements.source_518_enabled, settings.source_518_enabled !== false);
+  setSourceSwitch(form.elements.source_1111_enabled, settings.source_1111_enabled === true);
   for (const key of secretKeys) {
     form.elements[key].value = ""; form.elements[`clear_${key}`].checked = false;
     $(`[data-status=${key}]`).textContent = settings[key].configured ? "已設定 ••••••••" : "尚未設定";
@@ -861,13 +883,22 @@ action($("#logout"), async () => {
   await api("/api/admin/logout", {method: "POST"}); signedOut();
   await loginContext(); message("已登出。");
 });
+for (const name of ["source_518_enabled", "source_1111_enabled"]) {
+  const button = $("#services").elements[name];
+  button.addEventListener("click", () => setSourceSwitch(button, button.getAttribute("aria-checked") !== "true"));
+}
+$("#services").addEventListener("reset", () => {
+  setSourceSwitch($("#services").elements.source_518_enabled, true);
+  setSourceSwitch($("#services").elements.source_1111_enabled, false);
+});
 formAction($("#services"), async () => {
   const form = $("#services");
   const vapid_subject = form.elements.vapid_subject.value.trim();
   if (!validVapidSubject(vapid_subject)) throw new Error("VAPID 聯絡 URI 必須是 mailto 有效 email 或 HTTPS URL。");
   const values = {llm_base_url: form.elements.llm_base_url.value.trim(), llm_model: form.elements.llm_model.value.trim(),
     llm_protocol: form.elements.llm_protocol.value, admin_local_only: form.elements.admin_local_only.checked,
-    source_518_enabled: form.elements.source_518_enabled.checked, vapid_subject,
+    source_518_enabled: form.elements.source_518_enabled.getAttribute("aria-checked") === "true",
+    source_1111_enabled: form.elements.source_1111_enabled.getAttribute("aria-checked") === "true", vapid_subject,
     search_provider: form.elements.search_provider.value || null,
     clear_secrets: secretKeys.filter(key => form.elements[`clear_${key}`].checked)};
   for (const key of secretKeys) values[key] = form.elements[key].value;
@@ -918,6 +949,7 @@ formAction($("#user-form"), async () => {
   showAccess(result, result.username, true);
   await loadUsers();
 });
+$("#copy-access").addEventListener("click", copyAccess);
 $("#hide-access").addEventListener("click", hideAccess);
 window.addEventListener("pagehide", () => {
   invalidateSharing();

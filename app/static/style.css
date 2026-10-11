@@ -4,6 +4,12 @@
 @media(max-width:600px){.bar{padding:16px}h1{font-size:21px}main{padding:0 16px 32px;margin:16px auto}.card{padding:18px}.grid,.compare{grid-template-columns:1fr}.wide{grid-column:auto}.row{gap:8px}}
 dialog{max-width:min(480px,calc(100% - 32px));border:1px solid var(--line);border-radius:20px;padding:24px;background:var(--surface);color:var(--text)}dialog::backdrop{background:rgb(25 35 30 / .45)}
 #user-confirm-text{overflow-wrap:anywhere}
+.source-setting .row{flex-wrap:nowrap;justify-content:space-between}.source-setting .hint{margin-bottom:0}
+.source-switch{position:relative;flex-shrink:0;min-width:100px;padding-left:52px;padding-right:12px}
+.source-switch::before,.source-switch::after{content:"";position:absolute;top:50%;transform:translateY(-50%);border-radius:999px}
+.source-switch::before{left:12px;width:32px;height:20px;background:var(--muted)}
+.source-switch::after{left:15px;width:14px;height:14px;background:var(--surface)}
+.source-switch[aria-checked=true]::before{background:var(--primary)}.source-switch[aria-checked=true]::after{left:27px}
 #chat-list:empty::before{content:"今天想聊些什麼？不用急，慢慢來。";color:var(--muted)}.chat-text{white-space:pre-wrap;overflow-wrap:anywhere}
 .sprite-preview{display:block;max-width:100%;height:auto;image-rendering:pixelated}summary{cursor:pointer;min-height:44px;padding:8px 0}
 .companion{flex-shrink:0;image-rendering:pixelated}.backup-link{overflow-wrap:anywhere}

@@ -27,7 +27,7 @@ MAX_MANIFEST_BYTES = 64 * 1024
 MAX_SPRITE_BYTES = 5 * 1024**2
 MAX_SPRITES = 5
 MAX_COMPRESSION_RATIO = 1000
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _PNG_SUFFIX = ".png"
 _RE_HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _SUPPORTED_COMPRESSION = {
@@ -260,7 +260,7 @@ def _parse_manifest(data: bytes) -> tuple[int, list[dict[str, object]]]:
         _fail("manifest.json 欄位不符。")
     if type(parsed["format_version"]) is not int or parsed["format_version"] != 1:
         _fail("備份格式版本不支援。")
-    if type(parsed["schema_version"]) is not int or parsed["schema_version"] not in (4, 5, SCHEMA_VERSION):
+    if type(parsed["schema_version"]) is not int or parsed["schema_version"] not in (4, 5, 6, SCHEMA_VERSION):
         _fail("備份資料庫版本不符。")
     descriptors = parsed["files"]
     if not isinstance(descriptors, list):

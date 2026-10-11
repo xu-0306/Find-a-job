@@ -232,21 +232,17 @@ function accountsHarness() {
     addEventListener(type, handler) { assert.equal(type, "close"); this.closeHandlers.push(handler); }};
   for (const [selector, value] of [["#user-list", list], ["#user-confirm", dialog], ["#user-confirm-title", {textContent: ""}],
     ["#user-confirm-text", {textContent: ""}], ["#user-confirm-ok", {textContent: ""}],
-    ["#access-link", {value: "old-link"}], ["#access-owner", {textContent: ""}],
+    ["#access-link", {value: "old-link", focus() { this.focused = true; }, select() { this.selected = true; }}],
+    ["#copy-access", {disabled: true, events: {}, addEventListener(type, handler) { this.events[type] = handler; }}],
+    ["#access-owner", {textContent: ""}], ["#access-copy-status", {textContent: ""}],
     ["#open-access", {href: "old-link", removeAttribute() { delete this.href; }}], ["#access-result", {hidden: false}],
     ["#user-form", {}]]) {
     harness.elements.set(selector, value);
   }
   harness.context.window.location = {origin: "http://localhost:8041"};
-  harness.context.hideAccess = () => {
-    harness.elements.get("#access-link").value = "";
-    harness.elements.get("#open-access").removeAttribute("href");
-    harness.elements.get("#access-owner").textContent = "";
-    harness.elements.get("#access-result").hidden = true;
-  };
   let submitCreate;
   harness.context.formAction = (form, handler) => { submitCreate = handler; };
-  const begin = script.indexOf("// --- accounts ---");
+  const begin = script.indexOf("async function copyAccess()");
   const finish = script.indexOf("// --- end accounts ---", begin);
   assert.ok(begin >= 0 && finish > begin);
   vm.runInContext(script.slice(begin, finish), harness.context, {filename: "admin.js#accounts"});
@@ -291,6 +287,65 @@ async function testAccessLinkOriginAndLocalWarning() {
     assert.equal(harness.state.messages.at(-1).text.includes("僅供本機使用"), !origin);
     assert.deepEqual(calls.map(call => call[0]), ["/api/admin/users/default/access/reset", "/api/admin/users"]);
   }
+}
+
+async function testAccessLinkCopyAndClear() {
+  const {harness} = accountsHarness();
+  const input = harness.elements.get("#access-link");
+  const button = harness.elements.get("#copy-access");
+  const status = harness.elements.get("#access-copy-status");
+  const copied = [];
+  harness.context.navigator = {clipboard: {async writeText(value) { copied.push(value); }}};
+  harness.context.hideAccess();
+  assert.equal(button.disabled, true);
+  await button.events.click();
+  assert.equal(copied.length, 0, "empty links cannot be copied");
+  for (const [origin, path] of [
+    [null, "/access?token=synthetic-local-copy"],
+    ["https://another.example.invalid:8443", "/access?token=synthetic-reset-copy&extra=encoded%2Bvalue"],
+  ]) {
+    harness.context.showAccess({access_path: path, access_origin: origin}, "owner", false);
+    assert.equal(button.disabled, false);
+    assert.equal(status.textContent, "", "new links clear prior copy feedback");
+    const message = harness.state.messages.at(-1);
+    await button.events.click();
+    assert.equal(copied.at(-1), (origin || "http://localhost:8041") + path, "copy uses the complete current generated URL");
+    assert.match(status.textContent, /已複製完整連結/);
+    assert.equal(harness.state.messages.at(-1), message, "copy feedback preserves existing sharing guidance");
+    assert.equal(harness.elements.get("#access-result").hidden, false);
+  }
+  const current = input.value;
+  for (const clipboard of [undefined, {async writeText() { throw new Error("permission denied"); }}]) {
+    harness.context.navigator.clipboard = clipboard;
+    input.focused = input.selected = false;
+    await button.events.click();
+    assert.ok(input.focused && input.selected, "failure selects the current link for manual copying");
+    assert.match(status.textContent, /未能自動複製.*Ctrl\+C/);
+    assert.equal(input.value, current, "failed copying must preserve the link");
+    assert.equal(button.disabled, false);
+  }
+  for (const denied of [false, true]) {
+    let finish;
+    harness.context.navigator.clipboard = {writeText: () => new Promise((resolve, reject) => {
+      finish = () => denied ? reject(new Error("permission denied")) : resolve();
+    })};
+    const pending = button.events.click();
+    harness.context.hideAccess();
+    input.focused = input.selected = false;
+    const messages = harness.state.messages.length;
+    finish(); await pending;
+    assert.equal(input.value, "");
+    assert.equal(status.textContent, "", "cleared links ignore late clipboard feedback");
+    assert.equal(button.disabled, true);
+    assert.equal(harness.elements.get("#open-access").href, undefined);
+    assert.equal(harness.elements.get("#access-result").hidden, true);
+    assert.equal(harness.state.messages.length, messages, "cleared links ignore late clipboard replies");
+    assert.ok(!input.focused && !input.selected);
+    harness.context.showAccess({access_path: "/access?token=synthetic-next-copy"}, "owner", false);
+  }
+  assert.equal(harness.state.fetches.length + harness.state.apiCalls.length, 0, "copy actions remain local");
+  assert.match(html, /id="copy-access"[^>]*type="button"[^>]*disabled>複製連結/);
+  assert.match(html, /id="access-copy-status"[^>]*role="status"[^>]*aria-live="polite"/);
 }
 
 async function testAccountListShowsOnlyApplicableActions() {
@@ -639,46 +694,84 @@ function extractFunction(source, name) {
   return match[0];
 }
 
-async function testSource518SwitchLoadsAndSaves() {
-  assert.match(html, /<input name="source_518_enabled" type="checkbox">搜尋時使用 518 熊班/);
+async function testSourceSwitchesLoadToggleAndSave() {
+  for (const [source, enabled] of [["518", true], ["1111", false]]) {
+    assert.match(html, new RegExp(`<button[^>]*name="source_${source}_enabled"[^>]*type="button"[^>]*role="switch"[^>]*aria-checked="${enabled}"[^>]*aria-labelledby="source-${source}-label"[^>]*aria-describedby="source-${source}-help"`));
+    assert.doesNotMatch(html, new RegExp(`<input[^>]*name="source_${source}_enabled"`));
+  }
+  assert.match(html, /1111（實驗功能）/);
+  assert.match(html, /可能需要人機驗證而暫時查不到/);
+  assert.match(html, /name="admin_local_only" type="checkbox"/);
   const harness = createHarness();
   const common = fs.readFileSync(path.join(root, "app", "static", "common.js"), "utf8");
   vm.runInContext(common.match(/^const secretKeys = .*$/m)[0] + "\n" + extractFunction(common, "formAction"), harness.context);
-  vm.runInContext(extractFunction(script, "loadSettings"), harness.context, {filename: "admin.js#loadSettings"});
+  vm.runInContext(extractFunction(script, "setSourceSwitch") + "\n" + extractFunction(script, "loadSettings"), harness.context);
   const servicesSave = script.match(/^formAction\(\$\("#services"\), async \(\) => \{[\s\S]*?^\}\);/m);
   assert.ok(servicesSave, "services save handler should be extractable");
   const names = ["llm_base_url", "llm_model", "llm_protocol", "vapid_subject", "search_provider", "admin_local_only",
-    "source_518_enabled", "llm_api_key", "brave_api_key", "tavily_api_key", "clear_llm_api_key", "clear_brave_api_key", "clear_tavily_api_key"];
+    "source_518_enabled", "source_1111_enabled", "llm_api_key", "brave_api_key", "tavily_api_key", "clear_llm_api_key", "clear_brave_api_key", "clear_tavily_api_key"];
   const elements = Object.fromEntries(names.map(name => [name, {value: "", checked: false}]));
+  for (const name of ["source_518_enabled", "source_1111_enabled"]) {
+    elements[name] = {attributes: {}, events: {}, textContent: "",
+      setAttribute(key, value) { this.attributes[key] = value; },
+      getAttribute(key) { return this.attributes[key]; },
+      addEventListener(type, handler) { this.events[type] = handler; }};
+  }
   const listeners = {};
-  harness.elements.set("#services", {elements, addEventListener(type, handler) { listeners[type] = handler; }});
+  const form = {elements, addEventListener(type, handler) { listeners[type] = handler; }, reset() { listeners.reset(); }};
+  harness.elements.set("#services", form);
   for (const selector of ["#llm-status", "#search-test", "#search-status", "#search-engine-name",
     ...["llm_api_key", "brave_api_key", "tavily_api_key"].map(key => `[data-status=${key}]`)]) {
     harness.elements.set(selector, {textContent: "", disabled: false});
   }
   harness.elements.set("button[type=submit]", {disabled: false});
-  vm.runInContext(servicesSave[0], harness.context, {filename: "admin.js#services"});
-  let stored = false, saved = null;
+  const bindStart = script.indexOf('for (const name of ["source_518_enabled", "source_1111_enabled"])');
+  const bindEnd = script.indexOf('formAction($("#services"),', bindStart);
+  assert.ok(bindStart >= 0 && bindEnd > bindStart);
+  vm.runInContext(script.slice(bindStart, bindEnd) + servicesSave[0], harness.context);
+  let stored = {}, saved = null;
   const settings = () => ({
     llm_base_url: "", llm_model: "", llm_protocol: "auto", vapid_subject: "", search_provider: "",
-    admin_local_only: true, source_518_enabled: stored, connection_test_status: "pending", active_search_provider: null,
+    admin_local_only: true, ...stored, connection_test_status: "pending", active_search_provider: null,
     llm_api_key: {configured: false, mask: ""}, brave_api_key: {configured: false, mask: ""}, tavily_api_key: {configured: false, mask: ""},
   });
   harness.state.api = async (pathValue, options) => {
     assert.equal(pathValue, "/api/admin/settings");
-    if (options?.method === "PUT") { saved = JSON.parse(options.body); stored = saved.source_518_enabled; }
+    if (options?.method === "PUT") {
+      saved = JSON.parse(options.body);
+      stored = {source_518_enabled: saved.source_518_enabled, source_1111_enabled: saved.source_1111_enabled};
+    }
     return settings();
   };
-  elements.source_518_enabled.checked = true;
+  const assertSwitch = (name, enabled) => {
+    assert.equal(elements[name].getAttribute("aria-checked"), String(enabled));
+    assert.equal(elements[name].textContent, enabled ? "開啟" : "關閉");
+  };
   await harness.context.loadSettings();
-  assert.equal(elements.source_518_enabled.checked, false, "a stored off switch is shown unchecked");
-  elements.source_518_enabled.checked = true;
-  await listeners.submit({preventDefault() {}});
-  assert.equal(saved.source_518_enabled, true, "checking the box sends true");
-  assert.equal(elements.source_518_enabled.checked, true, "reloaded settings keep the box checked");
-  elements.source_518_enabled.checked = false;
-  await listeners.submit({preventDefault() {}});
-  assert.equal(saved.source_518_enabled, false, "unchecking the box sends false");
+  assertSwitch("source_518_enabled", true);
+  assertSwitch("source_1111_enabled", false);
+  for (const name of ["source_518_enabled", "source_1111_enabled"]) {
+    for (const enabled of [false, true]) {
+      stored[name] = enabled;
+      await harness.context.loadSettings();
+      assertSwitch(name, enabled);
+      const callsBefore = harness.state.apiCalls.length;
+      const other = name === "source_518_enabled" ? "source_1111_enabled" : "source_518_enabled";
+      const otherState = elements[other].getAttribute("aria-checked");
+      elements[name].events.click();
+      assertSwitch(name, !enabled);
+      assert.equal(elements[other].getAttribute("aria-checked"), otherState, "source switches remain independent");
+      assert.equal(harness.state.apiCalls.length, callsBefore, "toggling waits for the Save button");
+      await listeners.submit({preventDefault() {}});
+      assert.equal(saved[name], !enabled, "save sends the switch state as a boolean");
+      assertSwitch(name, !enabled);
+      await harness.context.loadSettings();
+      assertSwitch(name, !enabled);
+    }
+  }
+  form.reset();
+  assertSwitch("source_518_enabled", true);
+  assertSwitch("source_1111_enabled", false);
 }
 
 async function testVapidSubjectPorts() {
@@ -954,6 +1047,7 @@ async function testSpriteAnimationPreview() {
 
 (async () => {
   await testAccessLinkOriginAndLocalWarning();
+  await testAccessLinkCopyAndClear();
   await testAccountListShowsOnlyApplicableActions();
   await testAccountActionsConfirmBeforeAnythingIsSent();
   await testAccountFailuresAreShownNotThrown();
@@ -966,7 +1060,7 @@ async function testSpriteAnimationPreview() {
   await testRunNotificationSummary();
   await testSpriteTemplatePreviewRequiredAndSizeGuard();
   await testSingleSearchConnectionStatus();
-  await testSource518SwitchLoadsAndSaves();
+  await testSourceSwitchesLoadToggleAndSave();
   await testBackupHrefAndCreatedAt();
   await testVapidSubjectPorts();
   await testRestoreGuardsAndSuccess();
