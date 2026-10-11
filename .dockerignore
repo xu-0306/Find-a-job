@@ -2,6 +2,10 @@
 .git/**
 .venv
 .cache
+.dev-data
+.worktree-ports.json
+.github
+dev.cmd
 __pycache__
 **/__pycache__
 *.py[cod]

@@ -52,6 +52,35 @@ A self-hosted AI job-search companion for finding jobs through chat, managing se
 
 資料儲存在本機 `data/`；請使用後台備份功能保存資料。API 金鑰、資料庫、`.env`、憑證與私人備份不應提交到 GitHub。帳號隔離的是其他使用者；管理員仍可讀取本機資料，聊天內容會交給你設定的模型供應商。
 
+### 開發與 CI（不重啟正式服務）
+
+在另一個 Git worktree 開發，保留正在提供服務的目錄。例如從已確認的 `main` 建立開發分支：
+
+```powershell
+git worktree add ..\Find-a-job-dev -b codex/my-change main
+cd ..\Find-a-job-dev
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+.\dev.cmd --init-admin
+.\dev.cmd
+```
+
+`--init-admin` 只設定開發環境的管理員密碼；請自行輸入，沒有預設密碼。後台預設為 `http://127.0.0.1:8141/admin`。需要另一個埠可用 `dev.cmd --port 8142`，或 `--port 0` 由系統選擇，實際埠記在本機 `.worktree-ports.json`。埠已被占用就退出，不會終止其他程序；按 Ctrl+C 關閉本次開發服務。
+
+開發入口要求使用本目錄的 `.venv`，資料固定放在本目錄 `.dev-data/`；忽略繼承的正式資料目錄、對外網址與代理設定，也不載入 `.env`。自動每日搜尋、實際 Push 發送及 Tailscale/Funnel 控制停用。前後台與手動操作仍可測試；若自行設定測試用模型或搜尋 API，手動操作仍可能產生外部請求與費用。不要把正式資料庫、設定、備份或登入資料複製進開發環境。
+
+開發時使用 `dev.cmd`，不要使用會啟停正式模式或安裝 Tailscale 的 `setup.cmd`／`start.cmd`。Git worktree 隔離程式檔案，但不會自動隔離共用的環境變數、資料與系統服務。現有執行中的目錄也不應切換分支或直接 `git pull`，靜態檔更新可能立即影響使用者。
+
+本機離線檢查需要 Python 3.13 與 Node.js 24：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/check.py
+```
+
+GitHub Actions 對 `main`、`codex/**` 的 push、以 `main` 為目標的 PR，以及手動執行啟動相同檢查。測試使用暫存資料與合成回應，不需要 API secrets；第三方網站即時測試另行進行。CI 僅驗證程式，不部署、不連接本機正式服務，也不包含私人文件及歷史探測腳本。
+
+正式部署維持手動：選定通過 CI 的提交，先準備新版本與依賴、確認資料庫相容性，在維護時段等待工作結束並建立可還原的完整快照，再切換及重啟正式服務，核對登入與主要功能。不要把開發資料帶入正式環境。現有後台匯出備份會移除 session 與 Push 訂閱，不能視為完整部署快照；資料庫升級後也不能直接以舊程式回滾。這一版沒有新增自動部署、完整快照或回滾工具。
+
 ## English
 
 ### Features
@@ -95,6 +124,12 @@ A self-hosted AI job-search companion for finding jobs through chat, managing se
 4. Confirm your job-search preferences in the app to enable daily searches. For access from other devices, follow the admin page's Tailscale sign-in and Funnel setup steps. Remote access is optional for local use.
 
 Bring your own model and search API keys; provider fees may apply. Keep the server running for scheduled searches and notifications.
+
+### Isolated development and CI
+
+Use a separate Git worktree with its own Python 3.13 `.venv`, then run `dev.cmd --init-admin` once and `dev.cmd` to serve on loopback port 8141. Use `--port 0` to allocate a free port. This entry point uses only that checkout's `.dev-data`, ignores production data/origin/peer environment settings and `.env`, disables automatic searches, Push delivery and Funnel, and never stops another server. Do not copy production data or run the production `setup.cmd` / `start.cmd` for development.
+
+With Node.js 24 available, run `.venv\Scripts\python.exe scripts/check.py` for the same offline regression checks as GitHub Actions. CI runs on pushes to `main` / `codex/**`, pull requests to `main`, and manual dispatch, without production secrets or deployment access. Production updates remain manual, with a maintenance window, a complete recovery snapshot, database compatibility checks and post-start verification. No automated deployment or rollback tool is included.
 
 ### Data
 
