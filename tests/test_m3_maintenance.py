@@ -132,22 +132,30 @@ class Maintenance(unittest.TestCase):
         started, release = threading.Event(), threading.Event()
         def slow(*args):
             started.set()
-            release.wait(2)
+            release.wait(15)
             return {'result':'accepted'}
         self.app.state.notifications.sender = slow
         self.client.headers['X-CSRF-Token'] = security.csrf(self.admin)
         tests, resets = [], []
         sender = threading.Thread(target=lambda: tests.append(self.client.post('/api/admin/push-test')))
-        sender.start()
-        self.assertTrue(started.wait(1))
         reset = threading.Thread(target=lambda: resets.append(self.client.post('/api/admin/users/default/access/reset')))
-        reset.start()
-        time.sleep(.1)
-        self.assertTrue(reset.is_alive())
-        self.assertTrue(self.app.state.notifications.paused)
-        release.set()
-        sender.join(3)
-        reset.join(3)
+        sender.start()
+        try:
+            self.assertTrue(started.wait(5))
+            reset.start()
+            # Wait for the request to reach the pause barrier, not an assumed CI scheduling delay.
+            deadline = time.monotonic() + 5
+            while not self.app.state.notifications.paused and reset.is_alive() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(reset.is_alive())
+            self.assertTrue(self.app.state.notifications.paused)
+        finally:
+            release.set()
+            sender.join(5)
+            if reset.ident is not None:
+                reset.join(5)
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(reset.is_alive())
         self.assertEqual(tests[0].status_code,200)
         self.assertEqual(resets[0].status_code,200)
         self.assertEqual(self.app.state.notifications.active,0)
