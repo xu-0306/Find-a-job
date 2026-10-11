@@ -7,7 +7,7 @@ from .security import DEFAULT_USER_ID
 from .store import Job
 
 
-_SOURCES = {"104", "518"}
+_SOURCES = {"104", "518", "1111"}
 
 
 def _text(value: Any, name: str) -> str:
@@ -26,7 +26,7 @@ def _batch(batch: Mapping[str, Any], index: int) -> dict[str, Any]:
         raise ValueError("revision must be a positive integer")
     source = batch.get("source")
     if not isinstance(source, str) or source not in _SOURCES:
-        raise ValueError("source must be 104 or 518")
+        raise ValueError("source must be 104, 518 or 1111")
     eligible = batch.get("eligible")
     if type(eligible) is not bool:
         raise ValueError("eligible must be boolean")

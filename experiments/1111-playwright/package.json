@@ -5,9 +5,11 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "probe": "node probe.mjs",
-    "test": "node --test probe.test.mjs"
+    "source": "node source.mjs",
+    "test": "node --test --test-concurrency=1 probe.test.mjs source.test.mjs"
   },
   "dependencies": {
+    "patchright": "1.63.0",
     "playwright": "1.64.0"
   }
 }

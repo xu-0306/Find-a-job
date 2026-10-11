@@ -37,3 +37,11 @@ jobs:
           .venv\Scripts\python.exe -m pip install -r requirements.lock
       - name: Run offline regression checks
         run: .venv\Scripts\python.exe scripts/check.py
+      - name: Install optional browser source test dependencies
+        working-directory: experiments/1111-playwright
+        run: |
+          npm.cmd ci --ignore-scripts --no-audit --no-fund
+          npx.cmd playwright install chromium
+      - name: Run synthetic browser source checks
+        working-directory: experiments/1111-playwright
+        run: npm.cmd test

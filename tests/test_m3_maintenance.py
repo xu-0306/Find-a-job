@@ -205,7 +205,7 @@ class Maintenance(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             self.assertEqual(len(archive.namelist()), 3)
             manifest = json.loads(archive.read('manifest.json'))
-            self.assertEqual(manifest['schema_version'], 6)
+            self.assertEqual(manifest['schema_version'], 7)
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory)/'backup.zip'
             archive.write_bytes(data)

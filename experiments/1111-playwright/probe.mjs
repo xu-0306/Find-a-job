@@ -1,4 +1,5 @@
 import { chromium } from 'playwright';
+import { createRequire } from 'node:module';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,23 +16,38 @@ export function searchUrl(keyword, area = '') {
   return url.href;
 }
 
-// These functions run in the browser and read only rendered DOM, never session stores.
+// Read public page markup and its embedded search result, never session stores.
 export function readSearch() {
   const jobs = [];
   const seen = new Set();
-  for (const a of document.querySelectorAll('a[href*="/job/"][href*="mid=searchlist"]')) {
+  for (const a of document.querySelectorAll('.job-card__content a[href*="/job/"][href*="mid=searchlist"]')) {
     const url = new URL(a.getAttribute('href'), location.href);
     const id = url.pathname.match(/^\/job\/(\d+)\/?$/)?.[1];
     if (url.origin !== location.origin || !id || !a.checkVisibility({ visibilityProperty: true, opacityProperty: true }) || seen.has(id)) continue;
+    const title = a.querySelector('h2');
+    if (!title) continue;
     const company = a.parentElement.querySelector('a[href^="/corp/"]');
     seen.add(id);
     jobs.push({
-      id, url: `${url.origin}/job/${id}`, title: a.innerText.trim(),
+      id, url: `${url.origin}/job/${id}`, title: title.innerText.trim(),
       company: company?.querySelector('h2')?.innerText.trim() || company?.getAttribute('title') || '',
       companyUrl: company ? new URL(company.getAttribute('href'), location.href).href : '',
     });
   }
+  let initialResult = null;
+  try {
+    // Nuxt serializes object values as references into this public HTML array.
+    const values = JSON.parse(document.querySelector('#__NUXT_DATA__')?.textContent || 'null');
+    const data = values?.find(value => value && !Array.isArray(value) && Object.hasOwn(value, 'apiJob'));
+    const result = values[values[data.apiJob].result];
+    const pagination = values[result.pagination];
+    initialResult = {
+      ...Object.fromEntries(['page', 'limit', 'totalCount', 'totalPage'].map(key => [key, values[pagination[key]]])),
+      ids: values[result.hits].map(ref => String(values[values[ref].jobId])), source: 'html-ssr',
+    };
+  } catch { /* Missing or changed metadata must fail completeness validation. */ }
   return {
+    initialResult,
     url: location.href, title: document.title,
     heading: document.querySelector('h1')?.innerText.trim() || '',
     keywordInput: [...document.querySelectorAll('input[placeholder="工作職稱、公司名、技能專長..."]')]
@@ -40,7 +56,7 @@ export function readSearch() {
   };
 }
 
-export function validateSearch(page, expected, pageNumber) {
+export function validateSearch(page, expected, pageNumber, source = page.initialResult, { allowEmpty = false } = {}) {
   const actual = new URL(page.url);
   const wanted = new URL(expected);
   const mismatch = actual.origin !== wanted.origin || actual.pathname !== wanted.pathname
@@ -50,16 +66,28 @@ export function validateSearch(page, expected, pageNumber) {
     || page.keywordInput !== wanted.searchParams.get('ks')
     || !page.heading.includes(wanted.searchParams.get('ks'));
   if (mismatch) throw new Error('query_mismatch: URL, heading or search input does not match the requested query');
-  if (!page.jobs.length) throw new Error('layout_changed_or_empty: no verified search cards');
+  if (!page.jobs.length && !(allowEmpty && source?.totalCount === 0)) throw new Error('layout_changed_or_empty: no verified search cards');
   if (page.jobs.some(job => !job.title || !job.company || !job.companyUrl)) {
     throw new Error('incomplete_search_card: missing title or company');
+  }
+  if (!source || source.page !== pageNumber || !Number.isSafeInteger(source.limit) || source.limit <= 0
+      || !Number.isSafeInteger(source.totalCount) || source.totalCount < 0 || !Array.isArray(source.ids)
+      || source.ids.some(id => typeof id !== 'string' || !/^\d+$/.test(id))) {
+    throw new Error('incomplete_page: valid current-page metadata is required');
+  }
+  const expectedCount = Math.min(source.limit, Math.max(0, source.totalCount - (pageNumber - 1) * source.limit));
+  const expectedIds = new Set(source.ids);
+  if (expectedCount !== source.ids.length || expectedIds.size !== source.ids.length
+      || page.jobs.length !== expectedCount || page.jobs.some(job => !expectedIds.has(job.id))) {
+    throw new Error('incomplete_page: rendered job IDs do not match the complete source page');
   }
 }
 
 export function readDetail() {
   const headings = [...document.querySelectorAll('h1,h2,h3,h4')]
     .filter(h => h.checkVisibility({ visibilityProperty: true, opacityProperty: true }));
-  const index = headings.findIndex(h => h.innerText.trim() === '工作內容');
+  let index = headings.findIndex(h => h.innerText.trim() === '工作內容');
+  if (index >= 0 && headings[index + 1]?.innerText.trim() === '職缺描述') index += 1;
   const description = [];
   if (index >= 0 && headings[index + 1]) {
     const range = document.createRange();
@@ -87,7 +115,7 @@ export function validateDetail(detail, job) {
   const actual = new URL(detail.url);
   const wanted = new URL(job.url);
   if (actual.origin !== wanted.origin || actual.pathname.replace(/\/$/, '') !== wanted.pathname
-      || detail.title !== job.title || !detail.companyUrls.includes(job.companyUrl)) {
+      || detail.title !== job.title || !detail.companyUrls.some(url => url.replace(/\/$/, '') === job.companyUrl.replace(/\/$/, ''))) {
     throw new Error('detail_identity_mismatch: job URL, title or company differs from its search card');
   }
   if (!detail.description.trim() || /^(Loading\.{3}|載入中[.。…]*)$/i.test(detail.description.trim())) {
@@ -101,44 +129,77 @@ export function failureStatus(state) {
     ? 'blocked_or_loading' : 'failed';
 }
 
-async function waitForValidDom(page, read, validate, timeoutMs) {
+export async function evaluateWithTimeout(page, read, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      page.evaluate(read),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('dom_read_timeout: browser evaluation did not finish')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function waitForValidDom(page, read, validate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let lastError;
   for (;;) {
     try {
-      const result = await page.evaluate(read);
+      const result = await evaluateWithTimeout(page, read, Math.max(1, deadline - Date.now()));
       validate(result);
       return result;
     } catch (error) {
-      if (Date.now() >= deadline) throw error;
+      // A final bounded read must not hide the validation failure already observed.
+      if (!lastError || !error.message.startsWith('dom_read_timeout:')) lastError = error;
+      if (Date.now() >= deadline) throw lastError;
       await delay(Math.min(250, deadline - Date.now()));
+      if (Date.now() >= deadline) throw lastError;
     }
   }
 }
 
-export async function runProbe(context, { keyword, area = '', outputDir, timeoutMs = 30000, pauseMs = 1500 }) {
+export async function runProbe(context, { keyword, area = '', outputDir, timeoutMs = 30000, pauseMs = 1500, runtime = {} }) {
   const expected = searchUrl(keyword, area);
   await mkdir(outputDir, { recursive: true });
-  const page = await context.newPage();
+  const page = context.pages()[0] || await context.newPage();
   page.setDefaultTimeout(timeoutMs);
   page.setDefaultNavigationTimeout(timeoutMs);
   const report = {
-    startedAt: new Date().toISOString(), query: { keyword: keyword.trim(), area },
+    startedAt: new Date().toISOString(), query: { keyword: keyword.trim(), area }, runtime,
     status: 'running', stages: { search: 'not_run', pagination: 'not_run', details: 'not_run' },
     pages: [], details: [],
   };
   let stage = 'search';
+  let responseResult;
+  const onResponse = async response => {
+    const url = new URL(response.url());
+    if (url.origin !== ORIGIN || url.pathname !== '/api/v1/search/jobs/' || !response.ok()) return;
+    try {
+      const { result } = await response.json();
+      responseResult = { ...result.pagination, ids: result.hits.map(job => String(job.jobId)), source: 'search-response' };
+    } catch { responseResult = undefined; }
+  };
+  page.on('response', onResponse);
   try {
+    await page.bringToFront();
     await page.goto(expected, { waitUntil: 'domcontentloaded' });
     for (let number = 1; number <= 2; number++) {
       if (number === 2) {
         stage = 'pagination';
+        responseResult = undefined;
         await delay(pauseMs);
         // The current site exposes duplicate desktop/mobile controls; click the visible one.
         await page.locator('button.pagination-button[title="前往2頁"]:visible').first().click();
         await page.waitForURL(url => url.searchParams.get('page') === '2', { waitUntil: 'domcontentloaded' });
       }
       const result = await waitForValidDom(page, readSearch, result => {
-        validateSearch(result, expected, number);
+        const source = responseResult?.page === number ? responseResult : result.initialResult;
+        validateSearch(result, expected, number, source);
+        result.completeness = { ...source, expectedCount: source.ids.length, matched: true };
+        delete result.initialResult;
         if (number === 2) {
           const previousIds = new Set(report.pages[0].jobs.map(job => job.id));
           result.overlap = result.jobs.filter(job => previousIds.has(job.id)).length;
@@ -164,14 +225,19 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
     report.status = 'failed';
     report.error = { stage, message: error.message };
     try {
-      const state = await page.evaluate(() => ({ url: location.href, title: document.title, text: document.body.innerText.slice(0, 2000) }));
+      const state = await evaluateWithTimeout(page, () => ({ url: location.href, title: document.title, text: document.body.innerText.slice(0, 2000) }), Math.min(timeoutMs, 5000));
       report.status = failureStatus(state);
       report.diagnostic = state;
-      await page.screenshot({ path: resolve(outputDir, 'failure.png'), timeout: 5000 });
     } catch (diagnosticError) {
       report.diagnosticError = diagnosticError.message;
     }
+    try {
+      await page.screenshot({ path: resolve(outputDir, 'failure.png'), timeout: 5000 });
+    } catch (screenshotError) {
+      report.screenshotError = screenshotError.message;
+    }
   } finally {
+    page.off('response', onResponse);
     report.finishedAt = new Date().toISOString();
     await writeFile(resolve(outputDir, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
     await page.close();
@@ -183,22 +249,39 @@ async function main() {
   const { values } = parseArgs({ options: {
     keyword: { type: 'string', default: '採購' }, area: { type: 'string', default: '' },
     headed: { type: 'boolean', default: false }, chrome: { type: 'boolean', default: false },
+    patchright: { type: 'boolean', default: false },
     help: { type: 'boolean', default: false },
   } });
   if (values.help) {
-    console.log('npm run probe -- [--keyword 採購] [--area 101600] [--headed] [--chrome]\nChecks two search pages and two details. Stops on failure; writes output/playwright/<timestamp>/report.json.');
+    console.log('npm run probe -- [--keyword 採購] [--area 101600] [--headed] [--chrome] [--patchright]\nChecks two search pages and two details. Stops on failure; writes output/playwright/<timestamp>/report.json.');
     return;
   }
   searchUrl(values.keyword, values.area);
   const outputDir = resolve('output/playwright', new Date().toISOString().replace(/[:.]/g, '-'));
   let browser;
+  let context;
+  const driverName = values.patchright ? 'patchright' : 'playwright';
+  const launchOptions = { headless: !values.headed, channel: values.chrome ? 'chrome' : 'chromium' };
   try {
-    browser = await chromium.launch({ headless: !values.headed, channel: values.chrome ? 'chrome' : 'chromium' });
-    const context = await browser.newContext({ locale: 'zh-TW', viewport: { width: 1365, height: 900 } });
-    const report = await runProbe(context, { keyword: values.keyword, area: values.area, outputDir });
+    if (values.patchright) {
+      const { chromium: patchedChromium } = await import('patchright');
+      // Empty userDataDir creates a fresh temporary profile, never a personal Chrome profile.
+      context = await patchedChromium.launchPersistentContext('', { ...launchOptions, viewport: null });
+      browser = context.browser();
+    } else {
+      browser = await chromium.launch(launchOptions);
+      context = await browser.newContext({ locale: 'zh-TW', viewport: { width: 1365, height: 900 } });
+    }
+    const runtime = {
+      driver: driverName, driverVersion: createRequire(import.meta.url)(`${driverName}/package.json`).version,
+      browserVersion: browser.version(), channel: launchOptions.channel, headed: values.headed,
+      context: values.patchright ? 'temporary-persistent' : 'fresh-incognito',
+    };
+    const report = await runProbe(context, { keyword: values.keyword, area: values.area, outputDir, runtime });
     console.log(JSON.stringify({ status: report.status, stages: report.stages, outputDir }, null, 2));
     process.exitCode = report.status === 'passed' ? 0 : 1;
   } finally {
+    await context?.close();
     await browser?.close();
   }
 }

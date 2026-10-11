@@ -8,7 +8,7 @@ A self-hosted AI job-search companion for finding jobs through chat, managing se
 
 ### 功能
 
-- 聊天搜尋台灣 104／518 職缺、查看公司評價與收藏工作。
+- 聊天搜尋台灣 104／518 職缺、查看公司評價與收藏工作；可選擇啟用 1111 實驗來源。
 - 確認求職條件後，每日搜尋並提供新職缺通知。
 - 每位使用者有自己的專屬連結，對話、收藏與條件分開保存。
 - A／B 兩種外觀、像素角色陪伴，以及後台設定與備份還原。
@@ -48,6 +48,21 @@ A self-hosted AI job-search companion for finding jobs through chat, managing se
 
 模型與搜尋服務需自行提供 API 金鑰，費用依供應商計算。服務需保持運行，才能執行排程與發送通知。
 
+### 職缺來源開關與 1111 實驗功能
+
+後台「服務設定」以切換開關控制 518 與 1111，按「保存服務設定」套用。518 預設開啟，1111 預設關閉；關閉的來源不會加入新的搜尋。1111 開關同時影響聊天搜尋、續查、詳細內容及每日搜尋。
+
+1111 目前需有互動桌面的 Windows、Node.js 20+、已安裝的 Google Chrome，以及選用的瀏覽器套件。在準備部署的新版本目錄執行一次：
+
+```powershell
+npm.cmd ci --prefix experiments/1111-playwright --ignore-scripts --no-audit --no-fund
+```
+
+啟用後會開啟獨立 Chrome 視窗，以新的暫存設定檔讀取公開頁面；不使用個人瀏覽器設定檔或登入資料。每次只處理一個瀏覽器工作，遇到驗證或逾時會回報來源受阻／失敗，不會當成零筆職缺，也不會自動安裝套件或代替使用者解驗證。既有 Docker 映像未包含這個選用執行環境。
+
+目前支援不指定地區或單一可可靠對應的地區；地區取自 1111 官方代碼資料，無法對應或多地區查詢會明確回報不支援。職缺薪資與地點欄位尚未可靠解析，須至來源核對，最低月薪篩選也不保證。短期測試曾成功取得兩頁，但仍會遇到人工驗證，不能視為每日無人操作已穩定。
+
+此版本將資料庫升級至 schema 7，加入 1111 職缺與每日基線；可還原舊版 4／5／6 備份並升級。部署前先保存可還原快照；升級後的資料庫不可直接交給舊版程式。
 ### 資料
 
 資料儲存在本機 `data/`；請使用後台備份功能保存資料。API 金鑰、資料庫、`.env`、憑證與私人備份不應提交到 GitHub。帳號隔離的是其他使用者；管理員仍可讀取本機資料，聊天內容會交給你設定的模型供應商。
@@ -77,7 +92,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe scripts/check.py
 ```
 
-GitHub Actions 對 `main`、`codex/**` 的 push、以 `main` 為目標的 PR，以及手動執行啟動相同檢查。測試使用暫存資料與合成回應，不需要 API secrets；第三方網站即時測試另行進行。CI 僅驗證程式，不部署、不連接本機正式服務，也不包含私人文件及歷史探測腳本。
+GitHub Actions 對 `main`、`codex/**` 的 push、以 `main` 為目標的 PR，以及手動執行啟動相同檢查。測試使用暫存資料與合成回應，不需要 API secrets；第三方網站即時測試另行進行。CI 僅驗證程式，不部署、不連接本機正式服務，也不包含私人文件及歷史探測腳本。1111 的瀏覽器測試使用合成頁面，不連線到真實職缺網站。
 
 正式部署維持手動：選定通過 CI 的提交，先準備新版本與依賴、確認資料庫相容性，在維護時段等待工作結束並建立可還原的完整快照，再切換及重啟正式服務，核對登入與主要功能。不要把開發資料帶入正式環境。現有後台匯出備份會移除 session 與 Push 訂閱，不能視為完整部署快照；資料庫升級後也不能直接以舊程式回滾。這一版沒有新增自動部署、完整快照或回滾工具。
 
@@ -85,7 +100,7 @@ GitHub Actions 對 `main`、`codex/**` 的 push、以 `main` 為目標的 PR，�
 
 ### Features
 
-- Search Taiwan's 104 and 518 job boards through chat, check company reviews, and save favorites.
+- Search Taiwan's 104 and 518 job boards through chat, check company reviews, and save favorites; optionally enable the experimental 1111 source.
 - Confirm your search preferences to receive daily job updates and notifications.
 - Separate conversations, favorites, and preferences for each user, with a personal access link.
 - Two visual themes, a pixel companion, admin settings, and backup/restore.
@@ -131,6 +146,21 @@ Use a separate Git worktree with its own Python 3.13 `.venv`, then run `dev.cmd 
 
 With Node.js 24 available, run `.venv\Scripts\python.exe scripts/check.py` for the same offline regression checks as GitHub Actions. CI runs on pushes to `main` / `codex/**`, pull requests to `main`, and manual dispatch, without production secrets or deployment access. Production updates remain manual, with a maintenance window, a complete recovery snapshot, database compatibility checks and post-start verification. No automated deployment or rollback tool is included.
 
+### Source switches and experimental 1111 support
+
+Admin service settings use toggle switches for 518 and 1111. Save settings to apply them. 518 defaults on; 1111 defaults off. The 1111 setting covers chat search, continuation, job details, and daily searches.
+
+The optional 1111 runtime requires an interactive Windows desktop, Node.js 20+, installed Google Chrome, and the locked browser dependencies:
+
+```powershell
+npm.cmd ci --prefix experiments/1111-playwright --ignore-scripts --no-audit --no-fund
+```
+
+Run this in the new deployment checkout. The adapter opens its own headed Chrome with a fresh temporary profile, serializes browser work, and reports challenges/timeouts as failures rather than empty results. It neither uses personal browser sessions nor installs dependencies automatically. The existing Docker image does not include this optional runtime.
+
+Search supports no location filter or one location matched against 1111's official catalog; unsupported locations or multiple locations fail explicitly. Salary and location fields are not yet reliably parsed, and minimum monthly salary filtering is not guaranteed. Check the original listing. Successful two-page trials do not establish unattended reliability.
+
+Deployment upgrades the database to schema 7. Backups from schemas 4/5/6 can still be restored and upgraded. Preserve a recoverable snapshot before deployment; do not open an upgraded database with older code.
 ### Data
 
 Data is stored locally in `data/`; use the admin backup feature to keep a copy. Do not commit API keys, databases, `.env`, certificates, or private backups to GitHub. Accounts isolate users from one another, but the administrator can still read local data, and chat content is sent to your configured model provider.

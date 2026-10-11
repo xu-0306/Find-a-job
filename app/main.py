@@ -32,7 +32,7 @@ from .ports import Ports
 
 STATIC = Path(__file__).parent / "static"
 SECRET_FIELDS = ("llm_api_key", "brave_api_key", "tavily_api_key")
-DEFAULT_SETTINGS = {"llm_base_url": "", "llm_model": "", "llm_protocol": "auto", "admin_local_only": True, "source_518_enabled": True, "vapid_subject": ""}
+DEFAULT_SETTINGS = {"llm_base_url": "", "llm_model": "", "llm_protocol": "auto", "admin_local_only": True, "source_518_enabled": True, "source_1111_enabled": False, "vapid_subject": ""}
 
 
 async def finish_file_operation(function, *args, **kwargs):
@@ -82,6 +82,7 @@ class Settings(Input):
     llm_protocol: Literal["auto", "responses", "chat_completions", "anthropic_messages"] | None = None
     admin_local_only: bool | None = None
     source_518_enabled: bool | None = None
+    source_1111_enabled: bool | None = None
     vapid_subject: str | None = Field(default=None, max_length=2000)
     llm_api_key: str = Field(default="", max_length=4096)
     brave_api_key: str = Field(default="", max_length=4096)
@@ -1112,8 +1113,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 ensure_active(db, auth['hash'])
                 schema = backups.schema_catalog(db)
             try:
-                catalogs = {6: schema}
-                for old_version in (4, 5):
+                catalogs = {7: schema}
+                for old_version in (4, 5, 6):
                     reference = Store(root / f'schema{old_version}', target_version=old_version)
                     with reference.connect() as db: catalogs[old_version] = backups.schema_catalog(db)
                 await finish_file_operation(validate_backup, archive, staging, catalogs)
@@ -1207,6 +1208,10 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
     async def read_job_details(job_id, auth_hash, user_id):
         job = stored_job(job_id)
         try:
+            with store.connect() as db:
+                enabled = sources.enabled_sources(store.get(db, 'services', {}))
+            if job.source not in enabled:
+                raise sources.SourceError('unsupported', f'{job.source} 已在後台停用，本次未查詢詳細頁。')
             result = await app.state.sources.detail(job)
         except sources.SourceError as exc:
             result = {'status': exc.status, 'detail': None, 'identity_verified': False, 'limitations': [exc.message]}
@@ -1296,7 +1301,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
          'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         {'name': 'propose_preference_change', 'description': '提出條件變更，須由使用者檢視確認後才生效。',
          'parameters': ProposalInput.model_json_schema()},
-        {'name': 'search_jobs', 'description': '依使用者條件或履歷中的技能與經驗搜尋104／518職缺；只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
+        {'name': 'search_jobs', 'description': '依使用者條件或履歷中的技能與經驗搜尋104／518／1111職缺（1111 為預設停用的實驗來源，依後台開關可用）；只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
         {'name': 'lookup_job_areas', 'description': '由地區名稱查官方地區代碼；搜尋前先查碼，不猜數字。', 'parameters': AreaLookup.model_json_schema()},
         {'name': 'present_job_recommendations', 'description': '以本次對話已取得的職缺job_id呈現精選或比較卡片；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
         {'name': 'get_job_details', 'description': '讀取已保存職缺的詳細內容；未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
@@ -1368,10 +1373,15 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 arguments = sources.SearchInput.model_validate(previous['criteria_input'] | {'search_id': search_id})
             with store.connect() as db:
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
-            kept = [source for source in arguments.sources if source in enabled]
+            requested = list(arguments.sources)
+            if not previous and 'sources' not in arguments.model_fields_set and '1111' in enabled:
+                requested.append('1111')
+            kept = [source for source in requested if source in enabled]
+            disabled_sources = [source for source in requested if source not in enabled]
+            disabled_names = '、'.join(disabled_sources)
             if not kept:
-                raise llm.LLMError('source_disabled', '518 已在後台停用，本次未查詢；可改查 104，或請管理者在後台重新啟用 518。')
-            disabled = len(kept) < len(arguments.sources)
+                raise llm.LLMError('source_disabled', f'{disabled_names} 已在後台停用，本次未查詢；可改查 104，或請管理者在後台重新啟用來源。')
+            disabled = bool(disabled_sources)
             arguments = arguments.model_copy(update={'sources': kept})
             if previous:
                 excluded = {f'{job.source}:{job.source_job_id}' for job in map(stored_job, previous['dismissed_ids'])}
@@ -1380,9 +1390,9 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 search_id = str(uuid4())
                 result = await app.state.sources.search(arguments)
             if disabled:
-                result['filter_warnings'].append('518 已在後台停用，本次未查詢。')
+                result['filter_warnings'].append(f'{disabled_names} 已在後台停用，本次未查詢。')
             if previous and disabled and not result['items'] and not result['can_continue']:
-                raise llm.LLMError('search_exhausted', '518 已在後台停用，其餘來源也已沒有下一批，請調整條件後重新搜尋。')
+                raise llm.LLMError('search_exhausted', f'{disabled_names} 已在後台停用，其餘來源也已沒有下一批，請調整條件後重新搜尋。')
             await asyncio.sleep(0)
             with store.connect(write=True) as db:
                 ensure_active(db, auth_hash)

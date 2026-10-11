@@ -390,7 +390,7 @@ class ChatChecks(unittest.TestCase):
                 after={table:[tuple(row) for row in db.execute(f'SELECT {columns} FROM {table}')] for table,columns in tables.items()}
                 self.assertEqual(before,after)
                 self.assertEqual(store.get(db,'existing'),{'kept':True})
-                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
                 # Everything that existed belongs to the built-in account.
                 self.assertEqual(db.execute("SELECT DISTINCT user_id FROM favorites").fetchall()[0][0],'default')
                 self.assertEqual(db.execute("SELECT DISTINCT user_id FROM preferences").fetchall()[0][0],'default')
