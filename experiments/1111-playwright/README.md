@@ -48,6 +48,57 @@ npm.cmd run probe -- --keyword 採購 --area 101600 --chrome --headed
 
 已檢查公開 [robots.txt](https://www.1111.com.tw/robots.txt)；它不等同網站授權。遇驗證頁即停，未加入驗證碼代解、stealth、代理輪換或 cookie 複用。後續應先確認一般瀏覽器與網站允許的資料取得方式；取得正常公開頁後再重跑此探針。
 
+
+## 2026-10-11 續查：Loading 停在哪裡
+
+**已定位到 1111 驗證頁中的 Cloudflare Turnstile 階段，尚未確認 Cloudflare 作出判定的具體訊號。** 這與職缺卡片 selector 或正式後端無關：搜尋文件本身被驗證閘門取代，還沒有職缺 DOM 可解析。
+
+本輪只使用獨立探針的全新瀏覽器環境。沒有讀取個人 browser profile／cookie／IndexedDB，沒有修改驗證程式或人工點選驗證碼。
+
+| 本輪比較 | 結果 |
+|---|---|
+| Chrome 154 headless，全新 context；先首頁再搜尋 | 首頁正常；搜尋 30 秒仍 Loading |
+| Chrome 154 一般視窗，全新臨時 persistent context；先首頁再搜尋 | 搜尋 30 秒仍 Loading |
+| Chrome 154 一般視窗，全新臨時 persistent context；搜尋頁 bringToFront | 60 秒仍 Loading；實測 visibilityState=visible、hasFocus=true |
+
+這裡的 persistent context 是新建的臨時一般瀏覽器環境，結束即關閉；不是複製或沿用使用者已驗證的 profile。因此結果排除了「只要不是無痕就能過」，沒有驗證「使用者完成驗證後的既有狀態可持續多久」。
+
+三次網路紀錄一致：
+- 搜尋 document 回 HTTP 200，但內容是 captcha-gate；document.readyState=complete、可見本文 0 字、職缺連結 0 筆。
+- ALTCHA 與 Cloudflare challenge 端點均回 200；ALTCHA solve 端點也有 200 回應。這是 HTTP 層的觀察，不記錄或宣稱 token 內容。
+- Turnstile 腳本與驗證 iframe 正常載入。沒有捕捉到未處理的 pageerror；未看到 Cloudflare 結果送回 1111 的 solve/cf 請求，也未看到最後 auth/claim 放行請求。
+- 公開頁面程式先隱藏 loader，再等待 Turnstile callback／error-callback；此等待段沒有自行設定 timeout。最後量到 loader 為 display:none，錯誤訊息也隱藏，因而呈現空白本文與 Loading 標題。這說明介面表現，不代表已證實 Cloudflare 的判定理由。
+- 每次搜尋記錄 27 個 document/script/fetch/xhr 回應，未達紀錄上限；去識別摘要及 assertions 在本機 output/playwright/diagnostic-20261011/summary.json 與 output/playwright/verify-diagnostics.mjs。
+
+已排除的誤判：
+- PAT 路徑回 401 是可預期的回退流程，不等於封鎖。[Cloudflare PAT 說明](https://developers.cloudflare.com/cloudflare-challenges/reference/private-access-tokens/)
+- 某些 *.challenges.cloudflare.com 子網域 DNS lookup failure 是非阻塞測試。這次 brunhild 子網域失敗符合該類型，不能據此判斷 DNS 壞掉；主驗證網域、腳本與 iframe 都有成功回應。[Cloudflare 排錯說明](https://developers.cloudflare.com/cloudflare-challenges/troubleshooting/challenge-solve-issues/)
+- 保持前景與延長至 60 秒仍失敗，並非單純頁面未取得焦點。使用一般視窗也仍是自動化瀏覽器；Cloudflare 明列 Playwright 等框架不支援解正式 challenge。[支援的瀏覽器環境](https://developers.cloudflare.com/cloudflare-challenges/reference/supported-browsers/)
+
+### 為何之前內建瀏覽器可以
+
+先前結果只證明「當時那個內建瀏覽器環境能進入職缺頁」。獨立 Playwright 每輪使用不帶既有驗證狀態的新 context；不同的瀏覽器版本、工作階段、網路環境或自動化訊號可能造成不同結果，但沒有同時對照就不能指定哪一項是根因。[Playwright context 隔離說明](https://playwright.dev/docs/browser-contexts)
+
+本輪內建瀏覽器工具在載入連線模組時回 EPERM，未能重跑同條件比較；沒有改用其他機制存取該瀏覽器、複製它的驗證資料或查看私人儲存。歷史成功與本輪失敗不構成矛盾，也不能推論內建環境永遠可用。
+
+### 可行路徑與目前判斷
+
+1. **先驗證有人操作的正常瀏覽器流程。** 最有判別力的下一步是使用者在一般 Chrome 開同一查詢，若網站要求驗證，由使用者完成；之後只讀已正常顯示的頁面。可再評估獨立、專用的有狀態瀏覽器輔助工具，但持久化本身已證明不足以解決問題，這條路目前仍待驗。適合人工查詢，不能直接承諾每日無人值守。
+2. **若目標是每日自動搜尋，向 1111 確認可授權的資料介面或合作供應。** 目前沒有驗證過可直接採用的全站 API；不以更換 Playwright／Selenium／Crawlee 當成驗證閘門的解法。
+3. **既有網路搜尋可作職缺連結補充。** 不需依賴此處的互動搜尋頁，但覆蓋率、時效與完整分頁另有限制，不能當成完整 1111 搜尋的同等替代。本輪未接入，也未使用正式服務中的金鑰。
+
+不更改全機 DNS、代理、Tailscale 或防護設定；不加入 stealth、驗證碼代解、驗證資料匯出或測試 sitekey 替換。正式功能維持不含 1111。
+
+### 本機證據
+
+診斷目錄：output/playwright/diagnostic-20261011/
+- 2026-10-11T06-37-30-060Z/diagnostic.json：headless 新 context。
+- 2026-10-11T06-41-11-063Z/diagnostic.json：一般視窗、新臨時 persistent context。
+- 2026-10-11T06-44-20-000Z/diagnostic.json：前景／焦點與 60 秒等待。
+- summary.json：三份結果的機器檢查摘要。
+
+僅保存公開 DOM 摘要、資源狀態與去識別錯誤；沒有保存完整 HAR、HTTP headers、cookie 或回傳的驗證 token。動態 challenge URL 已遮蔽。研究原始輸出依然不進 Git。
+
 ## 公開程式參考
 
 查核日期：2026-10-11。此次自行實作，沒有複製下列爬蟲程式。
