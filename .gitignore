@@ -62,6 +62,17 @@
 !/tests/test_start_restart.py
 !/tests/test_web.py
 
+# Standalone 1111 feasibility probe; keep browser output and dependencies local.
+!/experiments/
+/experiments/*
+!/experiments/1111-playwright/
+/experiments/1111-playwright/*
+!/experiments/1111-playwright/package.json
+!/experiments/1111-playwright/package-lock.json
+!/experiments/1111-playwright/probe.mjs
+!/experiments/1111-playwright/probe.test.mjs
+!/experiments/1111-playwright/README.md
+
 # Never publish generated data or credentials, even under an allowed directory.
 __pycache__/
 *.py[cod]

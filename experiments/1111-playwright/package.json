@@ -1,0 +1,13 @@
+{
+  "name": "job-companion-1111-probe",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "probe": "node probe.mjs",
+    "test": "node --test probe.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}
