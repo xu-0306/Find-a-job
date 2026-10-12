@@ -1,6 +1,6 @@
 # 1111 實驗來源與 Playwright／Patchright 探針
 
-**2026-10-11 最新決策：1111 接入為可實際啟用的實驗來源，後台預設關閉。以下獨立探針結果保留為歷史證據；尚未部署至目前運行中的後端。**
+**2026-10-11 最新決策：1111 接入為可實際啟用的實驗來源，後台預設關閉。main 已於 2026-10-12 部署，正式設定仍關閉；下方本次研究修正僅在獨立 worktree，尚未部署。**
 
 正式 Python app 在管理者啟用並保存後，才以 source.mjs 啟動隔離的 Patchright／Chrome，供聊天搜尋、續查、每日搜尋及職缺詳細使用。518 仍預設開啟，兩者均以開關按鈕呈現。現有 Docker 映像不包含此選用環境。
 
@@ -11,9 +11,36 @@
 - 搜尋支援全國或單一縣市／行政區，使用 1111 官方 /api/v1/codeCategories/city 目錄精確對應名稱；多地區或無法唯一對應時明示不支援，不能默默改查全國。每輪最多前五頁，完整性仍依來源分頁 metadata 與職缺 ID 核對。
 - 搜尋卡片的薪資／工作地點尚未可靠解析，保留未知與提醒；不保證最低薪資篩選。詳細內容經職缺及公司身分核對後提供。
 - 載入逾時、人機驗證或不支援格式會回傳來源診斷，保留其他來源結果，不當成成功零筆，也不完成該来源的每日基線。
-- npm.cmd test 執行本機合成頁面的 probe.test.mjs 與 source.test.mjs；GitHub Actions 也跑這些離線檢查，不連線 1111。合併 main 不觸發部署。
+- npm.cmd test 執行本機合成頁面的 probe.test.mjs、source.test.mjs 與 session.test.mjs；GitHub Actions 也跑這些離線檢查，不連線 1111。合併 main 不觸發部署。
 
 穩定性尚未解決：先前完整探針三輪為兩輪成功、一輪人工驗證受阻；本次新橋接兩輪載入失敗，直接 runSource 與 Python→Node main 診斷各成功讀到一頁完整 30 筆（失敗輪未保存足夠資料以確認成因），不能據此宣稱無人操作穩定。固定 profile、跨日成功率及其他運行環境留待後續研究。
+
+## 固定設定檔與連續工作階段（2026-10-12，僅獨立實驗）
+
+在本目錄執行：
+
+~~~powershell
+npm.cmd run session -- --keyword 採購 --area 101600 --rounds 3
+~~~
+
+- 使用本目錄固定的 output/playwright/session-profile，保留此實驗自己的瀏覽器狀態。它與個人 Chrome、正式 app 的臨時 profile 分開；CLI 不接受任意 profile 路徑。
+- 整次執行只啟動一個 Patchright／Chrome，保留同一分頁。每輪依序取得第一頁、由 UI 翻第二頁、再取得各頁一筆詳細資料；每頁仍逐一核對來源 metadata 的全部職缺 ID、查詢條件，詳細頁仍核對職缺／公司及可讀內容。
+- rounds 接受 1～3，預設 3；輪間停 20 秒。任一輪未通過即停止，沒有自動重試。再次執行會重開同一專用設定檔。
+- 原子鎖 session-profile.lock 防止同時占用。正常結束或 Ctrl+C／SIGTERM 會關閉自己的瀏覽器再釋放鎖；強制終止或關閉失敗可能留下鎖。遇 profile_busy，先確認這個專用 profile 的 Chrome 已退出，再移除該空鎖目錄；不可直接刪除仍在使用的鎖。
+- 每次輸出至本目錄 output/playwright/session-<時間>-<唯一值>/。session-summary.json 記錄啟動、各輪、關閉及筆數；round-N/report.json 記錄瀏覽器版本、各階段 navigate／click／url／validate 的耗時與安全錯誤碼。診斷區僅記錄空白頁、Loading、可見驗證文字等提示，失敗時嘗試存 failure.png。
+- profile 會由 Chrome 自行保存網站狀態，屬本機私有資料。它、報告與截圖皆被 Git 忽略，不匯出 cookie、驗證 token、headers 或完整 HAR。
+
+此入口沒有接到 Python 的 source.mjs 呼叫，也沒有修改正式服務的 1111 設定。固定 profile 不能保證免驗證；通過標準始終是頁面與職缺資料完整，不是 HTTP 200 或驗證請求成功。
+
+本次43項離線測試全過；同一瀏覽器三輪＋關閉重開一輪，皆兩頁各30筆及2筆詳細通過，耗時約15.63／9.75／8.73／13.63秒。正式PID、99追蹤檔與設定未變，1111仍關閉。完整結果見 [本機研究報告](../../output/playwright/session-20261012/report.md)；未測跨日，不代表長期成功率。
+
+## 2026-10-12 穩定性研究（僅獨立 worktree，未部署修正）
+
+本輪找到可重現的詳細頁解析錯誤：導覽列與內容 section 都有「工作內容」H2，client rendering 時序使全頁第一個同名標題可能指向導覽，誤回空描述。readDetail 改優先限定真正內容 section，保留無 section 的既有版型及身份／可見性／空描述檢查。27項離線回歸通過；同一真頁DOM舊版0字、修正版37字，修正後完整30＋30筆與2詳細通過（約11.8秒）。
+
+固定專用profile重開時，第一頁完整取得約3.5～3.9秒，首次／臨時profile約7.4～7.7秒；但固定profile後續詳細頁仍出現驗證活動，不能保證免驗證。本輪Python→Node兩頁及兩詳細成功；先前31秒第一頁失敗未重現。正式程式／服務／設定未改，1111維持關閉。
+
+完整對照、原始失敗、解析修正、下一步順序及重現命令見本機 output/playwright/stability-20261012/report.md／summary.json。專用profile與原始診斷保持Git忽略；沒有將持久化profile、重試策略或排程接入正式來源。
 
 ## 獨立探針
 

@@ -72,6 +72,8 @@
 !/experiments/1111-playwright/package-lock.json
 !/experiments/1111-playwright/probe.mjs
 !/experiments/1111-playwright/probe.test.mjs
+!/experiments/1111-playwright/session.mjs
+!/experiments/1111-playwright/session.test.mjs
 !/experiments/1111-playwright/source.mjs
 !/experiments/1111-playwright/source.test.mjs
 !/experiments/1111-playwright/README.md

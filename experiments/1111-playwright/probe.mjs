@@ -84,8 +84,12 @@ export function validateSearch(page, expected, pageNumber, source = page.initial
 }
 
 export function readDetail() {
-  const headings = [...document.querySelectorAll('h1,h2,h3,h4')]
+  let headings = [...document.querySelectorAll('h1,h2,h3,h4')]
     .filter(h => h.checkVisibility({ visibilityProperty: true, opacityProperty: true }));
+  // The navigation repeats the section titles; only the content section owns the description.
+  const section = headings.filter(h => h.innerText.trim() === '工作內容')
+    .map(h => h.closest('section')).find(Boolean);
+  if (section) headings = headings.filter(h => section.contains(h));
   let index = headings.findIndex(h => h.innerText.trim() === '工作內容');
   if (index >= 0 && headings[index + 1]?.innerText.trim() === '職缺描述') index += 1;
   const description = [];
@@ -93,7 +97,7 @@ export function readDetail() {
     const range = document.createRange();
     range.setStartAfter(headings[index]);
     range.setEndBefore(headings[index + 1]);
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(section || document.body, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       if (range.intersectsNode(node) && node.parentElement.checkVisibility({ visibilityProperty: true, opacityProperty: true })
           && !node.parentElement.closest('script,style,noscript')) description.push(node.textContent.trim());
@@ -161,7 +165,12 @@ export async function waitForValidDom(page, read, validate, timeoutMs) {
   }
 }
 
-export async function runProbe(context, { keyword, area = '', outputDir, timeoutMs = 30000, pauseMs = 1500, runtime = {} }) {
+function errorCode(error) {
+  const known = /^(query_mismatch|layout_changed_or_empty|incomplete_search_card|incomplete_page|pagination_unchanged|detail_identity_mismatch|incomplete_detail|dom_read_timeout):/.exec(error?.message || '');
+  return known?.[1] || (error?.name === 'TimeoutError' ? 'timeout' : 'browser_error');
+}
+
+export async function runProbe(context, { keyword, area = '', outputDir, timeoutMs = 30000, pauseMs = 1500, runtime = {}, closePage = true }) {
   const expected = searchUrl(keyword, area);
   await mkdir(outputDir, { recursive: true });
   const page = context.pages()[0] || await context.newPage();
@@ -170,9 +179,27 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
   const report = {
     startedAt: new Date().toISOString(), query: { keyword: keyword.trim(), area }, runtime,
     status: 'running', stages: { search: 'not_run', pagination: 'not_run', details: 'not_run' },
-    pages: [], details: [],
+    pages: [], details: [], events: [],
   };
   let stage = 'search';
+  let step = 'navigate';
+  const recordStep = async (name, action, target = {}) => {
+    step = name;
+    const started = Date.now();
+    const event = { stage, step, ...target, startedAt: new Date(started).toISOString(), status: 'running' };
+    report.events.push(event);
+    try {
+      const result = await action();
+      event.status = 'passed';
+      return result;
+    } catch (error) {
+      event.status = 'failed';
+      event.code = errorCode(error);
+      throw error;
+    } finally {
+      event.durationMs = Date.now() - started;
+    }
+  };
   let responseResult;
   const onResponse = async response => {
     const url = new URL(response.url());
@@ -184,18 +211,20 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
   };
   page.on('response', onResponse);
   try {
-    await page.bringToFront();
-    await page.goto(expected, { waitUntil: 'domcontentloaded' });
+    await recordStep('navigate', async () => {
+      await page.bringToFront();
+      await page.goto(expected, { waitUntil: 'domcontentloaded' });
+    }, { pageNumber: 1 });
     for (let number = 1; number <= 2; number++) {
       if (number === 2) {
         stage = 'pagination';
         responseResult = undefined;
         await delay(pauseMs);
         // The current site exposes duplicate desktop/mobile controls; click the visible one.
-        await page.locator('button.pagination-button[title="前往2頁"]:visible').first().click();
-        await page.waitForURL(url => url.searchParams.get('page') === '2', { waitUntil: 'domcontentloaded' });
+        await recordStep('click', () => page.locator('button.pagination-button[title="前往2頁"]:visible').first().click(), { pageNumber: 2 });
+        await recordStep('url', () => page.waitForURL(url => url.searchParams.get('page') === '2', { waitUntil: 'domcontentloaded' }), { pageNumber: 2 });
       }
-      const result = await waitForValidDom(page, readSearch, result => {
+      const result = await recordStep('validate', () => waitForValidDom(page, readSearch, result => {
         const source = responseResult?.page === number ? responseResult : result.initialResult;
         validateSearch(result, expected, number, source);
         result.completeness = { ...source, expectedCount: source.ids.length, matched: true };
@@ -205,7 +234,7 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
           result.overlap = result.jobs.filter(job => previousIds.has(job.id)).length;
           if (result.overlap === result.jobs.length) throw new Error('pagination_unchanged: page 2 has no new job IDs');
         }
-      }, timeoutMs);
+      }, timeoutMs), { pageNumber: number });
       report.pages.push(result);
       report.stages[stage] = 'passed';
     }
@@ -214,8 +243,8 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
       !report.pages[0].jobs.some(previous => previous.id === job.id))];
     for (const job of sample) {
       await delay(pauseMs);
-      await page.goto(job.url, { waitUntil: 'domcontentloaded' });
-      const detail = await waitForValidDom(page, readDetail, detail => validateDetail(detail, job), timeoutMs);
+      await recordStep('navigate', () => page.goto(job.url, { waitUntil: 'domcontentloaded' }), { jobId: job.id });
+      const detail = await recordStep('validate', () => waitForValidDom(page, readDetail, detail => validateDetail(detail, job), timeoutMs), { jobId: job.id });
       report.details.push({ id: job.id, company: job.company, ...detail });
     }
     report.stages.details = 'passed';
@@ -223,24 +252,37 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
   } catch (error) {
     report.stages[stage] = 'failed';
     report.status = 'failed';
-    report.error = { stage, message: error.message };
+    report.error = { stage, step, code: errorCode(error), message: errorCode(error) };
     try {
-      const state = await evaluateWithTimeout(page, () => ({ url: location.href, title: document.title, text: document.body.innerText.slice(0, 2000) }), Math.min(timeoutMs, 5000));
+      const state = await recordStep('diagnostic', () => evaluateWithTimeout(page, () => ({
+        title: document.title, text: document.body.innerText.slice(0, 2000),
+      }), Math.min(timeoutMs, 5000)));
       report.status = failureStatus(state);
-      report.diagnostic = state;
+      // Save only failure hints; challenge URLs and page text can contain temporary tokens.
+      report.diagnostic = {
+        blankBody: !state.text.trim(),
+        loadingTitle: /^Loading\.{3}$/i.test(state.title) || state.title.startsWith('⏳'),
+        verificationVisible: /verify you are human|確認您是人類|驗證您是人類|checking your browser/i.test(state.text),
+      };
     } catch (diagnosticError) {
-      report.diagnosticError = diagnosticError.message;
+      report.diagnosticError = errorCode(diagnosticError);
     }
     try {
-      await page.screenshot({ path: resolve(outputDir, 'failure.png'), timeout: 5000 });
+      await recordStep('screenshot', () => page.screenshot({ path: resolve(outputDir, 'failure.png'), timeout: 5000 }));
     } catch (screenshotError) {
-      report.screenshotError = screenshotError.message;
+      report.screenshotError = errorCode(screenshotError);
     }
   } finally {
     page.off('response', onResponse);
+    if (closePage) {
+      try { await recordStep('close', () => page.close()); }
+      catch (error) {
+        report.status = 'failed';
+        report.closeError = errorCode(error);
+      }
+    }
     report.finishedAt = new Date().toISOString();
     await writeFile(resolve(outputDir, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
-    await page.close();
   }
   return report;
 }
