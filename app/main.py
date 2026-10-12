@@ -29,6 +29,7 @@ from .scheduler import DailyRunner, TAIPEI, effective_preferences, run_view, use
 from .sprite_validation import STATES, MAX_FILE_BYTES, TEMPLATE_COLUMNS, validate_png, split_template
 from .sharing import Sharing
 from .ports import Ports
+from .model_profiles import LLMSettings, ProfileInput, StoredProfile, CONNECTION_FIELDS, MAX_PROFILES, profile_view
 
 STATIC = Path(__file__).parent / "static"
 SECRET_FIELDS = ("llm_api_key", "brave_api_key", "tavily_api_key")
@@ -76,10 +77,7 @@ class SharingAction(Input):
     action: Literal['install', 'login', 'enable', 'disable', 'check']
 
 
-class Settings(Input):
-    llm_base_url: str | None = Field(default=None, max_length=2000)
-    llm_model: str | None = Field(default=None, max_length=200)
-    llm_protocol: Literal["auto", "responses", "chat_completions", "anthropic_messages"] | None = None
+class Settings(LLMSettings):
     admin_local_only: bool | None = None
     source_518_enabled: bool | None = None
     source_1111_enabled: bool | None = None
@@ -89,20 +87,6 @@ class Settings(Input):
     tavily_api_key: str = Field(default="", max_length=4096)
     search_provider: Literal['auto', 'Brave', 'Tavily'] | None = None
     clear_secrets: list[Literal["llm_api_key", "brave_api_key", "tavily_api_key"]] = Field(default_factory=list)
-
-    @field_validator("llm_base_url")
-    @classmethod
-    def valid_url(cls, value):
-        if value:
-            try:
-                parsed = urlsplit(value)
-                valid = parsed.scheme in ("http", "https") and parsed.hostname and not parsed.username and not parsed.password
-                parsed.port
-            except ValueError:
-                valid = False
-            if not valid or any(char.isspace() for char in value):
-                raise ValueError("需為不含帳密的 HTTP 或 HTTPS 網址")
-        return value
 
     @model_validator(mode="after")
     def no_conflicting_secret(self):
@@ -600,6 +584,67 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             provider = reviews.active_provider(store, db)
             if (provider, store.get(db, (provider or '').lower() + '_api_key', '')) != (previous_provider, previous_search_key):
                 db.execute("DELETE FROM settings WHERE key='search_test'")
+            return settings_view(store, db)
+
+    def saved_model_view(db, profile):
+        return profile_view(profile, DEFAULT_SETTINGS | store.get(db, "services", {}),
+                            store.get(db, "llm_api_key", ""))
+
+    @app.get("/api/admin/model-profiles")
+    def list_model_profiles(auth=Depends(admin)):
+        with store.connect() as db:
+            return {"items": [saved_model_view(db, item) for item in store.get(db, "model_profiles", [])]}
+
+    @app.post("/api/admin/model-profiles", status_code=201)
+    def add_model_profile(body: ProfileInput, auth=Depends(admin)):
+        if not body.llm_api_key:
+            raise APIError(422, "key_required", "新增模型設定時請填入 API 金鑰。")
+        with store.connect(write=True) as db:
+            ensure_active(db, auth["hash"])
+            profiles = store.get(db, "model_profiles", [])
+            if len(profiles) >= MAX_PROFILES:
+                raise APIError(409, "profile_limit", f"最多保存 {MAX_PROFILES} 組模型設定。")
+            profile = StoredProfile(id=uuid4().hex, **body.model_dump()).model_dump()
+            profiles.append(profile)
+            store.put(db, "model_profiles", profiles)
+            return saved_model_view(db, profile)
+
+    def find_model_profile(db, ident):
+        profiles = store.get(db, "model_profiles", [])
+        profile = next((item for item in profiles if item["id"] == ident), None)
+        if profile is None:
+            raise APIError(404, "profile_missing", "找不到這組模型設定，請重新載入列表。")
+        return profiles, profile
+
+    @app.put("/api/admin/model-profiles/{ident}")
+    def update_model_profile(ident: str, body: ProfileInput, auth=Depends(admin)):
+        with store.connect(write=True) as db:
+            ensure_active(db, auth["hash"])
+            profiles, profile = find_model_profile(db, ident)
+            values = body.model_dump()
+            values["llm_api_key"] = body.llm_api_key or profile["llm_api_key"]
+            profile.update(values)
+            store.put(db, "model_profiles", profiles)
+            return saved_model_view(db, profile)
+
+    @app.delete("/api/admin/model-profiles/{ident}", status_code=204)
+    def delete_model_profile(ident: str, auth=Depends(admin)):
+        with store.connect(write=True) as db:
+            ensure_active(db, auth["hash"])
+            profiles, profile = find_model_profile(db, ident)
+            profiles.remove(profile)
+            store.put(db, "model_profiles", profiles)
+        return Response(status_code=204)
+
+    @app.post("/api/admin/model-profiles/{ident}/apply")
+    def apply_model_profile(ident: str, auth=Depends(admin)):
+        with store.connect(write=True) as db:
+            ensure_active(db, auth["hash"])
+            _, profile = find_model_profile(db, ident)
+            services = DEFAULT_SETTINGS | store.get(db, "services", {})
+            services.update({field: profile[field] for field in CONNECTION_FIELDS})
+            store.put(db, "services", services)
+            store.put(db, "llm_api_key", profile["llm_api_key"])
             return settings_view(store, db)
 
     @app.post('/api/admin/search-test')

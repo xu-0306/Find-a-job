@@ -705,7 +705,8 @@ async function testSourceSwitchesLoadToggleAndSave() {
   const harness = createHarness();
   const common = fs.readFileSync(path.join(root, "app", "static", "common.js"), "utf8");
   vm.runInContext(common.match(/^const secretKeys = .*$/m)[0] + "\n" + extractFunction(common, "formAction"), harness.context);
-  vm.runInContext(extractFunction(script, "setSourceSwitch") + "\n" + extractFunction(script, "loadSettings"), harness.context);
+  vm.runInContext(extractFunction(script, "setSourceSwitch") + "\n" + extractFunction(script, "renderLLMSettings") + "\n" + extractFunction(script, "loadSettings"), harness.context);
+  harness.context.loadModelProfiles = async () => {};
   const servicesSave = script.match(/^formAction\(\$\("#services"\), async \(\) => \{[\s\S]*?^\}\);/m);
   assert.ok(servicesSave, "services save handler should be extractable");
   const names = ["llm_base_url", "llm_model", "llm_protocol", "vapid_subject", "search_provider", "admin_local_only",

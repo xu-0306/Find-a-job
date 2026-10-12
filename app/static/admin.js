@@ -805,6 +805,7 @@ function requestUserAction(kind, user) {
 }
 // --- end accounts ---
 function signedOut() {
+  resetModelProfiles();
   csrfToken = ""; invalidateSharing(); hideAccess();
   $("#user-list").replaceChildren(); linkButtons = []; pendingUserAction = null;
   spriteListVersion += 1; clearSpriteAnimations(spriteListAnimations);
@@ -825,11 +826,19 @@ function setSourceSwitch(button, enabled) {
   button.setAttribute("aria-checked", String(enabled));
   button.textContent = enabled ? "開啟" : "關閉";
 }
-async function loadSettings() {
-  const settings = await api("/api/admin/settings");
+function renderLLMSettings(settings) {
   const form = $("#services");
   for (const key of ["llm_base_url", "llm_model"]) form.elements[key].value = settings[key] || "";
   form.elements.llm_protocol.value = settings.llm_protocol || "auto";
+  form.elements.llm_api_key.value = "";
+  form.elements.clear_llm_api_key.checked = false;
+  $('[data-status=llm_api_key]').textContent = settings.llm_api_key.configured ? "已設定 ••••••••" : "尚未設定";
+  $("#llm-status").textContent = settings.connection_test_status === "passed" ? `文字與工具往返測試通過 · ${settings.detected_protocol}` : "尚未通過目前設定的連線測試。";
+}
+async function loadSettings() {
+  const settings = await api("/api/admin/settings");
+  const form = $("#services");
+  renderLLMSettings(settings);
   form.elements.vapid_subject.value = settings.vapid_subject || "";
   form.elements.search_provider.value = settings.search_provider || "";
   form.elements.admin_local_only.checked = Boolean(settings.admin_local_only);
@@ -839,7 +848,6 @@ async function loadSettings() {
     form.elements[key].value = ""; form.elements[`clear_${key}`].checked = false;
     $(`[data-status=${key}]`).textContent = settings[key].configured ? "已設定 ••••••••" : "尚未設定";
   }
-  $("#llm-status").textContent = settings.connection_test_status === "passed" ? `文字與工具往返測試通過 · ${settings.detected_protocol}` : "尚未通過目前設定的連線測試。";
   const provider = settings.active_search_provider;
   const configured = Boolean(provider && settings[`${provider.toLowerCase()}_api_key`]?.configured);
   $("#search-engine-name").textContent = provider ? `目前搜尋服務：${provider}` : "網路搜尋尚未啟用。";
@@ -855,6 +863,7 @@ function addDefault(criteria) {
 }
 async function signedIn() {
   await loadSettings();
+  await loadModelProfiles();
   const schedule = await api("/api/admin/schedule"); $("#schedule [name=time]").value = schedule.time;
   const quotes = await api("/api/admin/quotes"); $("#quotes [name=texts]").value = quotes.texts.join("\n");
   await loadSprites(); await loadRuns(); await loadBackups(); await loadUsers();
@@ -903,7 +912,7 @@ formAction($("#services"), async () => {
     clear_secrets: secretKeys.filter(key => form.elements[`clear_${key}`].checked)};
   for (const key of secretKeys) values[key] = form.elements[key].value;
   await api("/api/admin/settings", {method: "PUT", body: JSON.stringify(values)});
-  await loadSettings(); message("設定已保存，可測試模型與搜尋連線。");
+  await loadSettings(); await loadModelProfiles(); message("設定已保存，可測試模型與搜尋連線。");
 });
 action($("#llm-test"), async () => {
   $("#llm-status").textContent = "正在測試文字與工具往返，請稍候…";
@@ -952,6 +961,7 @@ formAction($("#user-form"), async () => {
 $("#copy-access").addEventListener("click", copyAccess);
 $("#hide-access").addEventListener("click", hideAccess);
 window.addEventListener("pagehide", () => {
+  resetModelProfiles();
   invalidateSharing();
   spriteListVersion += 1; clearSpriteAnimations(spriteListAnimations);
   hideAccess(); $("#services").reset(); $("#login").reset(); $("#restore-form").reset();

@@ -12,6 +12,7 @@ from uuid import uuid4
 from contextlib import closing
 
 from .store import encode
+from .model_profiles import ProfileCollection
 
 
 def validate_settings(path, settings_model, defaults_model, schedule_model):
@@ -22,6 +23,7 @@ def validate_settings(path, settings_model, defaults_model, schedule_model):
         with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
             values = {key: json.loads(value) for key, value in db.execute('SELECT * FROM settings')}
             settings_model.model_validate(values.get('services', {}))
+            ProfileCollection.model_validate({'items': values.get('model_profiles', [])})
             defaults_model.model_validate({'preferences': values.get('default_preferences', [])})
             schedule_model.model_validate({'time': values.get('schedule_time', '09:00')})
             if 'user_has_chosen' in values and type(values['user_has_chosen']) is not bool:
