@@ -162,6 +162,100 @@ class SourceChatChecks(unittest.TestCase):
         self.assertIn('search_exhausted', [x.get('code') for event, x in output if event == 'error'])
         self.assertEqual(self.source_urls, [])
 
+    def detail_provider(self, arguments, protocol='responses'):
+        requests = []
+        def provider(req):
+            payload = json.loads(req.content); requests.append(payload)
+            if len(requests) == 1:
+                tools = {tool.get('name', tool.get('function', {}).get('name')):
+                         tool.get('function', tool) for tool in payload['tools']}
+                self.assertIn('url', tools['get_job_details'].get('parameters', tools['get_job_details'].get('input_schema'))['properties'])
+                self.assertIn('只有使用者要找、推薦或比較職缺', tools['search_jobs']['description'])
+                from app.chat import SYSTEM
+                for principle in ('詢問特定職缺時不搜尋', '不用搜尋去找', '1～3句', '尚未確認'):
+                    self.assertIn(principle, SYSTEM)
+                self.assertIn(SYSTEM, json.dumps(payload, ensure_ascii=False))
+                return response(protocol, call=('detail1', 'get_job_details', encode(arguments)))
+            self.assertIn('identity_verified', json.dumps(payload))
+            return response(protocol, text='先依職缺內容分析；尚未確認的資訊請補充。')
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        return requests
+
+    def test_url_detail_roundtrip_preserves_identity_cleaning_and_no_candidates(self):
+        from test_m2_chat import SETTINGS
+        calls = []
+        async def detail(name, args):
+            calls.append((name, args))
+            self.assertEqual(name, 'get_job_detail')
+            self.assertEqual(args, {'detail_id': '91mtc'})
+            return ({'job_no': '15192528', 'job_name': '合成採購', 'company': '合成公司',
+                     'description': '<b>供應鏈工作</b> 請寄 secret@example.invalid'},
+                    {'data': {'header': {'analysisUrl': '/jobs/main/analysis/91mtc'}}})
+        for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
+            for suffix in ('', '?jobsource=google'):
+                with self.subTest(protocol=protocol, suffix=suffix):
+                    with self.store.connect(write=True) as db: self.store.put(db, 'services', SETTINGS | {'llm_protocol': protocol})
+                    self.use_sources(detail)
+                    url = 'https://www.104.com.tw/job/91mtc' + suffix
+                    requests = self.detail_provider({'url': url}, protocol)
+                    output = events(self.client.post('/api/chat', json={'request_id': protocol+str(bool(suffix)),
+                        'text': '分析這則職缺與職涯方向 '+url}))
+                    self.assertEqual(output[-1][1]['status'], 'completed', output)
+                    result = next(data for event, data in output if event == 'job_detail')
+                    self.assertTrue(result['identity_verified'])
+                    self.assertIsNone(result['item']); self.assertIsNone(result['job_id'])
+                    self.assertEqual(result['url'], url)
+                    self.assertIn('供應鏈工作', result['detail']['summary'])
+                    self.assertNotIn('<b>', result['detail']['summary'])
+                    self.assertNotIn('secret@example.invalid', result['detail']['summary'])
+                    self.assertFalse(any(event in ('jobs', 'recommendations') for event, _ in output))
+                    self.assertEqual(len(requests), 2)
+                    self.assertEqual(self.source_urls, [])
+                    with self.store.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM jobs').fetchone()[0], 0)
+                    history = self.client.get('/api/messages').json()['items'][-1]['content']['events']
+                    self.assertFalse(any(event['event'] == 'jobs' for event in history))
+        self.assertEqual(len(calls), 6)
+
+    def test_url_detail_cannot_verify_echoed_url_or_unrelated_analysis_url(self):
+        for index, analysis in enumerate((None, '/jobs/main/analysis/other')):
+            async def detail(name, args):
+                return ({'job_no': '15192528', 'url': 'https://www.104.com.tw/job/91mtc', 'description': '合成內容'},
+                        {'data': {'header': {'analysisUrl': analysis}}})
+            self.configure(service=detail)
+            self.detail_provider({'url': 'https://www.104.com.tw/job/91mtc'})
+            output = events(self.send('unverified'+str(index)))
+            result = next(data for event, data in output if event == 'job_detail')
+            self.assertFalse(result['identity_verified'])
+            self.assertIsNone(result['item'])
+            self.assertTrue(result['limitations'])
+
+    def test_saved_job_id_tool_and_api_still_update_verified_job(self):
+        from app.store import Job
+        job_id = self.store.save_job(Job(source='104', source_job_id='15192528', title='既有職稱',
+            company_name='合成公司', url='https://www.104.com.tw/job/91mtc'))
+        async def detail(name, args):
+            return {'job_no': '15192528', 'job_name': '新職稱', 'description': '已核對內容'}, None
+        self.configure(service=detail)
+        self.detail_provider({'job_id': job_id})
+        output = events(self.send('saved-detail'))
+        result = next(data for event, data in output if event == 'job_detail')
+        self.assertEqual(result['job_id'], job_id)
+        self.assertEqual(result['item']['title'], '新職稱')
+        self.assertTrue(result['identity_verified'])
+        self.assertEqual(self.client.post('/api/jobs/'+job_id+'/details').json()['item']['title'], '新職稱')
+        with self.store.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+
+    def test_invalid_url_tool_is_rejected_without_any_source_call(self):
+        async def blocked(*args): self.fail('Invalid URL must not reach the provider')
+        for index, args in enumerate(({'url': 'https://evil.invalid/job/91mtc'},
+                {'url': 'https://www.104.com.tw/job/91mtc/extra'},
+                {'job_id': 'saved', 'url': 'https://www.104.com.tw/job/91mtc'}, {})):
+            self.configure(service=blocked)
+            self.detail_provider(args)
+            output = events(self.send('invalid-detail'+str(index)))
+            self.assertIn('invalid_tool', [data.get('code') for event, data in output if event == 'error'])
+            self.assertFalse(any(event in ('jobs', 'job_detail') for event, _ in output))
+
 
 del ChatChecks  # Reuse setup without rediscovering the original suite in this module.
 if __name__ == '__main__': unittest.main()

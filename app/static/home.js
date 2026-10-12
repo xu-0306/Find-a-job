@@ -1152,26 +1152,62 @@ function showPage(page) {
 function renderChatText(container, text) {
   container.replaceChildren();
   const links = new Set();
-  const pattern = /\[([^\]\n]+)\]\((https?:\/\/[^\s<>]+)\)|(https?:\/\/[^\s<>"'`*]+)/g;
-  let offset = 0;
-  for (const match of text.matchAll(pattern)) {
-    container.append(node("span", text.slice(offset, match.index)));
-    let url = match[2] || match[3];
-    if (!match[2]) {
-      url = url.replace(/[.,!?;:，。！？；：、\]】」』]+$/, "");
-      while (url.endsWith(")") && url.split(")").length > url.split("(").length) url = url.slice(0, -1);
+  function inline(parent, value) {
+    const pattern = /\x60([^\x60\n]+)\x60|\*\*([^\n]+?)\*\*|\[([^\]\n]+)\]\((https?:\/\/[^\s<>]+)\)|(https?:\/\/[^\s<>"'\x60*]+)/g;
+    let offset = 0;
+    for (const match of value.matchAll(pattern)) {
+      parent.append(node("span", value.slice(offset, match.index)));
+      if (match[1] !== undefined) parent.append(node("code", match[1]));
+      else if (match[2] !== undefined) {
+        const strong = node("strong"); inline(strong, match[2]); parent.append(strong);
+      } else {
+        let url = match[4] || match[5];
+        if (!match[4]) {
+          url = url.replace(/[.,!?;:，。！？；：、\]】」』]+$/, "");
+          while (url.endsWith(")") && url.split(")").length > url.split("(").length) url = url.slice(0, -1);
+        }
+        const href = JobCards.safeHref(url);
+        if (href) {
+          links.add(href);
+          const link = JobCards.externalLink(match[3] || url, href, "chat-link");
+          link.addEventListener("click", () => focusJobByUrl(href));
+          parent.append(link);
+          if (!match[4]) parent.append(node("span", match[5].slice(url.length)));
+        } else parent.append(node("span", match[0]));
+      }
+      offset = match.index + match[0].length;
     }
-    const href = JobCards.safeHref(url);
-    if (href) {
-      links.add(href);
-      const link = JobCards.externalLink(match[1] || url, href, "chat-link");
-      link.addEventListener("click", () => focusJobByUrl(href));
-      container.append(link);
-      if (!match[2]) container.append(node("span", match[3].slice(url.length)));
-    } else container.append(node("span", match[0]));
-    offset = match.index + match[0].length;
+    parent.append(node("span", value.slice(offset)));
   }
-  container.append(node("span", text.slice(offset)));
+  let paragraph = [], list = null;
+  function flushParagraph() {
+    if (paragraph.length) {
+      const p = node("p"); inline(p, paragraph.join("\n")); container.append(p); paragraph = [];
+    }
+  }
+  for (const line of String(text || "").replace(/\r\n?/g, "\n").split("\n")) {
+    if (!line.trim()) { flushParagraph(); list = null; continue; }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    const item = line.match(/^\s*(?:([-*])\s+|(\d+)\.\s+)(.+)$/);
+    const quote = line.match(/^>\s?(.*)$/);
+    if (heading || item || quote) {
+      flushParagraph();
+      if (item) {
+        const tag = item[1] ? "ul" : "ol";
+        if (!list || list.tagName.toLowerCase() !== tag) {
+          list = node(tag);
+          if (tag === "ol") list.setAttribute("start", item[2]);
+          container.append(list);
+        }
+        const li = node("li"); inline(li, item[3]); list.append(li);
+      } else {
+        list = null;
+        const block = node(heading ? "h" + heading[1].length : "blockquote");
+        inline(block, heading ? heading[2] : quote[1]); container.append(block);
+      }
+    } else { list = null; paragraph.push(line); }
+  }
+  flushParagraph();
   return links;
 }
 function renderChatRecommendations(container, text) {
@@ -1510,7 +1546,7 @@ function chatMessage(role, text, status = "completed", events = [], attachments 
     avatar.append(portrait); card.append(avatar);
   }
   const bubble = node("div", undefined, "chat-bubble");
-  bubble.append(node("strong", role === "user" ? "你" : "小幫手"), node("p", undefined, "chat-text"));
+  bubble.append(node("strong", role === "user" ? "你" : "小幫手"), node("div", undefined, "chat-text"));
   for (const attachment of attachments) bubble.append(node("small", `附件：${attachment.filename}${attachment.pages ? ` · ${attachment.pages} 頁` : ""}`, "hint"));
   if (role === "user") {
     const meta = node("div", undefined, "chat-message-meta");

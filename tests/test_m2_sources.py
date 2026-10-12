@@ -282,5 +282,30 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['identity_verified'])
         self.assertTrue(result['detail']['summary'])
 
+    def test_detail_input_accepts_one_saved_id_or_safe_104_url(self):
+        from app.sources import DetailInput
+        self.assertEqual(DetailInput(job_id='saved-id').job_id, 'saved-id')
+        for url in ('https://www.104.com.tw/job/91mtc', 'https://www.104.com.tw/job/91mtc?jobsource=google'):
+            self.assertEqual(DetailInput(url=url).url, url)
+        invalid = [
+            'https://evil.invalid/job/91mtc', 'https://www.104.com.tw.evil.invalid/job/91mtc',
+            'https://www.518.com.tw/job/91mtc', 'http://www.104.com.tw/job/91mtc',
+            'https://user@www.104.com.tw/job/91mtc', 'https://www.104.com.tw:8443/job/91mtc',
+            'https://www.104.com.tw/job/91mtc#fragment', 'https://www.104.com.tw/jobs/91mtc',
+            'https://www.104.com.tw/job/', 'https://www.104.com.tw/job/91mtc/extra',
+            'https://www.104.com.tw/job/../admin', 'https://www.104.com.tw/job/%2e%2e',
+        ]
+        for url in invalid:
+            with self.subTest(url=url), self.assertRaises(ValueError): DetailInput(url=url)
+        for values in ({}, {'job_id': 'saved', 'url': 'https://www.104.com.tw/job/91mtc'}):
+            with self.assertRaises(ValueError): DetailInput(**values)
+
+    async def test_detail_rechecks_url_before_source_request(self):
+        from types import SimpleNamespace
+        async def blocked(*args): self.fail('Invalid URL must not reach the provider')
+        for url in ('https://evil.invalid/job/91mtc', 'https://www.104.com.tw/job/91mtc/extra'):
+            with self.assertRaises(SourceError):
+                await Sources(mcp_call=blocked).detail(SimpleNamespace(source='104', source_job_id=None, url=url))
+
 
 if __name__ == '__main__': unittest.main()

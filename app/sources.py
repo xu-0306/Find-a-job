@@ -36,7 +36,17 @@ class SearchInput(Input):
 
 
 class DetailInput(Input):
-    job_id: str = Field(min_length=1, max_length=100)
+    job_id: str | None = Field(default=None, min_length=1, max_length=100,
+        description='已保存職缺的 job_id；與 url 擇一。')
+    url: str | None = Field(default=None, min_length=1, max_length=2048,
+        description='使用者提供的 HTTPS 104 職缺網址 https://www.104.com.tw/job/<id>，可帶查詢參數；與 job_id 擇一。')
+
+    def model_post_init(self, context):
+        if (self.job_id is None) == (self.url is None):
+            raise ValueError('job_id 與 url 須擇一提供')
+        if self.url is not None and (not safe_url(self.url, 'www.104.com.tw') or
+                not re.fullmatch('/job/[A-Za-z0-9]+', urlsplit(self.url).path)):
+            raise ValueError('只接受合法的 HTTPS 104 職缺網址')
 
 
 class DailySearchInput(SearchInput):
@@ -708,7 +718,9 @@ class Sources:
                         raw_ids.append(value)
             observed_ids = [value for value in (returned_id, *raw_ids) if value]
             id_matches = any(value == job.source_job_id for value in observed_ids)
-            id_conflict = bool(observed_ids) and any(value != job.source_job_id for value in observed_ids)
+            # URL-only reads have no saved job number; identity still requires the returned analysisUrl.
+            id_conflict = (any(value != job.source_job_id for value in observed_ids)
+                           if job.source_job_id is not None else len(set(observed_ids)) > 1)
 
             # The installed package maps data.header.analysisUrl only in its
             # raw response, while the public JobDetail mapping drops it. It is

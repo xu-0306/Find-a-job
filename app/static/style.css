@@ -10,7 +10,8 @@ dialog{max-width:min(480px,calc(100% - 32px));border:1px solid var(--line);borde
 .source-switch::before{left:12px;width:32px;height:20px;background:var(--muted)}
 .source-switch::after{left:15px;width:14px;height:14px;background:var(--surface)}
 .source-switch[aria-checked=true]::before{background:var(--primary)}.source-switch[aria-checked=true]::after{left:27px}
-#chat-list:empty::before{content:"今天想聊些什麼？不用急，慢慢來。";color:var(--muted)}.chat-text{white-space:pre-wrap;overflow-wrap:anywhere}
+#chat-list:empty::before{content:"今天想聊些什麼？不用急，慢慢來。";color:var(--muted)}.chat-text{overflow-wrap:anywhere;line-height:1.65}
+.chat-text>p,.chat-text>blockquote,.chat-text li{white-space:pre-wrap}.chat-text>p{margin:0 0 .75em}.chat-text>h1,.chat-text>h2,.chat-text>h3{color:var(--text);line-height:1.4;margin:1em 0 .4em}.chat-text>h1{font-size:1.25em}.chat-text>h2{font-size:1.15em}.chat-text>h3{font-size:1.05em}.chat-text>ul,.chat-text>ol{margin:.4em 0 .75em;padding-left:1.5em}.chat-text li+li{margin-top:.3em}.chat-text>blockquote{margin:.6em 0;padding:.2em .75em;border-left:3px solid var(--primary);color:var(--muted)}.chat-text code{font-family:ui-monospace,monospace;font-size:.9em;padding:.1em .3em;border-radius:4px;background:var(--soft)}.chat-text>:first-child{margin-top:0}.chat-text>:last-child{margin-bottom:0}
 .sprite-preview{display:block;max-width:100%;height:auto;image-rendering:pixelated}summary{cursor:pointer;min-height:44px;padding:8px 0}
 .companion{flex-shrink:0;image-rendering:pixelated}.backup-link{overflow-wrap:anywhere}
 #sprite-prompts textarea[readonly]{font-size:14px;line-height:1.7}#sprite-prompts .sprite-prompt-character{min-height:96px}

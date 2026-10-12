@@ -1864,7 +1864,73 @@ function testSplitterMarkup() {
   assert.ok(homeHtml.indexOf('id="chat"') < homeHtml.indexOf('id="panel-resizer"') && homeHtml.indexOf('id="panel-resizer"') < homeHtml.indexOf('id="search-results-panel"'), "the splitter sits between the chat and results columns");
 }
 
+
+async function testMarkdownBlocksAndInline() {
+  const home = createContext(); await settle();
+  const text = new FakeElement();
+  home.context.renderChatText(text, "# 結論\n\n第一行\n第二行 **重點** 與 \x60skill\x60\n\n## 公司\n- 第一點\n* 第二點\n\n### 建議\n1. 準備\n2. 行動\n\n> 先確認內容");
+  assert.deepEqual(text.children.map(item => item.tagName), ["H1", "P", "H2", "UL", "H3", "OL", "BLOCKQUOTE"]);
+  assert.equal(text.children[1].textContent, "第一行\n第二行 重點 與 skill");
+  assert.equal(all(text, item => item.tagName === "STRONG")[0].textContent, "重點");
+  assert.equal(all(text, item => item.tagName === "CODE")[0].textContent, "skill");
+  assert.equal(text.children[3].children.length, 2);
+  assert.equal(text.children[5].children.length, 2);
+  assert.equal(text.children[5].getAttribute("start"), "1");
+  home.context.renderChatText(text, "前段\r\n\r\n後段\r\n換行");
+  assert.deepEqual(text.children.map(item => item.textContent), ["前段", "後段\n換行"]);
+}
+
+async function testMarkdownUnsafeInputStaysText() {
+  const home = createContext(); await settle();
+  const text = new FakeElement();
+  const malicious = '<script>alert(1)</script> <img src=x onerror=alert(1)> [壞連結](javascript:alert(1))';
+  const links = home.context.renderChatText(text, malicious);
+  assert.equal(text.textContent, malicious);
+  assert.equal(links.size, 0);
+  assert.equal(all(text, item => ["SCRIPT", "IMG", "A"].includes(item.tagName)).length, 0);
+  home.context.renderChatText(text, '**<img onerror=alert(1)>**\n- <script>bad</script>\n\x60[壞連結](javascript:alert(1))\x60');
+  assert.equal(all(text, item => ["SCRIPT", "IMG", "A"].includes(item.tagName)).length, 0);
+}
+
+async function testMarkdownLinksKeepFocusAndSet() {
+  const home = createContext(); await settle();
+  const focused = [];
+  home.context.focusJobByUrl = href => focused.push(href);
+  const text = new FakeElement();
+  const links = home.context.renderChatText(text, '**[職缺](https://www.104.com.tw/job/91mtc)**\n\n- https://www.104.com.tw/job/91mtc。\n- [公司](https://example.invalid/about)\n\n\x60https://example.invalid/code\x60');
+  assert.deepEqual([...links], ["https://www.104.com.tw/job/91mtc", "https://example.invalid/about"]);
+  const anchors = all(text, item => item.tagName === "A");
+  assert.equal(anchors.length, 3);
+  assert.equal(anchors[0].target, "_blank");
+  assert.equal(anchors[0].rel, "noopener noreferrer");
+  await anchors[0].click();
+  assert.deepEqual(focused, ["https://www.104.com.tw/job/91mtc"]);
+}
+
+async function testMarkdownStreamingAndHistoryShareRenderer() {
+  const home = createContext(); await settle();
+  const text = new FakeElement();
+  for (const partial of ['**', '**重點', '**重點*', '**重點**']) {
+    assert.doesNotThrow(() => home.context.renderChatText(text, partial));
+    assert.equal(text.textContent, partial === '**重點**' ? '重點' : partial);
+  }
+  const message = home.context.chatMessage("assistant", "## 歷史\n- **重點**", "completed");
+  const content = message.querySelector(".chat-text");
+  assert.equal(content.tagName, "DIV", "block markup has a valid container");
+  assert.equal(all(content, item => item.tagName === "H2").length, 1);
+  assert.equal(all(content, item => item.tagName === "LI").length, 1);
+  home.context.renderChatText(content, "## 串流\n- **未完成");
+  home.context.renderChatRecommendations(message, "## 串流\n- **已完成**");
+  assert.equal(all(content, item => item.tagName === "STRONG")[0].textContent, "已完成");
+  home.context.renderChatEvent(message, "job_detail", {job_id: null, item: null, identity_verified: true, detail: {title: "網址職缺"}});
+  assert.equal(home.elements.get("search-results-panel").hidden, true, "URL-only details do not create candidates");
+}
+
 (async () => {
+  await testMarkdownBlocksAndInline();
+  await testMarkdownUnsafeInputStaysText();
+  await testMarkdownLinksKeepFocusAndSet();
+  await testMarkdownStreamingAndHistoryShareRenderer();
   await testChatDeliveryFeedback();
   await testEditRegenerationInPlace();
   await testCompanionLifecycle();
@@ -1894,7 +1960,7 @@ function testSplitterMarkup() {
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 29 checks passed");
+  console.log("test_m3_home: 33 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

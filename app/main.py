@@ -9,6 +9,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -1205,10 +1206,11 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             store.put(db, 'search_provider', provider)
             return {'selection': provider, 'scores': scores}
 
-    async def read_job_details(job_id, auth_hash, user_id):
-        job = stored_job(job_id)
+    async def read_job_details(job_id, auth_hash, user_id, url=None):
+        job = stored_job(job_id) if job_id else SimpleNamespace(source='104', source_job_id=None, url=url)
         try:
             with store.connect() as db:
+                ensure_active(db, auth_hash)
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
             if job.source not in enabled:
                 raise sources.SourceError('unsupported', f'{job.source} 已在後台停用，本次未查詢詳細頁。')
@@ -1216,9 +1218,11 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         except sources.SourceError as exc:
             result = {'status': exc.status, 'detail': None, 'identity_verified': False, 'limitations': [exc.message]}
         result.update(job_id=job_id, item=None)
+        if url is not None:
+            result['url'] = url
         with store.connect(write=True) as db:
             ensure_active(db, auth_hash)
-            if result.get('identity_verified') and result.get('detail'):
+            if job_id and result.get('identity_verified') and result.get('detail'):
                 detail = result['detail']
                 changes = {name: detail[name] for name in ('summary', 'title', 'company_name', 'location', 'salary_text') if detail.get(name)}
                 updated = Job.model_validate(job.model_dump() | changes)
@@ -1301,10 +1305,10 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
          'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         {'name': 'propose_preference_change', 'description': '提出條件變更，須由使用者檢視確認後才生效。',
          'parameters': ProposalInput.model_json_schema()},
-        {'name': 'search_jobs', 'description': '依使用者條件或履歷中的技能與經驗搜尋104／518／1111職缺（1111 為預設停用的實驗來源，依後台開關可用）；只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
+        {'name': 'search_jobs', 'description': '只有使用者要找、推薦或比較職缺時才使用 search_jobs；分析、查評價、職涯建議或詢問特定職缺時不搜尋。識別特定職缺先以 get_job_details 讀使用者提供的 104 網址，讀不到就請使用者提供內容，不用搜尋尋找。依使用者條件或履歷中的技能與經驗搜尋104／518／1111職缺（1111 為預設停用的實驗來源，依後台開關可用）；只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
         {'name': 'lookup_job_areas', 'description': '由地區名稱查官方地區代碼；搜尋前先查碼，不猜數字。', 'parameters': AreaLookup.model_json_schema()},
         {'name': 'present_job_recommendations', 'description': '以本次對話已取得的職缺job_id呈現精選或比較卡片；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
-        {'name': 'get_job_details', 'description': '讀取已保存職缺的詳細內容；未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
+        {'name': 'get_job_details', 'description': '以 job_id 讀取已保存職缺，或以 url 直接讀使用者提供的 104 職缺網址（可帶查詢參數）；兩者擇一。網址讀取不新增搜尋候選。未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
         {'name': 'get_company_reviews', 'description': '使用者詢問或要求時才查公司評價；同名不明時請使用者選擇。', 'parameters': reviews.ReviewInput.model_json_schema()},
         {'name': 'read_web_page', 'description': '讀取使用者提供或與其要求直接相關的公開網頁，例如 GitHub 個人頁、專案 README、個人網站及作品集。一次一個完整 HTTP／HTTPS 網址；回傳文字及来源網址。不能登入或搜尋，失敗、截斷與未讀連結須如實說明。', 'parameters': web.ReadInput.model_json_schema()},
     ]
@@ -1422,7 +1426,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             result = await company_reviews(arguments, auth_hash)
             return result, ('review', result)
         if name == 'get_job_details':
-            result = await read_job_details(arguments.job_id, auth_hash, user_id)
+            result = await read_job_details(arguments.job_id, auth_hash, user_id, arguments.url)
             return result, ('job_detail', result)
         if name == 'list_preferences':
             with store.connect() as db:
