@@ -100,9 +100,19 @@ async function fixtureRun(options = {}) {
   });
   try {
     // Allow cold CI browsers; the dedicated stalled-read test verifies the short deadline.
-    const report = await runProbe(context, { keyword: '採購', outputDir, timeoutMs: 5000, pauseMs: 0, runtime: { driver: driverName, browserVersion: browser.version() } });
+    const report = await runProbe(context, { keyword: '採購', outputDir, timeoutMs: 5000, pauseMs: 0, runtime: { driver: driverName, browserVersion: browser.version() }, closePage: !options.reusePage });
     assert.deepEqual(JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8')), report);
-    if (existingPage) assert.equal(existingPage.isClosed(), true, 'the existing page must be used and closed');
+    if (existingPage) assert.equal(existingPage.isClosed(), !options.reusePage, 'the existing page follows the caller ownership option');
+    if (options.reusePage) {
+      assert.equal(existingPage.listenerCount('response'), 0);
+      const repeated = await runProbe(context, { keyword: '採購', outputDir, timeoutMs: 5000, pauseMs: 0, closePage: false });
+      assert.equal(repeated.status, 'passed', JSON.stringify(repeated.error));
+      assert.equal(context.pages().length, 1);
+      assert.equal(context.pages()[0], existingPage);
+      assert.equal(existingPage.isClosed(), false);
+      assert.equal(existingPage.listenerCount('response'), 0);
+      assert.deepEqual(repeated.pages.map(p => p.jobs.map(j => j.id)), [['101'], ['202']]);
+    }
     return { report, requests };
   } finally {
     await context.close();
@@ -129,6 +139,14 @@ test('search → UI page 2 → details; excludes recommendations and duplicates'
   assert.deepEqual(report.details.map(d => d.id), ['101', '202']);
   assert.match(report.details[0].text, /月薪 30,000/);
   assert.deepEqual(requests, ['/search/job', '/search/job', '/job/101', '/job/202']);
+  assert.deepEqual(report.events.map(e => [e.stage, e.step, e.status]), [
+    ['search', 'navigate', 'passed'], ['search', 'validate', 'passed'],
+    ['pagination', 'click', 'passed'], ['pagination', 'url', 'passed'], ['pagination', 'validate', 'passed'],
+    ['details', 'navigate', 'passed'], ['details', 'validate', 'passed'],
+    ['details', 'navigate', 'passed'], ['details', 'validate', 'passed'], ['details', 'close', 'passed'],
+  ]);
+  assert.ok(report.events.every(e => Number.isFinite(Date.parse(e.startedAt)) && e.durationMs >= 0));
+  assert.deepEqual(report.events.filter(e => e.jobId).map(e => e.jobId), ['101', '101', '202', '202']);
 });
 
 test('uses and closes the initial persistent-context page', async () => {
@@ -168,6 +186,8 @@ test('URL page change with repeated IDs cannot pass pagination', async () => {
   assert.equal(report.stages.search, 'passed');
   assert.equal(report.stages.pagination, 'failed');
   assert.match(report.error.message, /pagination_unchanged/);
+  assert.deepEqual(report.error, { stage: 'pagination', step: 'validate', code: 'pagination_unchanged', message: 'pagination_unchanged' });
+  assert.equal(report.events.find(e => e.status === 'failed').code, 'pagination_unchanged');
   assert.equal(report.stages.details, 'not_run');
 });
 
@@ -254,6 +274,63 @@ test('a stalled browser evaluation times out, records failure and still closes t
     assert.equal(screenshotAttempted, true);
     assert.equal(closed, true);
     assert.deepEqual(JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8')), report);
+  } finally {
+    await rm(join(outputDir, 'report.json'), { force: true });
+    await rmdir(outputDir);
+  }
+});
+
+test('duplicate navigation headings do not replace the job content section', async () => {
+  const page = await browser.newPage();
+  try {
+    for (const subheading of [true, false]) {
+      for (const content of ['<p>管理庫存與核對訂單。</p>', '', '<p hidden>不可讀內容</p>']) {
+        await page.setContent('<h1>不同職務</h1><ul><li><h2>工作內容</h2></li><li><h2>要求條件</h2></li></ul>'
+          + '<section><div><h2>工作內容</h2></div>'
+          + (subheading ? '<h3>職缺描述</h3>' : '') + content
+          + '<h3>工作待遇</h3><p>薪資不是職缺描述</p></section><footer>頁尾不是職缺描述</footer>');
+        const detail = await page.evaluate(readDetail);
+        assert.equal(detail.description, content.startsWith('<p>') ? '管理庫存與核對訂單。' : '');
+      }
+    }
+  } finally { await page.close(); }
+});
+
+test('legacy unsectioned description without a subheading remains readable', async () => {
+  const page = await browser.newPage();
+  try {
+    await page.setContent('<h1>倉管</h1><h2>工作內容</h2><p>辦理進出貨。</p><h2>工作待遇</h2><p>薪資</p>');
+    assert.equal((await page.evaluate(readDetail)).description, '辦理進出貨。');
+  } finally { await page.close(); }
+});
+
+test('two rounds retain the same page and remove per-round response listeners', async () => {
+  const { report, requests } = await fixtureRun({ existingPage: true, reusePage: true });
+  assert.equal(report.status, 'passed');
+  assert.equal(report.events.some(e => e.step === 'close'), false);
+  assert.deepEqual(requests, ['/search/job', '/search/job', '/job/101', '/job/202',
+    '/search/job', '/search/job', '/job/101', '/job/202']);
+});
+
+test('failure records the step and safe code without raw browser errors or challenge text', async () => {
+  const outputDir = await mkdtemp(join(tmpdir(), '1111-safe-errors-'));
+  const secret = 'SYNTHETIC_PRIVATE_TOKEN';
+  let closed = false;
+  const page = {
+    on() {}, off() {}, setDefaultTimeout() {}, setDefaultNavigationTimeout() {},
+    async bringToFront() {},
+    async goto() { const error = new Error('https://example.invalid/?token=' + secret); error.name = 'TimeoutError'; throw error; },
+    async evaluate() { return { title: secret, text: 'Verify you are human ' + secret }; },
+    async screenshot() {}, async close() { closed = true; },
+  };
+  try {
+    const report = await runProbe({ pages: () => [page] }, { keyword: '工程師', outputDir });
+    assert.deepEqual(report.error, { stage: 'search', step: 'navigate', code: 'timeout', message: 'timeout' });
+    assert.deepEqual(report.diagnostic, { blankBody: false, loadingTitle: false, verificationVisible: true });
+    assert.equal(report.stages.pagination, 'not_run');
+    assert.equal(JSON.stringify(report).includes(secret), false);
+    assert.equal((await readFile(join(outputDir, 'report.json'), 'utf8')).includes(secret), false);
+    assert.equal(closed, true);
   } finally {
     await rm(join(outputDir, 'report.json'), { force: true });
     await rmdir(outputDir);
