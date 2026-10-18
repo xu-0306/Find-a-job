@@ -13,8 +13,9 @@ from .store import encode
 
 # Providers report an over-long prompt with different codes and wording; these cover OpenAI-compatible,
 # Anthropic and common relay responses. Only the bounded error body is inspected and it is never shown to users.
-OVERFLOW_MARKERS = ('context_length_exceeded', 'context length', 'context window', 'maximum context',
-                    'prompt is too long', 'too many tokens', 'input is too long', 'request_too_large')
+# Only wording that says the input itself is too long; a bare "context window" also appears in max_tokens errors.
+OVERFLOW_MARKERS = ('context_length_exceeded', 'model_context_window_exceeded', 'prompt is too long', 'input is too long',
+                    'your messages resulted in', 'exceeds the context window', 'request_too_large')
 OVERFLOW_MESSAGE = '對話內容超過模型可處理的長度，精簡後仍無法送出；請開新對話，或在後台確認上下文視窗設定。'
 PROTOCOL_PATHS = {'responses': '/responses', 'chat_completions': '/chat/completions',
                   'anthropic_messages': '/messages'}

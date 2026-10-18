@@ -198,6 +198,18 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(self.company_exclusions[-1], ['來源公司 ALPHA'])
         self.assertNotIn(beta, [item['job_id'] for item in self.state()['removed']])
 
+    def test_conversation_exclusions_have_a_total_limit(self):
+        self.configure()
+        self.first()
+        for batch in range(2):
+            self.script(('search_jobs', {'criteria': {'keyword': f'條件{batch}'}, 'exclude_companies': [f'公司{batch}-{i}' for i in range(20)]}), '好。')
+            self.chat(f'exclude-{batch}')
+        self.assertEqual(len(self.state()['excluded_companies']), 40)
+        self.script(('search_jobs', {'criteria': {'keyword': '條件2'}, 'exclude_companies': [f'公司2-{i}' for i in range(11)]}))
+        output = events(self.client.post('/api/chat', json={'request_id': 'exclude-2', 'text': '再排除'}))
+        self.assertEqual(next(data['code'] for event, data in output if event == 'error'), 'too_many_exclusions')
+        self.assertEqual(len(self.state()['excluded_companies']), 40)
+
     def test_recommendations_replace_shortlist_and_remove_jobs(self):
         self.configure()
         first, _ = self.first()
@@ -219,13 +231,44 @@ class WorkspaceChecks(unittest.TestCase):
         self.script(('present_job_recommendations', {'items': [{'job_id': alpha}]}), '改回。')
         self.chat('rec-3')
         self.assertEqual((self.state()['shortlist'], self.state()['removed']), ([alpha], []))
+        # Removing only keeps the shortlist; an explicit empty list clears it.
+        self.script(('present_job_recommendations', {'removed': [{'job_id': beta, 'reason': '地點太遠'}]}), '已移出。')
+        self.chat('rec-4')
+        self.assertEqual(self.state()['shortlist'], [alpha])
+        self.script(('present_job_recommendations', {'items': [], 'removed': [{'job_id': alpha, 'reason': '不適合'}]}), '已清空。')
+        output = self.chat('rec-5')
+        self.assertTrue(next(data for name, data in output if name == 'recommendations')['replace'])
+        self.assertEqual(self.state()['shortlist'], [])
+        self.script(('present_job_recommendations', {'items': [{'job_id': beta}]}), '再選。')
+        self.chat('rec-6')
+        self.script(('present_job_recommendations', {'items': []}), '全部清空。')
+        self.chat('rec-7')
+        self.assertEqual(self.state()['shortlist'], [])
+
+    def test_history_pages_carry_the_whole_conversation_working_list(self):
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = (item['id'] for item in first['items'])
+        self.script(('present_job_recommendations', {'items': [{'job_id': alpha}]}), '一筆。')
+        self.chat('page-1')
+        self.script(('present_job_recommendations', {'items': [{'job_id': beta}], 'removed': [{'job_id': alpha, 'reason': '外派'}]}), '換一筆。')
+        self.chat('page-2')
+        expected = {'shortlist': [beta], 'removed': [{'job_id': alpha, 'by': 'agent', 'reason': '外派'}]}
+        latest = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2}).json()
+        self.assertEqual(latest['conversation_state'], expected)
+        # An older page, which only holds the first recommendation, still reports the current list.
+        older = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2, 'cursor': latest['next_cursor']}).json()
+        self.assertFalse(any(e['event'] == 'recommendations' and e['data']['items'][0]['job_id'] == beta
+                             for m in older['items'] for e in m['content']['events']))
+        self.assertEqual(older['conversation_state'], expected)
+        self.assertNotIn('conversation_state', self.client.get('/api/messages').json())
 
     def test_recommendations_reject_unknown_or_empty_changes(self):
         self.configure()
         self.first()
         for request_id, arguments, code in (
                 ('unknown', {'removed': [{'job_id': 'job-not-here', 'reason': '不適合'}]}, 'unknown_job'),
-                ('empty', {'items': []}, 'invalid_tool')):
+                ('empty', {}, 'invalid_tool'), ('empty-removed', {'removed': []}, 'invalid_tool')):
             with self.subTest(request_id=request_id):
                 self.script(('present_job_recommendations', arguments))
                 output = events(self.client.post('/api/chat', json={'request_id': request_id, 'text': '整理'}))

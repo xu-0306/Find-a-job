@@ -169,13 +169,17 @@ class RemovedJob(Input):
 
 class Recommendations(Input):
     items: list[Recommendation] = Field(default_factory=list, max_length=20,
-        description='目前的完整精選清單（依推薦順序）；會取代之前的精選，不是追加。')
+        description='目前的完整精選清單（依推薦順序）；提供時取代之前的精選，不是追加，空陣列表示清空精選。只移出職缺時省略。')
     removed: list[RemovedJob] = Field(default_factory=list, max_length=50,
         description='使用者不要或經判斷不適合、應從職缺清單移出的 job_id 與簡短原因。')
 
     def model_post_init(self, context):
-        if not self.items and not self.removed:
+        if 'items' not in self.model_fields_set and not self.removed:
             raise ValueError('items 與 removed 至少提供一項')
+
+    @property
+    def replaces_shortlist(self):
+        return 'items' in self.model_fields_set
 
 
 class AreaLookup(Input):
@@ -214,6 +218,8 @@ class APIError(Exception):
 
 
 MAX_ATTACHMENTS = 5
+# Exclusions accumulate over a conversation and are always sent to the model, so the total is bounded too.
+MAX_EXCLUDED_COMPANIES = 50
 MAX_ATTACHMENT_TOTAL = 50 * 1024 * 1024
 
 
@@ -1356,9 +1362,15 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
     @app.get('/api/messages')
     def messages(cursor: str | None = None, limit: int = Query(default=20, ge=1, le=100),
                  conversation_id: str | None = Query(default=None, min_length=1, max_length=100), auth=Depends(user)):
-        if conversation_id is not None:
-            with store.connect() as db: conversation_view(db, conversation_id, auth['user_id'])
-        return store.messages(parse_cursor(cursor) if cursor is not None else None, limit, conversation_id, user_id=auth['user_id'])
+        if conversation_id is None:
+            return store.messages(parse_cursor(cursor) if cursor is not None else None, limit, user_id=auth['user_id'])
+        with store.connect() as db:
+            conversation_view(db, conversation_id, auth['user_id'])
+            # The working list comes from the whole conversation, not from whichever pages the client has loaded.
+            working = store.conversation_state(db, conversation_id)
+        result = store.messages(parse_cursor(cursor) if cursor is not None else None, limit, conversation_id, user_id=auth['user_id'])
+        result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed')}
+        return result
 
     @app.patch('/api/searches/{search_id}')
     def dismiss_search_job(search_id: str, body: SearchDismiss, auth=Depends(user)):
@@ -1425,7 +1437,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                         citation_number=allowed.index(item.job_id) + 1,
                         is_favorite=bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (item.job_id, user_id)).fetchone()))})
                 removed = list({item.job_id: item.model_dump() for item in arguments.removed if item.job_id not in seen}.values())
-            result = {'items': items, 'removed': removed}
+            result = {'items': items, 'removed': removed, 'replace': arguments.replaces_shortlist}
             return result, ('recommendations', result)
         if name == 'read_web_page':
             with store.connect() as db:
@@ -1453,9 +1465,11 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
                 excluded_companies = list(dict.fromkeys([*store.conversation_state(db, conversation_id)['excluded_companies'],
                                                          *arguments.exclude_companies, *requested_exclusions]))
-            requested = list(arguments.sources)
-            if not previous and 'sources' not in arguments.model_fields_set and '1111' in enabled:
-                requested.append('1111')
+                user_text = (json.loads(row[0]).get('text') if (row := db.execute(
+                    "SELECT content_json FROM messages WHERE request_id=? AND role='user'", (request_id,)).fetchone()) else '')
+            if len({job_normalize.company_key(name) for name in excluded_companies}) > MAX_EXCLUDED_COMPANIES:
+                raise llm.LLMError('too_many_exclusions', f'這段對話排除的公司已超過 {MAX_EXCLUDED_COMPANIES} 家；請開新對話重新整理條件。')
+            requested = sources.requested_sources(arguments, enabled, user_text, continuation=bool(previous))
             kept = [source for source in requested if source in enabled]
             disabled_sources = [source for source in requested if source not in enabled]
             disabled_names = '、'.join(disabled_sources)

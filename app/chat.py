@@ -4,7 +4,7 @@ import json
 
 import httpx
 
-from . import context_budget
+from . import context_budget, sources
 from .llm import LLMError, stream_model
 from .store import encode, now
 
@@ -96,9 +96,19 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
             retries = 0
 
             # A summary saved by an earlier turn covers history up to its through_id. Start from it, so the
-            # model is not asked to summarise the same rows again on every long turn.
-            summary_state = next((item['content']['context_summary'] for item in reversed(kept)
-                                  if isinstance(item['content'].get('context_summary'), dict)), {})
+            # model is not asked to summarise the same rows again on every long turn. It is looked up over the
+            # whole conversation: the summary, or the rows it covers, may be older than the loaded history.
+            with store.connect() as db:
+                row = db.execute("""SELECT json_extract(content_json,'$.context_summary') FROM messages
+                    WHERE conversation_id=? AND role='user' AND rowid<? AND json_type(content_json,'$.context_summary')='object'
+                    ORDER BY rowid DESC LIMIT 1""", (current['conversation_id'], current['seq'])).fetchone()
+                summary_state = json.loads(row[0]) if row else {}
+                through = db.execute('SELECT rowid FROM messages WHERE id=? AND conversation_id=?',
+                                     (summary_state.get('through_id'), current['conversation_id'])).fetchone() if summary_state.get('text') else None
+                covered_ids = {ident for (ident,) in db.execute('SELECT id FROM messages WHERE conversation_id=? AND rowid<=?',
+                                                               (current['conversation_id'], through[0]))} if through else set()
+            if not through:
+                summary_state = {}
 
             def show_summary(text):
                 nonlocal history_start, history_end
@@ -106,9 +116,8 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                     messages.insert(1, {'role': 'user', 'content': ''}); history_start += 1; history_end += 1
                 messages[1]['content'] = SUMMARY_PREFIX + text
 
-            kept_ids = [item['id'] for item in kept]
-            if summary_state.get('text') and summary_state.get('through_id') in kept_ids:
-                dropped_count = kept_ids.index(summary_state['through_id']) + 1
+            if summary_state:
+                dropped_count = next((index for index, item in enumerate(kept) if item['id'] not in covered_ids), len(kept))
                 del messages[history_start:history_start + dropped_count]
                 history_end -= dropped_count
                 show_summary(summary_state['text'])
@@ -169,13 +178,18 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
             async def execute(call, arguments):
                 summary = call['name']
                 if call['name'] == 'search_jobs':
-                    summary = f'搜尋 {arguments.criteria.keyword} · {"／".join(arguments.sources)}'
+                    # The same source rule as the search itself, so the label names 1111 whenever it will be queried.
+                    enabled = sources.enabled_sources(settings)
+                    planned = [source for source in sources.requested_sources(arguments, enabled, user_text, continuation=bool(arguments.search_id))
+                               if source in enabled]
+                    summary = f'搜尋 {arguments.criteria.keyword} · {"／".join(planned or arguments.sources)}'
                 elif call['name'] == 'get_job_details':
                     summary = '讀取職缺詳細內容'
                 elif call['name'] == 'get_company_reviews':
                     summary = f'查詢 {arguments.company_name} 評價'
                 elif call['name'] == 'present_job_recommendations':
-                    summary = f'整理 {len(arguments.items)} 筆精選' + (f'、移出 {len(arguments.removed)} 筆' if arguments.removed else '')
+                    parts = [f'整理 {len(arguments.items)} 筆精選' if arguments.items else '清空精選'] if arguments.replaces_shortlist else []
+                    summary = '、'.join(parts + ([f'移出 {len(arguments.removed)} 筆'] if arguments.removed else []))
                 elif call['name'] == 'lookup_job_areas':
                     summary = f'查詢地區：{arguments.query}'
                 progress = {'call_id': call['id'], 'name': call['name'], 'summary': summary, 'phase': 'started'}

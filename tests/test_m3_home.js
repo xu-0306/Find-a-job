@@ -1799,9 +1799,44 @@ async function testConversationWorkingListConverges() {
   assert.deepEqual(featuredIds(), ["w3"]);
   assert.equal(removedSection().children[0].textContent, "已移出 1");
 
+  // Removing only keeps the shortlist; an explicit empty replacement clears it.
+  home.context.renderChatEvent(second, "recommendations", {items: [], removed: [{job_id: "w2", reason: "薪資太低"}], replace: false});
+  assert.deepEqual(featuredIds(), ["w3"]);
+  home.context.renderChatEvent(second, "recommendations", {items: [], replace: true});
+  assert.deepEqual(featuredIds(), [], "an empty replacement leaves nothing featured");
+  assert.equal(vm.runInContext("conversationWork.shortlist.length", home.context), 0);
+  assert.deepEqual(mainCards().map(card => card.dataset.jobId), ["w4", "w3"], "unfeatured jobs stay as candidates");
+
   // A conversation switch clears the working list together with the search batches.
   vm.runInContext("searchStates.clear(); resetConversationWork();", home.context);
   assert.equal(vm.runInContext("conversationWork.shortlist.length + conversationWork.removed.size", home.context), 0);
+}
+
+async function testHistoryPagesUseTheServerWorkingList() {
+  const home = createContext(); await settle();
+  const list = home.elements.get("search-results-list");
+  const job = id => ({id, source: "104", title: `T${id}`, company_name: `C${id}`, url: `https://jobs.example/${id}`});
+  const featuredIds = () => list.children.filter(item => item.className === "job-card item")
+    .filter(card => all(card, item => item.className === "job-featured").length).map(card => card.dataset.jobId);
+  const assistant = events => ({role: "assistant", content: {text: "", status: "completed", events}});
+  const state = {shortlist: ["h2"], removed: [{job_id: "h1", by: "agent", reason: "外派"}]};
+  const newest = [assistant([{event: "jobs", data: {search_id: "h-1", items: [job("h1"), job("h2")]}},
+                             {event: "recommendations", data: {items: [{job_id: "h2"}], removed: [{job_id: "h1", reason: "外派"}], replace: true}}])];
+  // The older page only knows the earlier recommendation of h1; replaying it last would undo the removal.
+  const older = [assistant([{event: "recommendations", data: {items: [{job_id: "h1"}], replace: true}}])];
+  home.context.api = async path => path.includes("cursor=older")
+    ? {items: older, next_cursor: null, conversation_state: state}
+    : {items: newest, next_cursor: "older", conversation_state: state};
+  await home.context.loadMessages(false, "conversation-h");
+  assert.deepEqual(featuredIds(), ["h2"]);
+  await home.context.loadMessages(true, "conversation-h");
+  assert.deepEqual(featuredIds(), ["h2"], "loading an older page keeps the server's current shortlist");
+  assert.equal(vm.runInContext("conversationWork.removed.get('h1')?.reason", home.context), "外派");
+  // After an edit the server's recomputed list replaces what the page replayed.
+  home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {shortlist: ["h1"], removed: []}});
+  await home.context.refreshConversationWork("conversation-h");
+  assert.deepEqual(featuredIds(), ["h1"]);
+  assert.equal(vm.runInContext("conversationWork.removed.size", home.context), 0);
 }
 
 const CHAT_WIDTH_KEY = "job-companion-chat-width";
@@ -2029,13 +2064,14 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   testChatHeadingMarkupMovesLatestButtonOutOfHeading();
   testSearchTitleIsNotRepeatedWhenUnlabelled();
   await testConversationWorkingListConverges();
+  await testHistoryPagesUseTheServerWorkingList();
   await testUpToFiveAttachmentsAreSentTogether();
   testSplitterMarkup();
   await testChatWidthClampsAndReclampsOnResize();
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 35 checks passed");
+  console.log("test_m3_home: 36 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

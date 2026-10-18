@@ -69,4 +69,5 @@ def profile_view(profile, settings, key):
             "llm_context_window": profile.get("llm_context_window", 0),
             "llm_api_key": {"configured": bool(profile["llm_api_key"]), "mask": "••••••••"},
             "is_active": all(profile[field] == settings.get(field) for field in CONNECTION_FIELDS)
+                         and (profile.get("llm_context_window") or 0) == (settings.get("llm_context_window") or 0)
                          and profile["llm_api_key"] == key}

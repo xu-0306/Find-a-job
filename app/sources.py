@@ -23,10 +23,26 @@ def enabled_sources(services):
             + (['1111'] if services.get('source_1111_enabled') is True else []))
 
 
+_SOURCE_MENTION = re.compile(r'(?<!\d)(?:104|518|1111)(?!\d)')
+
+
+def requested_sources(arguments, enabled, user_text, continuation=False):
+    """Sources a search asks for, before disabled ones are dropped.
+
+    A new search queries every enabled source unless this turn's user message names a source ("只查 104"、"不要 1111"):
+    models narrowed the list on their own, which silently skipped sources the admin had turned on. A continuation
+    keeps its saved sources, since its cursor has no position for a newly added one.
+    """
+    requested = list(arguments.sources)
+    if not continuation and ('sources' not in arguments.model_fields_set or not _SOURCE_MENTION.search(user_text or '')):
+        requested += [source for source in enabled if source not in requested]
+    return requested
+
+
 class SearchInput(Input):
     criteria: Criteria
     sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=3,
-        description='通常省略：省略時查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有使用者明確指定或排除某個人力銀行時才填。1111 為實驗來源，可能因人機驗證受阻。')
+        description='通常省略：一律查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有使用者這則訊息明確指定或排除某個人力銀行時才填，且只有那時才會限縮。1111 為實驗來源，可能因人機驗證受阻。')
     limit: StrictInt = Field(default=20, ge=1, le=20)
     search_id: str | None = Field(default=None, min_length=1, max_length=100)
     exclude_companies: list[str] = Field(default_factory=list, max_length=20,

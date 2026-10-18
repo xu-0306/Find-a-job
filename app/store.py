@@ -288,7 +288,7 @@ class Store:
             user = {'text': text, 'events': [], 'status': 'completed', 'attachments': attachments or []}
             assistant = {'text': '', 'events': [], 'status': 'running'}
             if edit_message_id:
-                original = db.execute("SELECT * FROM messages WHERE id=? AND role='user' AND conversation_id=?",
+                original = db.execute("SELECT rowid AS seq,* FROM messages WHERE id=? AND role='user' AND conversation_id=?",
                                       (edit_message_id, conversation_id)).fetchone()
                 if not original or not db.execute("SELECT 1 FROM messages WHERE request_id=? AND role='assistant'",
                                                  (original['request_id'],)).fetchone():
@@ -301,6 +301,10 @@ class Store:
                 db.execute("UPDATE messages SET request_id=?,content_json=? WHERE id=?", (request_id, encode(user), edit_message_id))
                 db.execute("UPDATE messages SET request_id=?,content_json=? WHERE request_id=? AND role='assistant'",
                            (request_id, encode(assistant), edit_request_id))
+                # Later context summaries may describe the replaced text; drop them so the next long turn re-summarises.
+                db.execute("""UPDATE messages SET content_json=json_remove(content_json,'$.context_summary')
+                    WHERE conversation_id=? AND role='user' AND rowid>? AND json_type(content_json,'$.context_summary') IS NOT NULL""",
+                           (conversation_id, original['seq']))
             else:
                 for role, content in [('user', user), ('assistant', assistant)]:
                     db.execute('INSERT INTO messages VALUES(?,?,?,?,?,?)',
@@ -382,7 +386,8 @@ class Store:
                     removed[job_id] = {'job_id': job_id, 'by': 'company', 'reason': '公司已排除'}
             else:
                 ids = [item.get('job_id') for item in data.get('items', []) if item.get('job_id')]
-                if ids:
+                # Events saved before `replace` existed always carried a non-empty replacement list.
+                if data.get('replace', bool(ids)):
                     shortlist = list(dict.fromkeys(ids))
                 for item in data.get('removed', []):
                     removed[item['job_id']] = {'job_id': item['job_id'], 'by': 'agent', 'reason': item.get('reason', '')}

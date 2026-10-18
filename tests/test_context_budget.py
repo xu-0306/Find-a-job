@@ -127,6 +127,45 @@ class CompactionChecks(unittest.TestCase):
         self.assertEqual(len(self.summary_calls), 1)
         self.assertEqual(self.texts(self.reply_calls[1])[0], SUMMARY_PREFIX + SUMMARY_TEXT)
 
+    def test_summary_is_still_used_after_its_rows_leave_the_loaded_history(self):
+        self.configure()
+        self.seed(40)
+        self.provider()
+        chats.events(self.client.post('/api/chat', json={'request_id': 'turn-1', 'text': '繼續幫我找'}))
+        self.assertEqual(len(self.summary_calls), 1)
+        # 220 short rows push both the summary's message and the rows it covers out of the last 200.
+        for index in range(110):
+            self.store.start_chat(f'short-{index}', f'短{index}')
+            self.store.save_reply(f'short-{index}', {'text': f'好{index}', 'events': [], 'status': 'completed'})
+        chats.events(self.client.post('/api/chat', json={'request_id': 'turn-2', 'text': '還記得條件嗎'}))
+        self.assertEqual(len(self.summary_calls), 1)
+        texts = self.texts(self.reply_calls[-1])
+        self.assertEqual(texts[0], SUMMARY_PREFIX + SUMMARY_TEXT)
+        self.assertFalse(any(text.startswith('A39：') for text in texts), 'rows the summary covers are not resent')
+        self.assertTrue(any(text == '短109' for text in texts))
+
+    def test_editing_a_summarised_message_drops_the_stale_summary(self):
+        self.configure()
+        self.seed(40)
+        self.provider()
+        chats.events(self.client.post('/api/chat', json={'request_id': 'turn-1', 'text': '繼續幫我找'}))
+        self.assertEqual(len(self.summary_calls), 1)
+        original = next(item for item in self.client.get('/api/messages').json()['items'] if item['request_id'] == 'seed-38')
+        output = chats.events(self.client.post('/api/chat', json={'request_id': 'edited', 'text': 'Q38：改成只找台南',
+            'conversation_id': 'legacy', 'edit_message_id': original['id'], 'edit_request_id': 'seed-38'}))
+        self.assertEqual(output[-1][1]['status'], 'completed', output)
+        with self.store.connect() as db:
+            edited = db.execute("SELECT rowid FROM messages WHERE id=?", (original['id'],)).fetchone()[0]
+            summaries = db.execute("""SELECT m.request_id, c.rowid FROM messages m
+                JOIN messages c ON c.id=json_extract(m.content_json,'$.context_summary.through_id')""").fetchall()
+        self.assertNotIn('turn-1', [request for request, _ in summaries], 'the summary covering the edited row is gone')
+        self.assertTrue(all(through < edited for _, through in summaries), 'no remaining summary covers the edited row')
+        calls = len(self.summary_calls)
+        chats.events(self.client.post('/api/chat', json={'request_id': 'turn-2', 'text': '繼續'}))
+        sent = self.texts(self.reply_calls[-1]) + [call['input'][0]['content'] for call in self.summary_calls[calls:]]
+        self.assertTrue(any('Q38：改成只找台南' in text for text in sent), 'the corrected text reaches the model')
+        self.assertFalse(any(text.startswith('Q38：' + '問') for text in sent))
+
     def test_short_conversation_is_sent_unchanged(self):
         self.configure()
         self.seed(3)
@@ -164,6 +203,16 @@ class CompactionChecks(unittest.TestCase):
         self.assertFalse(any(name == 'retry' for name, _ in output), 'overflow is not a generic retry')
         self.assertTrue(self.texts(self.reply_calls[1])[0].startswith(SUMMARY_PREFIX))
         self.assertLess(len(encode(self.reply_calls[1])), len(encode(self.reply_calls[0])))
+
+    def test_parameter_errors_mentioning_the_window_are_not_overflow(self):
+        self.configure()
+        self.seed(3)
+        rejected = httpx.Response(400, json={'error': {'message': 'max_tokens: 300000 exceeds the model context window limit of 200000'}})
+        self.provider(lambda payload: rejected)
+        output = chats.events(self.client.post('/api/chat', json={'request_id': 'bad-parameter', 'text': '你好'}))
+        error = next(data for name, data in output if name == 'error')
+        self.assertEqual(error['code'], 'provider_http_error')
+        self.assertEqual(len(self.reply_calls), 1, 'a parameter error is not compacted and resent')
 
     def test_repeated_overflow_reports_a_clear_error(self):
         self.configure(256_000)

@@ -51,18 +51,32 @@ _COMPANY_LEGAL_FORMS = ("股份有限公司", "有限公司", "財團法人", "�
 
 
 def company_key(value: Any) -> str:
-    """Comparable company text: width/case folded, 臺→台, punctuation and legal-form words removed."""
+    """Comparable company text: width/case folded, 臺→台, punctuation and legal-form words removed.
+
+    A single space survives only between two Latin letters or digits, so English names keep their word boundaries.
+    """
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("臺", "台")
-    text = _COMPANY_PUNCTUATION.sub("", text)
     for form in _COMPANY_LEGAL_FORMS:
-        text = text.replace(form, "")
-    return text
+        text = text.replace(form, " ")
+    text = _COMPANY_PUNCTUATION.sub(" ", text)
+    return re.sub(r"(?<![a-z0-9]) +| +(?![a-z0-9])", "", text)
 
 
 def company_excluded(company_name: Any, excluded_keys: Iterable[str]) -> bool:
-    """True when any excluded key (already passed through company_key) occurs in the company name."""
+    """True when any excluded key (already passed through company_key) occurs in the company name.
+
+    Chinese text matches anywhere inside the name (台積 matches 台積電); a Latin end must sit on a word boundary,
+    so "meta" leaves "MetalWorks" alone.
+    """
     key = company_key(company_name)
-    return bool(key) and any(len(excluded) >= 2 and excluded in key for excluded in excluded_keys)
+    for excluded in excluded_keys:
+        if len(excluded) < 2:
+            continue
+        pattern = ("(?<![a-z0-9])" if re.match("[a-z0-9]", excluded) else "") + re.escape(excluded) \
+            + ("(?![a-z0-9])" if re.match("[a-z0-9]", excluded[-1]) else "")
+        if key and re.search(pattern, key):
+            return True
+    return False
 
 
 def _clean_text(value: Any, *, redact_contacts: bool = True) -> str | None:

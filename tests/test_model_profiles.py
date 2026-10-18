@@ -120,6 +120,14 @@ class ModelProfileChecks(unittest.TestCase):
         self.assertEqual(self.client.put("/api/admin/settings", json={"llm_context_window": 500_000}).json()["llm_context_window"], 500_000)
         self.assertEqual(llm.signature(self.stored("services"), CONNECTION["llm_api_key"]), signature,
                          "changing the window does not invalidate the connection test")
+        # Same connection, different window: only the profile matching the applied window is active.
+        self.assertEqual([p["is_active"] for p in self.client.get(BASE).json()["items"]], [False, False])
+        self.client.post(BASE + "/" + large["id"] + "/apply")
+        same = self.create(llm_context_window=500_000)
+        self.assertEqual([p["is_active"] for p in self.client.get(BASE).json()["items"]], [True, False, False])
+        self.client.post(BASE + "/" + same["id"] + "/apply")
+        self.assertEqual([p["is_active"] for p in self.client.get(BASE).json()["items"]], [False, False, True])
+        self.client.delete(BASE + "/" + same["id"])
         # A profile saved before this setting existed applies the default.
         with self.store.connect(write=True) as db:
             profiles = self.store.get(db, "model_profiles")

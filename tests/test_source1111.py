@@ -173,8 +173,8 @@ class RouteChecks(unittest.TestCase):
             return response(call=('search1', 'search_jobs', encode(arguments))) if count == 1 else response(text='已整理')
         self.app.state.llm_transport = __import__('httpx').MockTransport(provider)
 
-    def send(self, ident):
-        return events(self.client.post('/api/chat', json={'request_id': ident, 'text': '合成來源查詢'}))
+    def send(self, ident, text='合成來源查詢'):
+        return events(self.client.post('/api/chat', json={'request_id': ident, 'text': text}))
 
     def test_default_off_zero_browser_calls_and_on_implicit_search(self):
         self.configure()
@@ -188,9 +188,25 @@ class RouteChecks(unittest.TestCase):
         self.assertEqual({x['source'] for x in on['items']}, {'104', '1111'})
         self.browser.call.assert_awaited_once()
 
+    def test_enabled_1111_is_queried_unless_the_user_names_a_source(self):
+        # The model narrowing sources on its own was how 1111 got skipped although the admin had turned it on.
+        self.configure(True, ['104'])
+        output = self.send('narrowed')
+        narrowed = next(x for event, x in output if event == 'jobs')
+        self.assertEqual(narrowed['sources'], ['104', '1111'])
+        self.browser.call.assert_awaited_once()
+        progress = [x for event, x in output if event == 'tool_status' and x.get('name') == 'search_jobs' and x.get('phase') == 'started']
+        self.assertIn('104／1111', progress[0]['summary'], 'the progress label names the sources actually queried')
+        for index, text in enumerate(('只查 104 就好', '這次不要1111')):
+            with self.subTest(text=text):
+                self.configure(True, ['104'])
+                chosen = next(x for event, x in self.send(f'chosen-{index}', text) if event == 'jobs')
+                self.assertEqual(chosen['sources'], ['104'])
+                self.browser.call.assert_not_awaited()
+
     def test_explicit_disabled_1111_names_correct_source_and_detail_off(self):
         self.configure(explicit=['1111'])
-        output = self.send('disabled')
+        output = self.send('disabled', '只查1111')
         error = next(x for event, x in output if event == 'error')
         self.assertEqual(error['code'], 'source_disabled')
         self.assertIn('1111', error['message'])
@@ -212,7 +228,7 @@ class RouteChecks(unittest.TestCase):
     def test_continue_after_1111_disabled_never_calls_browser_again(self):
         self.configure(True, ['1111'])
         self.browser.call.return_value = page([row(str(i)) for i in range(1, 31)], size=30, total=31)
-        first = next(x for event, x in self.send('first') if event == 'jobs')
+        first = next(x for event, x in self.send('first', '只查1111') if event == 'jobs')
         self.assertTrue(first['can_continue'])
         self.client.put('/api/admin/settings', json={'source_1111_enabled': False},
                         headers={'X-CSRF-Token': security.csrf(self.admin_token)})

@@ -39,8 +39,8 @@ class SourceChatChecks(unittest.TestCase):
         self.app.state.llm_transport = httpx.MockTransport(provider)
         return requests
 
-    def send(self, ident='source'):
-        return self.client.post('/api/chat', json={'request_id': ident, 'text': '合成來源查詢'})
+    def send(self, ident='source', text='合成來源查詢'):
+        return self.client.post('/api/chat', json={'request_id': ident, 'text': text})
 
     def test_three_protocols_source_sse_history_and_stable_favorites(self):
         for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
@@ -111,7 +111,7 @@ class SourceChatChecks(unittest.TestCase):
         self.configure(); self.set_518(False)
         self.app.state.llm_transport = httpx.MockTransport(lambda req: response('responses', call=(
             's1', 'search_jobs', encode({'criteria': {'keyword': '採購'}, 'sources': ['518']}))))
-        output = events(self.send('only518'))
+        output = events(self.send('only518', '只查 518'))
         self.assertIn('source_disabled', [x.get('code') for event, x in output if event == 'error'])
         self.assertEqual(self.source_urls, [])
         self.assertFalse(any(event == 'jobs' for event, _ in output))

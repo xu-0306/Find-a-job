@@ -23,6 +23,22 @@ const searchStates = new Map();
 // recommendation replaces the shortlist, and removed jobs leave the main list.
 const conversationWork = {shortlist: [], removed: new Map()};
 function resetConversationWork() { conversationWork.shortlist = []; conversationWork.removed.clear(); }
+// The server replays the whole conversation in order; loaded pages and edits only approximate it.
+function applyConversationWork(state) {
+  if (!state || typeof state !== "object") return;
+  conversationWork.shortlist = Array.isArray(state.shortlist) ? [...new Set(state.shortlist.map(String))] : [];
+  conversationWork.removed.clear();
+  for (const item of Array.isArray(state.removed) ? state.removed : []) {
+    if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: String(item.by || "agent"), reason: String(item.reason || "")});
+  }
+}
+async function refreshConversationWork(conversationId = selectedConversationId) {
+  if (!conversationId) return;
+  const result = await api(`/api/messages?${new URLSearchParams({conversation_id: String(conversationId), limit: "1"})}`);
+  if (String(conversationId) !== selectedConversationId) return;
+  applyConversationWork(result.conversation_state);
+  renderSearchResultsPanel();
+}
 let activeSearchId = null;
 let activeSearchState = null;
 // null keeps the result panel on the conversation-wide aggregate. Selecting a
@@ -766,7 +782,8 @@ function updateRecommendations(data, message) {
     chatRecommendationIds.set(message, ids.length ? ids : recommendationIds);
     if (state) chatSearchMetadata.set(message, state);
   }
-  if (recommendationIds.length) conversationWork.shortlist = [...new Set(recommendationIds)];
+  // Events saved before `replace` existed always carried a non-empty replacement list.
+  if (data?.replace ?? recommendationIds.length > 0) conversationWork.shortlist = [...new Set(recommendationIds)];
   for (const item of Array.isArray(data?.removed) ? data.removed : []) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: "agent", reason: String(item.reason || "")});
   }
@@ -1644,6 +1661,8 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   if (more) $("#chat-list").prepend(fragment);
   else $("#chat-list").replaceChildren(fragment);
   selectedConversationId = id;
+  applyConversationWork(result.conversation_state);
+  renderSearchResultsPanel();
   messageCursor = result.next_cursor; $("#more-messages").hidden = !messageCursor;
   if (changed) viewport.scrollTop = 0;
   else if (more) viewport.scrollTop = top + viewport.scrollHeight - height;
@@ -2355,6 +2374,8 @@ $("#chat-form").addEventListener("submit", async event => {
     $("#cancel-chat").hidden = true; $("#refresh-messages").disabled = false; $("#more-messages").disabled = false;
     updateConversationControls();
     if (csrfToken && completed && !operation.snapshotRestored && !operation.editMessage) await loadMessages().catch(error => message(error.message, true));
+    // An edit drops the replaced reply's events, so the working list is recomputed from the server.
+    else if (csrfToken && completed && operation.editMessage) await refreshConversationWork().catch(error => message(error.message, true));
   }
 });
 $("#cancel-message-edit").addEventListener("click", () => cancelMessageEdit());

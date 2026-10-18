@@ -4,6 +4,7 @@ import re
 import unittest
 from unittest.mock import patch
 import httpx
+from app.job_normalize import company_excluded, company_key
 from app.sources import Sources, SearchInput, SourceError, _valid_518_cursor, region_map
 from app.store import Job
 from test_m2_source518 import SEARCH_HTML
@@ -180,6 +181,15 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second['items'], [])
         self.assertEqual(second['excluded_count'], 1)
         self.assertFalse(second['can_continue'])
+
+    def test_company_exclusion_keeps_latin_word_boundaries(self):
+        keys = [company_key(name) for name in ('Meta', 'IBM')]
+        for name, expected in (('MetalWorks有限公司', False), ('Meta Platforms Taiwan', True), ('META台灣分公司', True),
+                               ('ibm-台灣國際商業機器', True), ('IBMX Labs', False), ('Big Meta-data Co', True)):
+            with self.subTest(name=name):
+                self.assertEqual(company_excluded(name, keys), expected)
+        self.assertTrue(company_excluded('台積電股份有限公司', [company_key('台積')]))
+        self.assertEqual(company_key('臺 灣 合成 股份有限公司'), company_key('台灣合成'))
 
     def test_exclude_companies_input_is_bounded(self):
         self.assertEqual(SearchInput(criteria={'keyword': '採購'}, exclude_companies=['工研院', '工研院']).exclude_companies, ['工研院'])
