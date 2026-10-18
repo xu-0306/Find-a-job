@@ -49,6 +49,17 @@ class BudgetUnits(unittest.TestCase):
         self.assertEqual(context_budget.mask_tool_results(messages), 0, 'masking is idempotent')
         self.assertEqual(context_budget.mask_tool_results(messages, keep_rounds=0), 2)
 
+    def test_masking_below_trigger_keeps_history_above_target(self):
+        messages = [{'role': 'system', 'content': '系統'}, {'role': 'user', 'content': '問' * 1000},
+                    {'role': 'assistant', 'content': '答' * 1000}]
+        messages += tool_round(1, ['old']) + tool_round(2, ['recent'])
+        masked, dropped = context_budget.fit(messages, 1, 3, 3500, 1500, keep_rounds=1)
+        self.assertEqual(masked, 1)
+        self.assertEqual(dropped, [])
+        self.assertEqual(messages[1]['content'], '問' * 1000)
+        self.assertLessEqual(context_budget.estimate(messages), 3500)
+        self.assertGreater(context_budget.estimate(messages), 1500)
+
     def test_trimming_drops_oldest_history_only(self):
         messages = [{'role': 'system', 'content': '系統'}]
         for index in range(10):
@@ -99,6 +110,36 @@ class CompactionChecks(unittest.TestCase):
     @staticmethod
     def texts(payload):
         return [item['content'] for item in payload['input'] if isinstance(item.get('content'), str)]
+
+    def test_masking_alone_does_not_request_summary(self):
+        from unittest.mock import patch
+        self.configure()
+        self.seed(1, size=1000)
+        calls = 0
+        def reply(payload):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return chats.response(call=(f'web-{calls}', 'read_web_page', encode({'url': 'https://example.com'})))
+            return chats.response(text='完成')
+        async def read(*args):
+            return {'text': '文' * 5000}
+        self.app.state.web_reader.read = read
+        self.provider(reply)
+        fit = context_budget.fit
+        def measured_fit(messages, start, end, trigger, target, tools, keep_rounds):
+            import copy
+            if sum(item.get('role') == 'tool' for item in messages) < 2:
+                return fit(messages, start, end, 10**9, target, tools, 1)
+            masked = copy.deepcopy(messages)
+            context_budget.mask_tool_results(masked, 1)
+            trigger = (context_budget.estimate(messages, tools) + context_budget.estimate(masked, tools)) // 2
+            return fit(messages, start, end, trigger, 1, tools, 1)
+        with patch('app.context_budget.fit', side_effect=measured_fit):
+            output = chats.events(self.client.post('/api/chat', json={'request_id': 'mask-only', 'text': '讀網頁'}))
+        self.assertEqual(output[-1][1]['status'], 'completed', output)
+        self.assertTrue(any(context_budget.MASKED_PREFIX in json.dumps(payload, ensure_ascii=False) for payload in self.reply_calls))
+        self.assertEqual(self.summary_calls, [])
 
     def test_long_history_is_summarised_once_and_reused(self):
         self.configure()

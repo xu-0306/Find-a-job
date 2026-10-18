@@ -21,14 +21,15 @@ const searchStates = new Map();
 // The conversation's working list, replayed from jobs/recommendations events in
 // order with the same rules as Store.conversation_state: the latest
 // recommendation replaces the shortlist, and removed jobs leave the main list.
-const conversationWork = {shortlist: [], removed: new Map(), recommendations: null};
+const conversationWork = {shortlist: [], removed: new Map(), recommendations: null, excludedCompanies: []};
 function resetConversationWork() {
-  conversationWork.shortlist = []; conversationWork.removed.clear(); conversationWork.recommendations = null;
+  conversationWork.excludedCompanies = []; conversationWork.shortlist = []; conversationWork.removed.clear(); conversationWork.recommendations = null;
 }
 // The server replays the whole conversation in order; loaded pages and edits only approximate it.
 function applyConversationWork(state) {
   if (!state || typeof state !== "object") return;
   conversationWork.shortlist = Array.isArray(state.shortlist) ? [...new Set(state.shortlist.map(String))] : [];
+  conversationWork.excludedCompanies = Array.isArray(state.excluded_companies) ? state.excluded_companies.map(String) : [];
   conversationWork.removed.clear();
   for (const item of Array.isArray(state.removed) ? state.removed : []) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: String(item.by || "agent"), reason: String(item.reason || "")});
@@ -538,7 +539,7 @@ function mergeJob(state, raw) {
   return state.jobs.get(id);
 }
 function searchLabel(state) {
-  if (state?.isAggregate) return `全部搜尋結果（${state.jobs.size} 筆）`;
+  if (state?.isAggregate) return `全部搜尋結果（${availableJobCount(state)} 筆）`;
   const criteria = state?.criteria?.criteria || state?.criteria || {};
   const keyword = typeof criteria.keyword === "string" ? criteria.keyword.trim() : "";
   const areas = Array.isArray(criteria.area_codes) ? [...new Set(criteria.area_codes.filter(Boolean).map(code => {
@@ -560,6 +561,9 @@ function jobRating(job) {
 }
 function isFeaturedJob(job) {
   return conversationWork.shortlist.includes(jobIdentifier(job)) || Boolean(job.is_recommended || job.featured);
+}
+function availableJobCount(state) {
+  return state.jobs.size - removedJobs(state).length;
 }
 function removedJobs(state) {
   return [...(state?.jobs?.values() || [])].filter(job => conversationWork.removed.has(jobIdentifier(job)));
@@ -592,14 +596,14 @@ function resultJobs(state) {
   });
   return values;
 }
-// Counts come straight from the server fields. `short` is the one-line header summary; `full` goes in the filter dialog.
+// Panel counts describe retained candidates; server totals describe the original search batch.
 function updateResultCounts(state, visible) {
-  const total = state.isAggregate ? state.jobs.size : Number(state.counts.total_count ?? state.counts.total ?? state.jobs.size);
+  const total = availableJobCount(state);
   const totalText = Number.isFinite(total) ? total : state.jobs.size;
   const newCount = state.counts.new_count;
   const duplicate = state.counts.duplicate_count;
   const hasNew = newCount !== undefined && newCount !== null;
-  const shown = visible.length !== state.jobs.size ? `目前顯示 ${visible.length}` : "";
+  const shown = visible.length !== total ? `目前顯示 ${visible.length}` : "";
   const full = [`共 ${totalText} 筆`, hasNew && `本輪新增 ${newCount}`, duplicate !== undefined && duplicate !== null && `重複 ${duplicate}`, shown].filter(Boolean);
   const short = [`${totalText} 筆`, hasNew && `新 ${newCount}`, shown && `顯示 ${visible.length}`].filter(Boolean);
   return {short: short.join(" · "), full: full.join(" · ") + (state.canContinue ? " · 還可以繼續找" : ""), total: totalText};
@@ -680,7 +684,7 @@ function renderSearchResultsPanel() {
   showSearchPanel();
   panel.dataset.searchId = state.id;
   const title = $("#search-results-title");
-  if (title) title.textContent = state.isAggregate ? `這段對話的職缺（${state.jobs.size} 筆）` : ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
+  if (title) title.textContent = state.isAggregate ? `這段對話的職缺（${availableJobCount(state)} 筆）` : ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
   const summary = $("#search-results-summary");
   const jobs = resultJobs(state);
   const counts = updateResultCounts(state, jobs);
@@ -688,7 +692,7 @@ function renderSearchResultsPanel() {
   const fullCounts = $("#search-results-counts");
   if (fullCounts) fullCounts.textContent = counts.full;
   const badge = $("#results-count-badge");
-  if (badge) badge.textContent = `(${state.isAggregate ? state.jobs.size : Number(state.counts.total_count ?? state.jobs.size) || 0})`;
+  if (badge) badge.textContent = `(${counts.total})`;
   const controls = $("#search-results-controls");
   if (controls) {
     controls.replaceChildren();
@@ -739,6 +743,18 @@ function renderSearchResultsPanel() {
   const list = $("#search-results-list");
   if (!list) return;
   list.replaceChildren();
+  if (conversationWork.excludedCompanies.length) {
+    const section = node("section", undefined, "excluded-companies");
+    section.append(node("h3", "已排除公司"));
+    const chips = node("div", undefined, "excluded-company-chips");
+    for (const company of conversationWork.excludedCompanies) {
+      const chip = node("button", `${company} ×`); chip.type = "button";
+      chip.setAttribute("aria-label", `取消排除 ${company}`);
+      chip.disabled = Boolean(activeChat || switchingConversation || !csrfToken);
+      chip.addEventListener("click", () => restoreExcludedCompany(company, chip)); chips.append(chip);
+    }
+    section.append(chips); list.append(section);
+  }
   const removed = removedJobs(state);
   const removedSection = () => {
     const section = node("details", undefined, "removed-jobs");
@@ -747,7 +763,7 @@ function renderSearchResultsPanel() {
     return section;
   };
   if (!jobs.length) {
-    list.append(node("p", state.jobs.size ? "目前篩選沒有職缺。" : "這次搜尋尚未取得職缺。", "hint"));
+    list.append(node("p", state.jobs.size && !counts.total ? "職缺都已移出，請展開「已移出」區查看。" : state.jobs.size ? "目前篩選沒有職缺。" : "這次搜尋尚未取得職缺。", "hint"));
     if (removed.length) list.append(removedSection());
     if (state.canContinue || state.jobs.size) list.append(continueFooter(state, counts.total));
     return;
@@ -796,6 +812,7 @@ function updateSearchState(data, message, {historical = false, render = true} = 
   if (Array.isArray(data.dismissed_ids)) state.dismissed = new Set(data.dismissed_ids.map(String));
   writeDismissed(state.id, state.dismissed);
   for (const item of Array.isArray(data.items) ? data.items : []) mergeJob(state, item);
+  if (Array.isArray(data.excluded_companies)) conversationWork.excludedCompanies = data.excluded_companies.map(String);
   for (const id of Array.isArray(data.excluded_job_ids) ? data.excluded_job_ids : []) {
     conversationWork.removed.set(String(id), {by: "company", reason: "公司已排除"});
   }
@@ -880,6 +897,22 @@ function markDismissedCard(card, dismissed) {
   if (card.notInterestedElement) {
     card.notInterestedElement.textContent = dismissed ? "復原" : "不感興趣";
     card.notInterestedElement.setAttribute("aria-pressed", String(dismissed));
+  }
+}
+async function restoreExcludedCompany(company, button) {
+  if (activeChat || switchingConversation || !csrfToken || !selectedConversationId) return;
+  const token = csrfToken; const conversationId = selectedConversationId;
+  button.disabled = true;
+  try {
+    await api(`/api/conversations/${encodeURIComponent(conversationId)}/excluded-companies`, {
+      method: "PATCH", body: JSON.stringify({company}),
+    });
+    if (token !== csrfToken || conversationId !== selectedConversationId) return;
+    await refreshConversationWork(conversationId);
+  } catch (error) {
+    if (token === csrfToken && conversationId === selectedConversationId) message(`取消排除未能保存：${error.message}`, true);
+  } finally {
+    if (token === csrfToken && conversationId === selectedConversationId) renderSearchResultsPanel();
   }
 }
 async function dismissResultJob(state, job, card) {
@@ -1472,6 +1505,9 @@ function updateConversationControls() {
   $("#refresh-messages").disabled = Boolean(activeChat && !activeChat.awaitingSnapshot) || switchingConversation || !selectedConversationId;
   $("#more-messages").disabled = blocked;
   syncContinueButton();
+  for (const chip of $("#search-results-list")?.querySelectorAll?.(".excluded-company-chips button") || []) {
+    chip.disabled = blocked || !csrfToken;
+  }
   for (const card of $("#conversation-list").children) {
     const id = card.dataset.conversationId;
     const open = card.querySelector("[data-conversation-open]");

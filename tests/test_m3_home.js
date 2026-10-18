@@ -1768,6 +1768,47 @@ async function testUpToFiveAttachmentsAreSentTogether() {
   assert.equal(home.state.fileInput.files.length, 0, "an accepted send clears the selection");
 }
 
+async function testExcludedCompanyChipsAndRemovedCounts() {
+  const home = createContext(); await settle();
+  const list = home.elements.get("search-results-list");
+  const job = id => ({id, source: "104", title: id, company_name: "公司甲", url: `https://jobs.example/${id}`});
+  const search = {search_id: "chips", total_count: 99, items: [job("a"), job("b")], excluded_companies: ["公司甲"], excluded_job_ids: ["a"], filter_warnings: ["依你的指定，本次未查 1111。"]};
+  const emptySearch = {search_id: "empty-chips", items: []};
+  home.context.renderChatEvent(home.context.chatMessage("assistant", "", "running"), "jobs", emptySearch);
+  home.context.renderChatEvent(home.context.chatMessage("assistant", "", "running"), "jobs", search);
+  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（1 筆）");
+  assert.equal(home.elements.get("results-count-badge").textContent, "(1)");
+  assert.equal(home.elements.get("search-results-summary").textContent, "1 筆 · 新 0");
+  assert.match(home.elements.get("search-results-details").textContent, /依你的指定，本次未查 1111/);
+  const chips = () => all(list, item => item.getAttribute("aria-label") === "取消排除 公司甲");
+  assert.equal(chips().length, 1);
+  const requests = [];
+  home.context.api = async (path, options) => {
+    requests.push({path, options});
+    if (options?.method === "PATCH") return {ok: true};
+    return {items: [], conversation_state: {shortlist: [], removed: [], excluded_companies: [], searches: [emptySearch, search]}};
+  };
+  await chips()[0].click();
+  assert.equal(requests[0].path, "/api/conversations/conversation-1/excluded-companies");
+  assert.equal(requests[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {company: "公司甲"});
+  assert.match(requests[1].path, /^\/api\/messages\?/);
+  assert.equal(chips().length, 0, "empty exclusions hide the whole section after authoritative refresh");
+  assert.equal(all(list, item => item.className === "excluded-companies").length, 0);
+  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（2 筆）");
+  home.context.applyConversationWork({shortlist: [], removed: [{job_id: "a"}, {job_id: "b"}], excluded_companies: ["公司甲"]});
+  home.context.renderSearchResultsPanel();
+  assert.match(list.textContent, /職缺都已移出，請展開「已移出」區查看/);
+  assert.doesNotMatch(list.textContent, /目前篩選沒有職缺/);
+  assert.match(list.textContent, /已移出 2/);
+  for (const expression of ["activeChat = {}", "activeChat = {stopping: true}", "activeChat = null; csrfToken = ''"]) {
+    vm.runInContext(expression, home.context); home.context.renderSearchResultsPanel();
+    assert.equal(chips()[0].disabled, true);
+    const before = requests.length; await home.context.restoreExcludedCompany("公司甲", chips()[0]);
+    assert.equal(requests.length, before, "busy/stopping/no-CSRF calls cannot mutate the panel");
+  }
+}
+
 async function testConversationWorkingListConverges() {
   const home = createContext(); await settle();
   const list = home.elements.get("search-results-list");
@@ -1792,7 +1833,7 @@ async function testConversationWorkingListConverges() {
   assert.equal(removed.tagName, "DETAILS"); assert.equal(removed.open, false, "the removed section starts collapsed");
   assert.equal(removed.children[0].textContent, "已移出 2");
   assert.match(removed.textContent, /公司已排除/); assert.match(removed.textContent, /移出原因：需要外派/);
-  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（4 筆）");
+  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（2 筆）");
 
   // Recommending a removed job again brings it back.
   home.context.renderChatEvent(second, "recommendations", {items: [{job_id: "w3"}]});
@@ -2310,6 +2351,7 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testChatHeadingMenuOpensClosesAndRunsItems();
   testChatHeadingMarkupMovesLatestButtonOutOfHeading();
   testSearchTitleIsNotRepeatedWhenUnlabelled();
+  await testExcludedCompanyChipsAndRemovedCounts();
   await testConversationWorkingListConverges();
   await testHistoryPagesUseTheServerWorkingList();
   await testUnrelatedEditKeepsRecommendationReasons();

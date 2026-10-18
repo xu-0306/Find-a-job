@@ -21,6 +21,21 @@ async def fake104(name, args):
 
 
 class SourceChecks(unittest.IsolatedAsyncioTestCase):
+    def test_source_mentions_distinguish_links_and_digit_groups(self):
+        from app.sources import SearchInput, mentions_source, requested_sources
+        for text in ('月薪 52,104', '52，104', '0912-518-123', '02-1111-2222',
+                     'https://www.104.com.tw/job/abc123', 'https://www.518.com.tw/job-G123.html',
+                     'https://www.1111.com.tw/job/98765', '61,518', '03-104-7777'):
+            with self.subTest(text=text): self.assertFalse(mentions_source(text))
+        for text in ('只查104', '不要1111', '１１１１', '只看 104.com.tw', '104。',
+                     '請用５１８', '只查 https://www.104.com.tw 的職缺',
+                     'https://www.104.com.tw/job/abc123，但不要1111'):
+            with self.subTest(text=text): self.assertTrue(mentions_source(text))
+        arguments = SearchInput(criteria={'keyword': '產品經理'}, sources=['104', '518'])
+        enabled = ['104', '518', '1111']
+        self.assertEqual(requested_sources(arguments, enabled, ['不要1111', '再找產品經理']), ['104', '518'])
+        self.assertEqual(requested_sources(arguments, enabled, ['月薪 52,104', '再找產品經理']), enabled)
+
     def test_chat_search_default_limit_is_twenty(self):
         self.assertEqual(SearchInput(criteria={'keyword': '採購'}).limit, 20)
 

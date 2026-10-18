@@ -209,9 +209,33 @@ class RouteChecks(unittest.TestCase):
         for index, text in enumerate(('中山區104號附近', '時薪518元以上', '代號A1111B',
                                       '51040', '月薪 104 千', '$104', '104.5', 'x104.com.tw', '104.com.tw.evil.invalid')):
             with self.subTest(text=text):
+                with self.store.connect(write=True) as db: db.execute('DELETE FROM messages')
                 self.configure(True, ['104'])
                 kept = next(x for event, x in self.send(f'number-{index}', text) if event == 'jobs')
                 self.assertEqual(kept['sources'], ['104', '1111'])
+
+    def test_preference_survives_followups_and_warning_continuation(self):
+        self.configure(True, ['1111'])
+        self.browser.call.return_value = page([row(str(i)) for i in range(1, 31)], size=30, total=31)
+        first = next(data for event, data in self.send('preference', '只查1111') if event == 'jobs')
+        warning = '依你的指定，本次未查 104。'
+        self.assertIn(warning, first['filter_warnings'])
+        self.configure(True, ['1111'])
+        output = self.send('followup', '再找產品經理')
+        jobs = next(data for event, data in output if event == 'jobs')
+        self.assertEqual(jobs['sources'], ['1111'])
+        self.assertIn(warning, jobs['filter_warnings'])
+        progress = [data for event, data in output if event == 'tool_status'
+                    and data['name'] == 'search_jobs' and data['phase'] == 'started']
+        self.assertEqual(len(progress), 1)
+        label = progress[0]['summary']
+        self.assertTrue(label.endswith('· 1111'), label)
+        self.app.state.llm_transport = __import__('httpx').MockTransport(lambda request: response(text='續查完成'))
+        output = events(self.client.post('/api/chat', json={'request_id': 'continued', 'text': '繼續',
+            'action': {'type': 'continue_search', 'search_id': first['search_id']}}))
+        jobs = next(data for event, data in output if event == 'jobs')
+        self.assertEqual(jobs['filter_warnings'].count(warning), 1)
+        self.assertEqual(jobs['sources'], ['1111'])
 
     def test_model_continuation_label_uses_the_saved_sources(self):
         self.configure(True, ['1111'])

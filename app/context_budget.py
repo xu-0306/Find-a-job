@@ -114,4 +114,6 @@ def fit(messages, history_start, history_end, trigger, target, tools=(), keep_ro
     if estimate(messages, tools) <= trigger:
         return 0, []
     masked = mask_tool_results(messages, keep_rounds)
+    if estimate(messages, tools) <= trigger:
+        return masked, []
     return masked, trim_history(messages, history_start, history_end, target, tools)

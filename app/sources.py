@@ -29,16 +29,25 @@ _SOURCE_MENTION = re.compile(
     r'(?<!\.)(?<!薪)(?:104|518|1111)(?![0-9a-z]|\.[0-9a-z]|\s*(?:號|号|巷|弄|樓|楼|路|街|段|區|元|塊|萬|千|百|個|天|年|月|小時|分)))')
 
 
+def mentions_source(text):
+    text = unicodedata.normalize('NFKC', text or '').casefold()
+    # Links with paths are references, and digit runs with punctuation are quantities/phone numbers.
+    text = re.sub(r'(?:https?://)?(?:www\.)?(?:104|518|1111)\.com\.tw/[a-z0-9._~:/?#@!$&()*+,;=%-]*', ' ', text)
+    text = re.sub(r'(?<![0-9])[0-9]+(?:[,\-][0-9]+)+(?![0-9])', ' ', text)
+    return bool(_SOURCE_MENTION.search(text))
+
+
 def requested_sources(arguments, enabled, user_text, continuation=False):
     """Sources a search asks for, before disabled ones are dropped.
 
-    A new search queries every enabled source unless this turn's user message names a source ("只查 104"、"不要 1111"):
+    A new search queries every enabled source unless any user message through the current turn names a source ("只查 104"、"不要 1111"):
     models narrowed the list on their own, which silently skipped sources the admin had turned on. A continuation
     keeps its saved sources, since its cursor has no position for a newly added one.
     """
     requested = list(arguments.sources)
-    text = unicodedata.normalize('NFKC', user_text or '').casefold()
-    if not continuation and ('sources' not in arguments.model_fields_set or not _SOURCE_MENTION.search(text)):
+    texts = [user_text] if isinstance(user_text, str) else (user_text or [])
+    mentioned = any(mentions_source(text) for text in texts)
+    if not continuation and ('sources' not in arguments.model_fields_set or not mentioned):
         requested += [source for source in enabled if source not in requested]
     return requested
 
@@ -46,7 +55,7 @@ def requested_sources(arguments, enabled, user_text, continuation=False):
 class SearchInput(Input):
     criteria: Criteria
     sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=3,
-        description='通常省略：一律查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有使用者這則訊息明確指定或排除某個人力銀行時才填，且只有那時才會限縮。1111 為實驗來源，可能因人機驗證受阻。')
+        description='通常省略：一律查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有這段對話截至當回合的使用者訊息曾明確指定或排除某個人力銀行時才填，且只有那時才會限縮。1111 為實驗來源，可能因人機驗證受阻。')
     limit: StrictInt = Field(default=20, ge=1, le=20)
     search_id: str | None = Field(default=None, min_length=1, max_length=100)
     exclude_companies: list[str] = Field(default_factory=list, max_length=20,

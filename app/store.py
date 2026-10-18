@@ -298,6 +298,13 @@ class Store:
                 if json.loads(original['content_json']).get('attachments') and not attachments:
                     raise ValueError('attachment_required')
                 user['edited_at'] = now().isoformat()
+                metadata = json.loads(original['content_json'])
+                if 'company_restorations' in metadata:
+                    # Old assistant events are replaced; retained panel actions precede the regenerated reply.
+                    user['company_restorations'] = [dict(action, after_event=0)
+                                                    for action in metadata['company_restorations']]
+                if 'search_dismissed' in metadata:
+                    user['search_dismissed'] = metadata['search_dismissed']
                 db.execute("UPDATE messages SET request_id=?,content_json=? WHERE id=?", (request_id, encode(user), edit_message_id))
                 db.execute("UPDATE messages SET request_id=?,content_json=? WHERE request_id=? AND role='assistant'",
                            (request_id, encode(assistant), edit_request_id))
@@ -327,11 +334,11 @@ class Store:
                 WHERE role='assistant' AND json_extract(content_json,'$.status')='running'""")
 
     @staticmethod
-    def search_snapshot(db, conversation_id, search_id):
+    def search_snapshot(db, conversation_id, search_id, before_seq=None):
         row = db.execute("""SELECT e.value FROM messages m, json_each(m.content_json,'$.events') e
             WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event')='jobs'
-            AND json_extract(e.value,'$.data.search_id')=? ORDER BY m.rowid DESC,CAST(e.key AS INTEGER) DESC LIMIT 1""",
-            (conversation_id, search_id)).fetchone()
+            AND json_extract(e.value,'$.data.search_id')=? AND (? IS NULL OR m.rowid<?) ORDER BY m.rowid DESC,CAST(e.key AS INTEGER) DESC LIMIT 1""",
+            (conversation_id, search_id, before_seq, before_seq)).fetchone()
         if not row:
             raise LookupError('search_missing')
         snapshot = json.loads(row[0])['data']
@@ -363,28 +370,72 @@ class Store:
             return {'search_id': search_id, 'dismissed_ids': sorted(ignored)}
 
     @staticmethod
-    def conversation_job_ids(db, conversation_id):
+    def conversation_job_ids(db, conversation_id, before_seq=None):
         rows = db.execute("""SELECT json_extract(j.value,'$.id') FROM messages m,
             json_each(m.content_json,'$.events') e,json_each(e.value,'$.data.items') j
-            WHERE m.conversation_id=? AND json_extract(e.value,'$.event')='jobs'
-            ORDER BY m.rowid,CAST(e.key AS INTEGER),CAST(j.key AS INTEGER)""", (conversation_id,)).fetchall()
+            WHERE m.conversation_id=? AND json_extract(e.value,'$.event')='jobs' AND (? IS NULL OR m.rowid<?)
+            ORDER BY m.rowid,CAST(e.key AS INTEGER),CAST(j.key AS INTEGER)""", (conversation_id, before_seq, before_seq)).fetchall()
         return list(dict.fromkeys(row[0] for row in rows if row[0]))
 
     @staticmethod
-    def conversation_state(db, conversation_id):
+    def turn_before_seq(db, request_id):
+        """Edits retain both rowids; include the current assistant, but no later turn."""
+        return db.execute("SELECT rowid+1 FROM messages WHERE request_id=? AND role='assistant'", (request_id,)).fetchone()[0]
+
+    @staticmethod
+    def conversation_user_texts(db, conversation_id, before_seq=None):
+        return [json.loads(row[0]).get('text', '') for row in db.execute(
+            "SELECT content_json FROM messages WHERE conversation_id=? AND role='user' AND (? IS NULL OR rowid<?) ORDER BY rowid",
+            (conversation_id, before_seq, before_seq))]
+
+    @staticmethod
+    def restore_company(db, conversation_id, company):
+        row = db.execute("""SELECT u.id,u.content_json,a.content_json AS assistant FROM messages u
+            JOIN messages a ON a.request_id=u.request_id AND a.role='assistant'
+            WHERE u.conversation_id=? AND u.role='user' ORDER BY u.rowid DESC LIMIT 1""", (conversation_id,)).fetchone()
+        if row:
+            content = json.loads(row['content_json'])
+            content.setdefault('company_restorations', []).append({
+                'company': company, 'after_event': len(json.loads(row['assistant']).get('events', []))})
+            db.execute('UPDATE messages SET content_json=? WHERE id=?', (encode(content), row['id']))
+
+    @staticmethod
+    def conversation_state(db, conversation_id, before_seq=None):
         """Working-list state replayed from this conversation's saved events (the front end replays the same rules)."""
-        rows = db.execute("""SELECT e.value FROM messages m, json_each(m.content_json,'$.events') e
-            WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event') IN ('jobs','recommendations')
-            ORDER BY m.rowid,CAST(e.key AS INTEGER)""", (conversation_id,)).fetchall()
-        companies, shortlist, removed, recommendations = [], [], {}, {}
+        from .job_normalize import company_key, company_excluded
+
+        rows = db.execute("""SELECT role,request_id,content_json FROM messages
+            WHERE conversation_id=? AND (? IS NULL OR rowid<?) ORDER BY rowid""",
+            (conversation_id, before_seq, before_seq)).fetchall()
+        companies, shortlist, removed, recommendations, jobs = [], [], {}, {}, {}
+        actions, events, dismissed = {}, [], []
         for row in rows:
-            event = json.loads(row[0])
+            content = json.loads(row['content_json'])
+            if row['role'] == 'user':
+                actions[row['request_id']] = content.get('company_restorations', [])
+                for ids in content.get('search_dismissed', {}).values():
+                    dismissed.extend(ids)
+            else:
+                saved = content.get('events', [])
+                pending = actions.get(row['request_id'], [])
+                for index in range(len(saved) + 1):
+                    events.extend({'event': 'restore_company', 'data': action} for action in pending
+                                  if min(action['after_event'], len(saved)) == index)
+                    if index < len(saved):
+                        events.append(saved[index])
+        for event in events:
             data = event.get('data') or {}
-            if event.get('event') == 'jobs':
+            if event.get('event') == 'restore_company':
+                companies = [company for company in companies if company_key(company) != company_key(data['company'])]
+                keys = [company_key(company) for company in companies]
+                removed = {ident: item for ident, item in removed.items()
+                           if item['by'] != 'company' or company_excluded(jobs.get(ident), keys)}
+            elif event.get('event') == 'jobs':
+                jobs.update((job['id'], job.get('company_name')) for job in data.get('items', []) if job.get('id'))
                 companies = list(dict.fromkeys([*companies, *data.get('excluded_companies', [])]))
                 for job_id in data.get('excluded_job_ids', []):
                     removed[job_id] = {'job_id': job_id, 'by': 'company', 'reason': '公司已排除'}
-            else:
+            elif event.get('event') == 'recommendations':
                 ids = [item.get('job_id') for item in data.get('items', []) if item.get('job_id')]
                 # Events saved before `replace` existed always carried a non-empty replacement list.
                 if data.get('replace', bool(ids)):
@@ -403,11 +454,6 @@ class Store:
                     removed[item['job_id']] = {'job_id': item['job_id'], 'by': 'agent', 'reason': item.get('reason', '')}
                 for job_id in ids:
                     removed.pop(job_id, None)
-        dismissed = []
-        for (content,) in db.execute("""SELECT content_json FROM messages WHERE conversation_id=? AND role='user'
-                AND json_extract(content_json,'$.search_dismissed') IS NOT NULL ORDER BY rowid""", (conversation_id,)):
-            for ids in json.loads(content).get('search_dismissed', {}).values():
-                dismissed.extend(ids)
         shortlist = [job_id for job_id in shortlist if job_id not in removed]
         return {'shortlist': shortlist, 'recommendations': [recommendations[job_id] for job_id in shortlist],
                 'excluded_companies': companies, 'removed': list(removed.values()),

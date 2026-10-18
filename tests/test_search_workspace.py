@@ -258,6 +258,7 @@ class WorkspaceChecks(unittest.TestCase):
         self.script(('search_jobs', {'criteria': {'keyword': '條件2'}, 'exclude_companies': [f'公司2-{i}' for i in range(10)]}))
         output = events(self.client.post('/api/chat', json={'request_id': 'exclude-2', 'text': '再排除'}))
         self.assertEqual(next(data['code'] for event, data in output if event == 'error'), 'too_many_exclusions')
+        self.assertEqual(next(data['message'] for event, data in output if event == 'error'), '這段對話排除的公司已超過 50 家；請在職缺清單面板移除部分已排除公司。')
         self.assertEqual(len(self.state()['excluded_companies']), 41)
 
     def test_recommendations_replace_shortlist_and_remove_jobs(self):
@@ -287,7 +288,7 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(self.state()['shortlist'], [alpha])
         self.script(('present_job_recommendations', {'items': [], 'removed': [{'job_id': alpha, 'reason': '不適合'}]}), '已清空。')
         output = self.chat('rec-5')
-        self.assertTrue(next(data for name, data in output if name == 'recommendations')['replace'])
+        self.assertFalse(next(data for name, data in output if name == 'recommendations')['replace'])
         self.assertEqual(self.state()['shortlist'], [])
         self.script(('present_job_recommendations', {'items': [{'job_id': beta}]}), '再選。')
         self.chat('rec-6')
@@ -303,7 +304,7 @@ class WorkspaceChecks(unittest.TestCase):
         self.chat('page-1')
         self.script(('present_job_recommendations', {'items': [{'job_id': beta}], 'removed': [{'job_id': alpha, 'reason': '外派'}]}), '換一筆。')
         self.chat('page-2')
-        expected = {'shortlist': [beta], 'removed': [{'job_id': alpha, 'by': 'agent', 'reason': '外派'}]}
+        expected = {'excluded_companies': [], 'shortlist': [beta], 'removed': [{'job_id': alpha, 'by': 'agent', 'reason': '外派'}]}
         latest = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2}).json()
         searches = latest['conversation_state'].pop('searches')
         recommendations = latest['conversation_state'].pop('recommendations')
@@ -383,7 +384,7 @@ class WorkspaceChecks(unittest.TestCase):
         self.configure()
         self.first()
         for request_id, arguments, code in (
-                ('unknown', {'removed': [{'job_id': 'job-not-here', 'reason': '不適合'}]}, 'unknown_job'),
+                ('unknown', {'items': [{'job_id': 'job-not-here'}]}, 'unknown_job'),
                 ('empty', {}, 'invalid_tool'), ('empty-removed', {'removed': []}, 'invalid_tool')):
             with self.subTest(request_id=request_id):
                 self.script(('present_job_recommendations', arguments))
@@ -400,6 +401,240 @@ class WorkspaceChecks(unittest.TestCase):
         history = self.client.get('/api/messages').json()['items']
         job = next(e['data']['items'][0] for m in history for e in m['content']['events'] if e['event'] == 'jobs')
         self.assertEqual(job['summary'], detail['item']['summary'])
+
+
+    def test_restore_company_replays_and_can_exclude_again(self):
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = [item['id'] for item in first['items']]
+        self.script(('present_job_recommendations', {'items': [{'job_id': alpha}, {'job_id': beta}]}))
+        self.chat('featured')
+        self.script(('search_jobs', {'criteria': {'keyword': '另一條件'}, 'exclude_companies': ['來源公司 alpha']}))
+        self.chat('exclude')
+        url = '/api/conversations/legacy/excluded-companies'
+        self.assertEqual(self.client.patch(url, json={'company': '來源公司 alpha'}).status_code, 200)
+        current = self.client.get('/api/messages', params={'conversation_id': 'legacy'}).json()['conversation_state']
+        self.assertEqual(current['excluded_companies'], [])
+        self.assertEqual(current['removed'], [])
+        self.assertEqual(current['shortlist'], [alpha, beta])
+        requests = self.script(('search_jobs', {'criteria': {'keyword': '新條件'}}))
+        self.chat('after-restore')
+        self.assertEqual(self.company_exclusions[-1], [])
+        working = next(json.loads(item['content'].split('\n', 1)[1]) for item in json.loads(requests[0])['input']
+                       if isinstance(item.get('content'), str) and '"shortlist"' in item['content'])
+        self.assertEqual(working['excluded_companies'], [])
+        self.assertEqual(working['removed'], [])
+        self.script('續查。')
+        self.chat('after-restore-continue', action={'type': 'continue_search', 'search_id': first['search_id']})
+        self.assertEqual(self.company_exclusions[-1], [])
+        self.script(('search_jobs', {'criteria': {'keyword': '再排除'}, 'exclude_companies': ['來源公司 alpha']}))
+        self.chat('exclude-again')
+        self.assertEqual(self.state()['excluded_companies'], ['來源公司 alpha'])
+        self.assertIn(alpha, [item['job_id'] for item in self.state()['removed']])
+
+    def test_restore_company_authorization_and_csrf(self):
+        self.configure()
+        self.first()
+        # Use another owner's conversation, rather than just a missing id.
+        with self.store.connect(write=True) as db:
+            db.execute("INSERT INTO users SELECT 'other','other',NULL,0,1,created_at FROM users WHERE id='default'")
+            db.execute("INSERT INTO conversations SELECT 'other-chat',title,created_at,updated_at,'other' FROM conversations WHERE id='legacy'")
+        body = {'company': '合成公司'}
+        self.assertEqual(self.client.patch('/api/conversations/other-chat/excluded-companies', json=body).status_code, 404)
+        self.assertEqual(self.client.patch('/api/conversations/legacy/excluded-companies', json=body,
+                                          headers={'X-CSRF-Token': 'wrong'}).status_code, 403)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.patch('/api/conversations/legacy/excluded-companies', json=body).status_code, 401)
+
+    def test_restore_metadata_survives_edit_and_stream_snapshots(self):
+        self.configure()
+        first, _ = self.first()
+        alpha = first['items'][0]['id']
+        self.script(('search_jobs', {'criteria': {'keyword': '另一條件'}, 'exclude_companies': ['來源公司 alpha']}))
+        self.chat('exclude')
+        self.client.patch('/api/conversations/legacy/excluded-companies', json={'company': '來源公司 alpha'})
+        with self.store.connect() as db:
+            row = db.execute("SELECT id,rowid FROM messages WHERE request_id='exclude' AND role='user'").fetchone()
+            assistant_seq = db.execute("SELECT rowid FROM messages WHERE request_id='exclude' AND role='assistant'").fetchone()[0]
+        self.script('重新回答。')
+        self.chat('edited-exclude', edit_message_id=row['id'], edit_request_id='exclude')
+        with self.store.connect() as db:
+            user = db.execute("SELECT rowid,content_json FROM messages WHERE request_id='edited-exclude' AND role='user'").fetchone()
+            self.assertEqual(user[0], row['rowid'])
+            self.assertEqual(json.loads(user[1])['company_restorations'], [{'company': '來源公司 alpha', 'after_event': 0}])
+            self.assertEqual(db.execute("SELECT rowid FROM messages WHERE request_id='edited-exclude' AND role='assistant'").fetchone()[0], assistant_seq)
+        self.assertEqual(self.state()['excluded_companies'], [])
+        self.assertNotIn(alpha, [item['job_id'] for item in self.state()['removed']])
+        # A new exclusion in the regenerated reply follows the preserved cancellation.
+        self.script(('search_jobs', {'criteria': {'keyword': '重做'}, 'exclude_companies': ['來源公司 alpha']}))
+        self.chat('edited-again', edit_message_id=row['id'], edit_request_id='edited-exclude')
+        self.assertEqual(self.state()['excluded_companies'], ['來源公司 alpha'])
+
+    def test_empty_items_with_removals_keep_other_featured_jobs(self):
+        from app.chat import SYSTEM
+        self.assertNotIn('比較既有職缺也使用此工具', SYSTEM)
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = [item['id'] for item in first['items']]
+        self.script(('present_job_recommendations', {'items': [{'job_id': alpha}, {'job_id': beta}]}))
+        self.chat('two-featured')
+        self.script(('present_job_recommendations', {'items': [], 'removed': [{'job_id': alpha, 'reason': '外派'}]}))
+        output = self.chat('remove-one')
+        self.assertFalse(next(data['replace'] for event, data in output if event == 'recommendations'))
+        self.assertEqual(self.state()['shortlist'], [beta])
+        started = [data['summary'] for event, data in output if event == 'tool_status'
+                   and data['name'] == 'present_job_recommendations' and data['phase'] == 'started']
+        self.assertEqual(started, ['移出 1 筆'])
+        self.script(('present_job_recommendations', {'items': []}))
+        self.chat('clear-featured')
+        self.assertEqual(self.state()['shortlist'], [])
+
+    def test_unknown_removed_is_ignored_without_clearing_shortlist(self):
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = [item['id'] for item in first['items']]
+        self.script(('present_job_recommendations', {'items': [{'job_id': alpha}, {'job_id': beta}]}))
+        self.chat('select-two')
+        self.script(('present_job_recommendations', {'removed': [{'job_id': 'unknown-id', 'reason': '不存在'}]}))
+        output = self.chat('unknown-only')
+        self.assertEqual(self.state()['shortlist'], [alpha, beta])
+        result = next(data for event, data in output if event == 'recommendations')
+        self.assertEqual(result, {'items': [], 'removed': [], 'replace': False})
+        self.script(('present_job_recommendations', {'items': [], 'removed': [{'job_id': 'unknown-id', 'reason': '不存在'}]}))
+        output = self.chat('unknown-with-empty-items')
+        self.assertEqual(self.state()['shortlist'], [alpha, beta])
+        self.assertEqual(next(data for event, data in output if event == 'recommendations'),
+                         {'items': [], 'removed': [], 'replace': False})
+        self.script(('present_job_recommendations', {'items': [], 'removed': [
+            {'job_id': 'unknown-id', 'reason': '不存在'}, {'job_id': alpha, 'reason': '地點不符'}]}))
+        self.chat('mixed-removed')
+        self.assertEqual(self.state()['shortlist'], [beta])
+        self.assertEqual(self.state()['removed'], [{'job_id': alpha, 'by': 'agent', 'reason': '地點不符'}])
+
+    def test_edit_bounds_working_list_sources_exclusions_and_allowed_jobs(self):
+        self.configure()
+        first, _ = self.first()
+        alpha = first['items'][0]['id']
+        self.store.save_reply('first', {'text': '第一輪', 'status': 'completed', 'events': [
+            {'event': 'jobs', 'data': first}, {'event': 'recommendations', 'data': {'items': [{'job_id': alpha}], 'replace': True}}]})
+        self.script(('present_job_recommendations', {'items': [{'job_id': alpha}]}))
+        self.chat('middle', text='再比較')
+        with self.store.connect() as db:
+            middle = dict(db.execute("SELECT id,rowid FROM messages WHERE request_id='middle' AND role='user'").fetchone())
+        self.script(('search_jobs', {'criteria': {'keyword': '另一條件'}, 'exclude_companies': ['未來公司']}),
+                    ('present_job_recommendations', {'removed': [{'job_id': alpha, 'reason': '未來決定'}]}))
+        later = self.chat('future', text='只查104')
+        future_id = next(data['items'][0]['id'] for event, data in later if event == 'jobs')
+        self.client.patch('/api/conversations/legacy/excluded-companies', json={'company': '未來公司'})
+        requests = self.script(('search_jobs', {'criteria': {'keyword': '重找'}, 'sources': ['104']}),
+                               ('present_job_recommendations', {'items': [{'job_id': alpha}]}))
+        output = self.chat('edit-middle', text='再找', edit_message_id=middle['id'], edit_request_id='middle')
+        work = next(json.loads(item['content'].split('\n', 1)[1]) for item in json.loads(requests[0])['input']
+                    if isinstance(item.get('content'), str) and '"shortlist"' in item['content'])
+        self.assertEqual(work, {'shortlist': [alpha], 'excluded_companies': [], 'removed': [], 'dismissed_ids': []})
+        self.assertEqual(self.company_exclusions[-1], [])
+        self.assertEqual(next(data['sources'] for event, data in output if event == 'jobs'), ['104', '518'])
+        self.assertTrue(any(event == 'recommendations' for event, data in output))
+        with self.store.connect() as db:
+            boundary = self.store.turn_before_seq(db, 'edit-middle')
+            self.assertNotIn(future_id, self.store.conversation_job_ids(db, 'legacy', boundary))
+            self.assertEqual(self.store.conversation_user_texts(db, 'legacy', boundary), ['合成搜尋', '再找'])
+
+    def test_same_turn_search_can_recommend_new_candidate(self):
+        self.configure()
+        count = 0
+        def provider(request):
+            nonlocal count
+            count += 1
+            payload = json.loads(request.content)
+            if count == 1:
+                return response(call=('search', 'search_jobs', encode({'criteria': {'keyword': '資料'}})))
+            if count == 2:
+                result = next(json.loads(item['output']) for item in payload['input'] if item.get('type') == 'function_call_output')
+                return response(call=('present', 'present_job_recommendations', encode({'items': [{'job_id': result['items'][0]['id']}]})))
+            return response(text='完成')
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        output = self.chat('same-turn')
+        job_id = next(data['items'][0]['id'] for event, data in output if event == 'jobs')
+        self.assertEqual(self.state()['shortlist'], [job_id])
+
+
+    def test_edited_turn_sees_its_new_jobs_and_exclusions(self):
+        self.configure()
+        self.first()
+        self.script('原回覆')
+        self.chat('middle-to-edit')
+        with self.store.connect() as db:
+            middle = db.execute("SELECT id FROM messages WHERE request_id='middle-to-edit' AND role='user'").fetchone()[0]
+        self.script('後面的回覆')
+        self.chat('future-turn', text='只查104')
+        count, new_ids = 0, []
+
+        def provider(request):
+            nonlocal count
+            count += 1
+            payload = json.loads(request.content)
+            if count == 1:
+                return response(call=('new-search', 'search_jobs', encode({'criteria': {'keyword': '另一條件'}})))
+            if count == 2:
+                result = next(json.loads(item['output']) for item in payload['input'] if item.get('type') == 'function_call_output')
+                new_ids.extend(item['id'] for item in result['items'])
+                return response(call=('exclude-new', 'search_jobs', encode({
+                    'criteria': {'keyword': '資料'}, 'exclude_companies': ['來源公司 gamma']})))
+            if count == 3:
+                result = [json.loads(item['output']) for item in payload['input'] if item.get('type') == 'function_call_output'][-1]
+                self.assertEqual(result['excluded_companies'], ['來源公司 gamma'])
+                self.assertEqual(result['excluded_job_ids'], [new_ids[0]])
+                return response(call=('present-new', 'present_job_recommendations', encode({'items': [{'job_id': new_ids[1]}]})))
+            return response(text='重生完成')
+
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        output = self.chat('edited-same-turn', edit_message_id=middle, edit_request_id='middle-to-edit')
+        self.assertEqual(count, 4)
+        self.assertEqual(self.company_exclusions[-2:], [[], ['來源公司 gamma']])
+        self.assertEqual(next(data['sources'] for event, data in output if event == 'jobs'), ['104', '518'])
+        with self.store.connect() as db:
+            bounded = self.store.conversation_state(db, 'legacy', self.store.turn_before_seq(db, 'edited-same-turn'))
+        self.assertEqual(bounded['shortlist'], [new_ids[1]])
+        self.assertEqual(bounded['removed'], [{'job_id': new_ids[0], 'by': 'company', 'reason': '公司已排除'}])
+
+
+class ReplayUnits(unittest.TestCase):
+    def test_restore_order_and_agent_removals_with_in_memory_database(self):
+        import sqlite3
+        from app.store import Store
+        with sqlite3.connect(':memory:') as db:
+            db.row_factory = sqlite3.Row
+            db.execute('CREATE TABLE messages(id TEXT,request_id TEXT,role TEXT,content_json TEXT,conversation_id TEXT)')
+            saved = [
+                {'event': 'jobs', 'data': {'items': [{'id': 'alpha', 'company_name': '甲公司'}, {'id': 'beta', 'company_name': '乙公司'}]}},
+                {'event': 'recommendations', 'data': {'items': [{'job_id': 'alpha'}], 'removed': [{'job_id': 'beta', 'reason': '外派'}]}},
+                {'event': 'jobs', 'data': {'excluded_companies': ['甲公司'], 'excluded_job_ids': ['alpha']}}]
+            db.execute('INSERT INTO messages VALUES(?,?,?,?,?)', ('u', 'one', 'user', encode({'text': '不要1111'}), 'test'))
+            db.execute('INSERT INTO messages VALUES(?,?,?,?,?)', ('a', 'one', 'assistant', encode({'events': saved}), 'test'))
+            Store.restore_company(db, 'test', '甲公司')
+            state = Store.conversation_state(db, 'test')
+            self.assertEqual(state['excluded_companies'], [])
+            self.assertEqual(state['shortlist'], ['alpha'])
+            self.assertEqual(state['removed'], [{'job_id': 'beta', 'by': 'agent', 'reason': '外派'}])
+            # A later streamed exclusion must follow the user metadata, rather than overwrite it.
+            saved.append({'event': 'jobs', 'data': {'excluded_companies': ['甲公司'], 'excluded_job_ids': ['alpha']}})
+            db.execute("UPDATE messages SET content_json=? WHERE id='a'", (encode({'events': saved}),))
+            self.assertEqual(Store.conversation_state(db, 'test')['excluded_companies'], ['甲公司'])
+            self.assertEqual(Store.conversation_state(db, 'test')['shortlist'], [])
+            Store.restore_company(db, 'test', '甲公司')
+            self.assertEqual(Store.conversation_state(db, 'test')['shortlist'], ['alpha'])
+            boundary = Store.turn_before_seq(db, 'one')
+            db.execute('INSERT INTO messages VALUES(?,?,?,?,?)', ('u2', 'two', 'user', encode({'text': '只查104', 'search_dismissed': {'later': ['alpha']}}), 'test'))
+            db.execute('INSERT INTO messages VALUES(?,?,?,?,?)', ('a2', 'two', 'assistant', encode({'events': [
+                {'event': 'jobs', 'data': {'items': [{'id': 'future', 'company_name': '未來'}], 'excluded_companies': ['未來公司']}}]}), 'test'))
+            Store.restore_company(db, 'test', '未來公司')
+            limited = Store.conversation_state(db, 'test', boundary)
+            self.assertEqual(limited['excluded_companies'], [])
+            self.assertEqual(limited['dismissed_ids'], [])
+            self.assertEqual(Store.conversation_job_ids(db, 'test', boundary), ['alpha', 'beta'])
+            self.assertEqual(Store.conversation_user_texts(db, 'test', boundary), ['不要1111'])
+            self.assertEqual(Store.conversation_state(db, 'test')['dismissed_ids'], ['alpha'])
 
 
 del ChatChecks

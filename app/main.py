@@ -169,7 +169,7 @@ class RemovedJob(Input):
 
 class Recommendations(Input):
     items: list[Recommendation] = Field(default_factory=list, max_length=20,
-        description='目前的完整精選清單（依推薦順序）；提供時取代之前的精選，不是追加，空陣列表示清空精選。只移出職缺時省略。')
+        description='目前的完整精選清單（依推薦順序）；非空時取代之前的精選，不是追加。空陣列且沒有 removed 才表示清空；只移出職缺時省略或填空陣列。')
     removed: list[RemovedJob] = Field(default_factory=list, max_length=50,
         description='使用者不要或經判斷不適合、應從職缺清單移出的 job_id 與簡短原因。')
 
@@ -179,7 +179,11 @@ class Recommendations(Input):
 
     @property
     def replaces_shortlist(self):
-        return 'items' in self.model_fields_set
+        return bool(self.items) or ('items' in self.model_fields_set and not self.removed)
+
+
+class CompanyRestore(Input):
+    company: str = Field(min_length=1, max_length=80)
 
 
 class AreaLookup(Input):
@@ -1371,7 +1375,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             # The first page also carries the recent searches, so the panel does not depend on which messages are loaded.
             searches = store.conversation_searches(db, conversation_id, auth['user_id']) if cursor is None else None
         result = store.messages(parse_cursor(cursor) if cursor is not None else None, limit, conversation_id, user_id=auth['user_id'])
-        result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed', 'recommendations')}
+        result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed', 'recommendations', 'excluded_companies')}
         if searches is not None:
             result['conversation_state']['searches'] = searches
         return result
@@ -1387,6 +1391,14 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         except PermissionError:
             raise APIError(401, 'session_revoked', '登入已失效，請重新登入。') from None
 
+    @app.patch('/api/conversations/{conversation_id}/excluded-companies')
+    def restore_company(conversation_id: str, body: CompanyRestore, auth=Depends(user)):
+        with store.connect(write=True) as db:
+            ensure_active(db, auth['hash'])
+            conversation_view(db, conversation_id, auth['user_id'])
+            store.restore_company(db, conversation_id, body.company)
+        return {'ok': True}
+
     tool_specs = [
         {'name': 'list_preferences', 'description': '查看已確認的條件與等待確認的提案。',
          'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
@@ -1394,7 +1406,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
          'parameters': ProposalInput.model_json_schema()},
         {'name': 'search_jobs', 'description': '只有使用者要找、推薦或比較職缺時才使用 search_jobs；分析、查評價、職涯建議或詢問特定職缺時不搜尋。識別特定職缺先以 get_job_details 讀使用者提供的 104 網址，讀不到就請使用者提供內容，不用搜尋尋找。依使用者條件或履歷中的技能與經驗搜尋職缺；sources 通常省略，以查詢後台已啟用的全部來源。使用者要求排除某公司時填 exclude_companies，之後本對話的搜尋都會套用。只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
         {'name': 'lookup_job_areas', 'description': '由地區名稱查官方地區代碼；搜尋前先查碼，不猜數字。', 'parameters': AreaLookup.model_json_schema()},
-        {'name': 'present_job_recommendations', 'description': '維護這段對話的職缺清單：items 是目前完整的精選（取代先前精選，依推薦順序），removed 把使用者不要或不適合的已取得職缺移出清單並附原因。只能用本次對話已取得的job_id；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
+        {'name': 'present_job_recommendations', 'description': '維護這段對話的職缺清單：只是比較、不改精選時直接在回覆文字比較，不呼叫此工具。要改精選時 items 提交完整清單（取代先前精選，依推薦順序）；items 空陣列且沒有 removed 才清空精選，removed 把使用者不要或不適合的已取得職缺移出清單並附原因。只能用本次對話已取得的job_id；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
         {'name': 'get_job_details', 'description': '以 job_id 讀取已保存職缺，或以 url 直接讀使用者提供的 104 職缺網址（可帶查詢參數）；兩者擇一。網址讀取不新增搜尋候選。未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
         {'name': 'get_company_reviews', 'description': '使用者詢問或要求時才查公司評價；同名不明時請使用者選擇。', 'parameters': reviews.ReviewInput.model_json_schema()},
         {'name': 'read_web_page', 'description': '讀取使用者提供或與其要求直接相關的公開網頁，例如 GitHub 個人頁、專案 README、個人網站及作品集。一次一個完整 HTTP／HTTPS 網址；回傳文字及来源網址。不能登入或搜尋，失敗、截斷與未讀連結須如實說明。', 'parameters': web.ReadInput.model_json_schema()},
@@ -1420,6 +1432,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         raise llm.LLMError('invalid_tool', '模型提出的工具或參數不符，請調整後重試。')
 
     async def invoke_tool(name, arguments, auth_hash, conversation_id, request_id, user_id):
+        with store.connect() as db:
+            before_seq = store.turn_before_seq(db, request_id)
         if name == 'lookup_job_areas':
             normalized = arguments.query.replace('臺', '台')
             catalog = sources.area_catalog()
@@ -1428,8 +1442,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         if name == 'present_job_recommendations':
             with store.connect() as db:
                 ensure_active(db, auth_hash)
-                allowed = store.conversation_job_ids(db, conversation_id)
-                if any(item.job_id not in allowed for item in [*arguments.items, *arguments.removed]):
+                allowed = store.conversation_job_ids(db, conversation_id, before_seq)
+                if any(item.job_id not in allowed for item in arguments.items):
                     raise llm.LLMError('unknown_job', '只能推薦這段對話已取得的職缺，請先搜尋。')
                 items, seen = [], set()
                 for item in arguments.items:
@@ -1440,7 +1454,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                     items.append(item.model_dump() | {'job': dict(job.model_dump(mode='json'), id=item.job_id,
                         citation_number=allowed.index(item.job_id) + 1,
                         is_favorite=bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (item.job_id, user_id)).fetchone()))})
-                removed = list({item.job_id: item.model_dump() for item in arguments.removed if item.job_id not in seen}.values())
+                removed = list({item.job_id: item.model_dump() for item in arguments.removed if item.job_id in allowed and item.job_id not in seen}.values())
             result = {'items': items, 'removed': removed, 'replace': arguments.replaces_shortlist}
             return result, ('recommendations', result)
         if name == 'read_web_page':
@@ -1459,7 +1473,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 with store.connect() as db:
                     ensure_active(db, auth_hash)
                     try:
-                        previous = store.search_snapshot(db, conversation_id, search_id)
+                        previous = store.search_snapshot(db, conversation_id, search_id, before_seq)
                     except LookupError:
                         raise llm.LLMError('search_missing', '找不到這段對話的搜尋，請重新搜尋。') from None
                 if not previous.get('can_continue'):
@@ -1469,15 +1483,14 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
                 # One name per normalised key, the earliest kept, so spelling variants do not pile up.
                 by_key = {}
-                for name in [*store.conversation_state(db, conversation_id)['excluded_companies'],
-                             *arguments.exclude_companies, *requested_exclusions]:
-                    by_key.setdefault(job_normalize.company_key(name), name)
+                for company in [*store.conversation_state(db, conversation_id, before_seq)['excluded_companies'],
+                                *requested_exclusions]:
+                    by_key.setdefault(job_normalize.company_key(company), company)
                 excluded_companies = list(by_key.values())
-                user_text = (json.loads(row[0]).get('text') if (row := db.execute(
-                    "SELECT content_json FROM messages WHERE request_id=? AND role='user'", (request_id,)).fetchone()) else '')
+                user_texts = store.conversation_user_texts(db, conversation_id, before_seq)
             if len(excluded_companies) > MAX_EXCLUDED_COMPANIES:
-                raise llm.LLMError('too_many_exclusions', f'這段對話排除的公司已超過 {MAX_EXCLUDED_COMPANIES} 家；請開新對話重新整理條件。')
-            requested = sources.requested_sources(arguments, enabled, user_text, continuation=bool(previous))
+                raise llm.LLMError('too_many_exclusions', f'這段對話排除的公司已超過 {MAX_EXCLUDED_COMPANIES} 家；請在職缺清單面板移除部分已排除公司。')
+            requested = sources.requested_sources(arguments, enabled, user_texts, continuation=bool(previous))
             kept = [source for source in requested if source in enabled]
             disabled_sources = [source for source in requested if source not in enabled]
             disabled_names = '、'.join(disabled_sources)
@@ -1492,6 +1505,12 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             else:
                 search_id = str(uuid4())
                 result = await app.state.sources.search(arguments, exclude_companies=excluded_companies)
+            if previous:
+                result['filter_warnings'] = list(dict.fromkeys([*previous.get('filter_warnings', []), *result['filter_warnings']]))
+            else:
+                skipped = [source for source in enabled if source not in kept]
+                if skipped:
+                    result['filter_warnings'].append(f'依你的指定，本次未查 {"、".join(skipped)}。')
             if disabled:
                 result['filter_warnings'].append(f'{disabled_names} 已在後台停用，本次未查詢。')
             if previous and disabled and not result['items'] and not result['can_continue']:
@@ -1500,7 +1519,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             with store.connect(write=True) as db:
                 ensure_active(db, auth_hash)
                 items = []
-                known_job_ids = store.conversation_job_ids(db, conversation_id)
+                known_job_ids = store.conversation_job_ids(db, conversation_id, before_seq)
                 # Earlier candidates from a newly excluded company leave the working list too.
                 company_keys = [job_normalize.company_key(name) for name in excluded_companies]
                 excluded_job_ids = [job_id for job_id, payload in (
@@ -1558,7 +1577,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                     raise APIError(404, 'search_missing', '找不到這段對話的搜尋，請重新搜尋。') from None
                 if not previous.get('can_continue'):
                     raise APIError(409, 'search_finished', '這次搜尋已沒有可接續的結果，請調整條件。')
-            initial_search = previous['criteria_input'] | {'search_id': body.action.search_id}
+            initial_search = previous['criteria_input'] | {'search_id': body.action.search_id, 'exclude_companies': []}
         if (body.edit_message_id is None) != (body.edit_request_id is None):
             raise APIError(422, 'invalid_input', '編輯訊息需提供原訊息及原請求識別。')
         with store.connect() as db:
