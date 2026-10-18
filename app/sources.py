@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 import httpx
 from pydantic import Field, StrictInt
 
-from .job_normalize import normalize_jobs
+from .job_normalize import company_excluded, company_key, normalize_jobs
 from .source518 import parse_search_response, parse_detail_response
 from .source1111 import Browser1111, BrowserError, search_rows, job_url, company_id
 from .store import Criteria, Input, Job
@@ -26,13 +26,18 @@ def enabled_sources(services):
 class SearchInput(Input):
     criteria: Criteria
     sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=3,
-        description='可選 104、518、1111。1111 為實驗來源，預設停用；需後台啟用及 Node、Chrome 和實驗依賴，可因人機驗證受阻。104 涵蓋各類職缺，專業技術職通常只需 104；518 以基層、服務業為主。停用的來源不會查詢；未指定來源時依後台開關選擇。')
+        description='通常省略：省略時查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有使用者明確指定或排除某個人力銀行時才填。1111 為實驗來源，可能因人機驗證受阻。')
     limit: StrictInt = Field(default=20, ge=1, le=20)
     search_id: str | None = Field(default=None, min_length=1, max_length=100)
+    exclude_companies: list[str] = Field(default_factory=list, max_length=20,
+        description='使用者要求排除的公司。同時列出使用者說法與搜尋結果中出現的公司全名（例如簡稱與全名各一項）；比對忽略全半形、空白及「股份有限公司」等字樣，任一項包含於公司名稱即排除。排除會套用到這段對話之後的所有搜尋與續查。')
 
     def model_post_init(self, context):
         if any(x not in ('104', '518', '1111') for x in self.sources) or len(set(self.sources)) != len(self.sources):
             raise ValueError('來源不符或重複')
+        if any(not name or len(name) > 80 or len(company_key(name)) < 2 for name in self.exclude_companies):
+            raise ValueError('排除公司名稱須為2～80字')
+        self.exclude_companies = list(dict.fromkeys(self.exclude_companies))
 
 
 class DetailInput(Input):
@@ -377,7 +382,7 @@ class Sources:
                     break
             raise
 
-    async def search(self, arguments, *, continuation=None, exclude_ids=None):
+    async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None):
         result = {
             'items': [], 'source_results': [], 'filter_warnings': [],
             'new_count': 0, 'duplicate_count': 0, 'excluded_count': 0,
@@ -396,6 +401,11 @@ class Sources:
             return result
         excluded = ({str(exclude_ids)} if isinstance(exclude_ids, str) else
                     {str(value) for value in (exclude_ids or []) if value is not None})
+        company_keys = [key for key in map(company_key, exclude_companies or []) if len(key) >= 2]
+
+        def is_excluded(job):
+            return bool(_source_job_keys(job) & excluded) or company_excluded(job.company_name, company_keys)
+
         saved_sources = cursor.get('sources', {}) if cursor else {}
         cursor_sources = {}
 
@@ -481,7 +491,7 @@ class Sources:
                             continue
                         if job.source_job_id in seen_ids and not is_pending:
                             source_duplicates += 1
-                        elif _source_job_keys(job) & excluded:
+                        elif is_excluded(job):
                             seen_ids.add(job.source_job_id)
                             source_excluded += 1
                         else:
@@ -497,7 +507,7 @@ class Sources:
                         if job.source_job_id in seen_ids or job.source_job_id in queued:
                             source_duplicates += 1
                             continue
-                        if _source_job_keys(job) & excluded:
+                        if is_excluded(job):
                             seen_ids.add(job.source_job_id)
                             source_excluded += 1
                             continue

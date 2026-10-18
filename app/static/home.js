@@ -18,6 +18,11 @@ const chatSearchMetadata = new WeakMap();
 const chatRecommendationIds = new WeakMap();
 const chatRecommendationItems = new WeakMap();
 const searchStates = new Map();
+// The conversation's working list, replayed from jobs/recommendations events in
+// order with the same rules as Store.conversation_state: the latest
+// recommendation replaces the shortlist, and removed jobs leave the main list.
+const conversationWork = {shortlist: [], removed: new Map()};
+function resetConversationWork() { conversationWork.shortlist = []; conversationWork.removed.clear(); }
 let activeSearchId = null;
 let activeSearchState = null;
 // null keeps the result panel on the conversation-wide aggregate. Selecting a
@@ -497,9 +502,16 @@ function jobRating(job) {
   const preferred = ratings.find(rating => rating?.source === "GoodJob" && rating?.metric === "overall" && Number.isFinite(Number(rating.value)));
   return preferred ? Number(preferred.value) : null;
 }
+function isFeaturedJob(job) {
+  return conversationWork.shortlist.includes(jobIdentifier(job)) || Boolean(job.is_recommended || job.featured);
+}
+function removedJobs(state) {
+  return [...(state?.jobs?.values() || [])].filter(job => conversationWork.removed.has(jobIdentifier(job)));
+}
 function resultJobs(state) {
   const values = [...(state?.jobs?.values() || [])].filter(job => {
     const owner = state?.jobOwners?.get(jobIdentifier(job)) || state;
+    if (conversationWork.removed.has(jobIdentifier(job))) return false;
     if (resultSources.size && !resultSources.has(String(job.source || ""))) return false;
     if (salaryOnly && !salaryPresent(job)) return false;
     if (newOnly && !owner.newIds.has(jobIdentifier(job))) return false;
@@ -515,9 +527,12 @@ function resultJobs(state) {
       const ar = jobRating(a); const br = jobRating(b);
       if (ar !== null || br !== null) return (br === null ? -Infinity : br) - (ar === null ? -Infinity : ar) || number(a) - number(b);
     }
-    const af = state.recommendations.has(jobIdentifier(a)) || a.is_recommended || a.featured;
-    const bf = state.recommendations.has(jobIdentifier(b)) || b.is_recommended || b.featured;
-    return Number(bf) - Number(af) || number(a) - number(b);
+    // Shortlisted jobs keep the agent's recommendation order ahead of everything else.
+    const rank = job => {
+      const index = conversationWork.shortlist.indexOf(jobIdentifier(job));
+      return index >= 0 ? index : isFeaturedJob(job) ? conversationWork.shortlist.length : Number.MAX_SAFE_INTEGER;
+    };
+    return rank(a) - rank(b) || number(a) - number(b);
   });
   return values;
 }
@@ -575,11 +590,15 @@ function resultCardJob(state, job) {
   });
   card.dataset.searchId = owner.id;
   card.dataset.resultNumber = stableJobNumber(owner, job);
-  const recommendation = state.recommendations.get(id) || owner.recommendations.get(id);
-  const featured = Boolean(recommendation || job.is_recommended || job.featured);
-  card.topElement.prepend(node("span", `${featured ? "精選" : "尚未精選"} #${stableJobNumber(owner, job)}`, featured ? "job-featured" : "job-unfeatured"));
+  const removed = conversationWork.removed.get(id);
+  const featured = !removed && isFeaturedJob(job);
+  const label = removed ? "已移出" : featured ? "精選" : "尚未精選";
+  card.topElement.prepend(node("span", `${label} #${stableJobNumber(owner, job)}`, featured ? "job-featured" : "job-unfeatured"));
+  // Fit notes belong to the current shortlist; an older recommendation no longer explains a candidate.
+  const recommendation = featured ? state.recommendations.get(id) || owner.recommendations.get(id) : null;
   const fits = recommendation ? JobCards.fitList(recommendation) : null;
   if (fits) card.insertBefore(fits, card.footerElement);
+  if (removed?.reason) card.insertBefore(node("p", `移出原因：${removed.reason}`, "hint"), card.footerElement);
   if (owner.dismissed.has(id)) markDismissedCard(card, true);
   return card;
 }
@@ -605,7 +624,7 @@ function renderSearchResultsPanel() {
   showSearchPanel();
   panel.dataset.searchId = state.id;
   const title = $("#search-results-title");
-  if (title) title.textContent = ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
+  if (title) title.textContent = state.isAggregate ? `這段對話的職缺（${state.jobs.size} 筆）` : ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
   const summary = $("#search-results-summary");
   const jobs = resultJobs(state);
   const counts = updateResultCounts(state, jobs);
@@ -664,12 +683,20 @@ function renderSearchResultsPanel() {
   const list = $("#search-results-list");
   if (!list) return;
   list.replaceChildren();
+  const removed = removedJobs(state);
+  const removedSection = () => {
+    const section = node("details", undefined, "removed-jobs");
+    section.append(node("summary", `已移出 ${removed.length}`));
+    for (const job of removed) section.append(resultCardJob(state, job));
+    return section;
+  };
   if (!jobs.length) {
     list.append(node("p", state.jobs.size ? "目前篩選沒有職缺。" : "這次搜尋尚未取得職缺。", "hint"));
+    if (removed.length) list.append(removedSection());
     if (state.canContinue || state.jobs.size) list.append(continueFooter(state, counts.total));
     return;
   }
-  const featured = jobs.filter(job => state.recommendations.has(jobIdentifier(job)) || job.is_recommended || job.featured);
+  const featured = jobs.filter(isFeaturedJob);
   const rest = jobs.filter(job => !featured.includes(job));
   if (featured.length) {
     list.append(node("h3", `精選 ${featured.length}`));
@@ -679,6 +706,7 @@ function renderSearchResultsPanel() {
     list.append(node("h3", `其他候選 ${rest.length}`));
     for (const job of rest) list.append(resultCardJob(state, job));
   }
+  if (removed.length) list.append(removedSection());
   list.append(continueFooter(state, counts.total));
 }
 function updateSearchState(data, message) {
@@ -703,6 +731,9 @@ function updateSearchState(data, message) {
   if (Array.isArray(data.dismissed_ids)) state.dismissed = new Set(data.dismissed_ids.map(String));
   writeDismissed(state.id, state.dismissed);
   for (const item of Array.isArray(data.items) ? data.items : []) mergeJob(state, item);
+  for (const id of Array.isArray(data.excluded_job_ids) ? data.excluded_job_ids : []) {
+    conversationWork.removed.set(String(id), {by: "company", reason: "公司已排除"});
+  }
   if (message) {
     chatSearchResults.set(message, [...(chatSearchResults.get(message) || []), ...(data.items || []).map(item => ({...item, id: jobIdentifier(item)})).filter(item => item.id)]);
     chatSearchMetadata.set(message, state);
@@ -735,7 +766,12 @@ function updateRecommendations(data, message) {
     chatRecommendationIds.set(message, ids.length ? ids : recommendationIds);
     if (state) chatSearchMetadata.set(message, state);
   }
-  if (state) renderSearchResultsPanel();
+  if (recommendationIds.length) conversationWork.shortlist = [...new Set(recommendationIds)];
+  for (const item of Array.isArray(data?.removed) ? data.removed : []) {
+    if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: "agent", reason: String(item.reason || "")});
+  }
+  for (const id of recommendationIds) conversationWork.removed.delete(id);
+  renderSearchResultsPanel();
   return state;
 }
 function focusJob(job, state = activeSearchState) {
@@ -924,7 +960,7 @@ function signedOut() {
   conversationListRequest++; messageLoadRequest++;
   if (activeChat) activeChat.controller.abort();
   activeChat = null; pendingChatAction = null; selectedConversationId = null; conversationCursor = null; messageCursor = null; dailyCursor = null; switchingConversation = false;
-  activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); setResultView("chat");
+  activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetConversationWork(); setResultView("chat");
   clearCompanion();
   csrfToken = ""; editing = null; favoriteCursor = null;
   $("#preferences-feedback").textContent = "";
@@ -1597,7 +1633,7 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   const height = viewport.scrollHeight;
   const follow = !$("#chat-list").children.length || chatAtBottom();
   if (changed || !more) {
-    activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetBasicReviews();
+    activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetConversationWork(); resetBasicReviews();
     const panel = $("#search-results-panel"); if (panel) panel.hidden = true;
   }
   const fragment = document.createDocumentFragment();

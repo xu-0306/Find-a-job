@@ -25,7 +25,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from . import security
 from .store import Criteria, Input, Job, Store, encode, now
-from . import chat, llm, sources, reviews, backups, notifications, push, resume_pdf, chat_files, web
+from . import chat, llm, sources, reviews, backups, notifications, push, resume_pdf, chat_files, web, job_normalize
 from .scheduler import DailyRunner, TAIPEI, effective_preferences, run_view, user_run_view
 from .sprite_validation import STATES, MAX_FILE_BYTES, TEMPLATE_COLUMNS, validate_png, split_template
 from .sharing import Sharing
@@ -178,8 +178,20 @@ class Recommendation(Input):
         return values
 
 
+class RemovedJob(Input):
+    job_id: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class Recommendations(Input):
-    items: list[Recommendation] = Field(min_length=1, max_length=20)
+    items: list[Recommendation] = Field(default_factory=list, max_length=20,
+        description='目前的完整精選清單（依推薦順序）；會取代之前的精選，不是追加。')
+    removed: list[RemovedJob] = Field(default_factory=list, max_length=50,
+        description='使用者不要或經判斷不適合、應從職缺清單移出的 job_id 與簡短原因。')
+
+    def model_post_init(self, context):
+        if not self.items and not self.removed:
+            raise ValueError('items 與 removed 至少提供一項')
 
 
 class AreaLookup(Input):
@@ -1305,9 +1317,9 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
          'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         {'name': 'propose_preference_change', 'description': '提出條件變更，須由使用者檢視確認後才生效。',
          'parameters': ProposalInput.model_json_schema()},
-        {'name': 'search_jobs', 'description': '只有使用者要找、推薦或比較職缺時才使用 search_jobs；分析、查評價、職涯建議或詢問特定職缺時不搜尋。識別特定職缺先以 get_job_details 讀使用者提供的 104 網址，讀不到就請使用者提供內容，不用搜尋尋找。依使用者條件或履歷中的技能與經驗搜尋104／518／1111職缺（1111 為預設停用的實驗來源，依後台開關可用）；只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
+        {'name': 'search_jobs', 'description': '只有使用者要找、推薦或比較職缺時才使用 search_jobs；分析、查評價、職涯建議或詢問特定職缺時不搜尋。識別特定職缺先以 get_job_details 讀使用者提供的 104 網址，讀不到就請使用者提供內容，不用搜尋尋找。依使用者條件或履歷中的技能與經驗搜尋職缺；sources 通常省略，以查詢後台已啟用的全部來源。使用者要求排除某公司時填 exclude_companies，之後本對話的搜尋都會套用。只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
         {'name': 'lookup_job_areas', 'description': '由地區名稱查官方地區代碼；搜尋前先查碼，不猜數字。', 'parameters': AreaLookup.model_json_schema()},
-        {'name': 'present_job_recommendations', 'description': '以本次對話已取得的職缺job_id呈現精選或比較卡片；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
+        {'name': 'present_job_recommendations', 'description': '維護這段對話的職缺清單：items 是目前完整的精選（取代先前精選，依推薦順序），removed 把使用者不要或不適合的已取得職缺移出清單並附原因。只能用本次對話已取得的job_id；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
         {'name': 'get_job_details', 'description': '以 job_id 讀取已保存職缺，或以 url 直接讀使用者提供的 104 職缺網址（可帶查詢參數）；兩者擇一。網址讀取不新增搜尋候選。未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
         {'name': 'get_company_reviews', 'description': '使用者詢問或要求時才查公司評價；同名不明時請使用者選擇。', 'parameters': reviews.ReviewInput.model_json_schema()},
         {'name': 'read_web_page', 'description': '讀取使用者提供或與其要求直接相關的公開網頁，例如 GitHub 個人頁、專案 README、個人網站及作品集。一次一個完整 HTTP／HTTPS 網址；回傳文字及来源網址。不能登入或搜尋，失敗、截斷與未讀連結須如實說明。', 'parameters': web.ReadInput.model_json_schema()},
@@ -1342,7 +1354,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             with store.connect() as db:
                 ensure_active(db, auth_hash)
                 allowed = store.conversation_job_ids(db, conversation_id)
-                if any(item.job_id not in allowed for item in arguments.items):
+                if any(item.job_id not in allowed for item in [*arguments.items, *arguments.removed]):
                     raise llm.LLMError('unknown_job', '只能推薦這段對話已取得的職缺，請先搜尋。')
                 items, seen = [], set()
                 for item in arguments.items:
@@ -1353,7 +1365,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                     items.append(item.model_dump() | {'job': dict(job.model_dump(mode='json'), id=item.job_id,
                         citation_number=allowed.index(item.job_id) + 1,
                         is_favorite=bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (item.job_id, user_id)).fetchone()))})
-            result = {'items': items}
+                removed = list({item.job_id: item.model_dump() for item in arguments.removed if item.job_id not in seen}.values())
+            result = {'items': items, 'removed': removed}
             return result, ('recommendations', result)
         if name == 'read_web_page':
             with store.connect() as db:
@@ -1365,6 +1378,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         if name == 'search_jobs':
             search_id = getattr(arguments, 'search_id', None)
             previous = None
+            # Exclusions are conversation-wide, so a continuation keeps them even though its criteria come from the snapshot.
+            requested_exclusions = list(arguments.exclude_companies)
             if search_id:
                 with store.connect() as db:
                     ensure_active(db, auth_hash)
@@ -1377,6 +1392,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 arguments = sources.SearchInput.model_validate(previous['criteria_input'] | {'search_id': search_id})
             with store.connect() as db:
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
+                excluded_companies = list(dict.fromkeys([*store.conversation_state(db, conversation_id)['excluded_companies'],
+                                                         *arguments.exclude_companies, *requested_exclusions]))
             requested = list(arguments.sources)
             if not previous and 'sources' not in arguments.model_fields_set and '1111' in enabled:
                 requested.append('1111')
@@ -1389,10 +1406,11 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             arguments = arguments.model_copy(update={'sources': kept})
             if previous:
                 excluded = {f'{job.source}:{job.source_job_id}' for job in map(stored_job, previous['dismissed_ids'])}
-                result = await app.state.sources.search(arguments, continuation=previous.get('_continuation'), exclude_ids=excluded)
+                result = await app.state.sources.search(arguments, continuation=previous.get('_continuation'), exclude_ids=excluded,
+                                                        exclude_companies=excluded_companies)
             else:
                 search_id = str(uuid4())
-                result = await app.state.sources.search(arguments)
+                result = await app.state.sources.search(arguments, exclude_companies=excluded_companies)
             if disabled:
                 result['filter_warnings'].append(f'{disabled_names} 已在後台停用，本次未查詢。')
             if previous and disabled and not result['items'] and not result['can_continue']:
@@ -1402,6 +1420,12 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 ensure_active(db, auth_hash)
                 items = []
                 known_job_ids = store.conversation_job_ids(db, conversation_id)
+                # Earlier candidates from a newly excluded company leave the working list too.
+                company_keys = [job_normalize.company_key(name) for name in excluded_companies]
+                excluded_job_ids = [job_id for job_id, payload in (
+                    db.execute(f"SELECT id,payload_json FROM jobs WHERE id IN ({','.join('?' * len(known_job_ids))})", known_job_ids)
+                    if company_keys and known_job_ids else [])
+                    if job_normalize.company_excluded(json.loads(payload).get('company_name'), company_keys)]
                 for job in result['items']:
                     ident = store.save_job(job, db)
                     if ident not in known_job_ids:
@@ -1418,7 +1442,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 criteria=arguments.criteria.model_dump(), sources=arguments.sources,
                 criteria_input=arguments.model_dump(exclude={'search_id'}), candidate_ids=candidate_ids,
                 new_ids=new_ids, new_count=len(new_ids), total_count=len(candidate_ids),
-                dismissed_ids=previous['dismissed_ids'] if previous else [], _continuation=continuation)
+                dismissed_ids=previous['dismissed_ids'] if previous else [], _continuation=continuation,
+                excluded_companies=excluded_companies, excluded_job_ids=excluded_job_ids)
             result.setdefault('duplicate_count', len(items) - len(new_ids))
             result.setdefault('can_continue', bool(continuation))
             return {key: value for key, value in result.items() if key != '_continuation'}, ('jobs', result)

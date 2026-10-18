@@ -160,6 +160,33 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second['can_continue'])
         self.assertEqual(calls, [1])
 
+    async def test_company_exclusion_normalizes_names_and_applies_to_queued_rows(self):
+        async def provider(name, args):
+            rows = [
+                dict(job_no='1', job_name='一', company='工研院_財團法人工業技術研究院', url='https://www.104.com.tw/job/u1'),
+                dict(job_no='2', job_name='二', company='光寶科技股份有限公司', url='https://www.104.com.tw/job/u2'),
+                dict(job_no='3', job_name='三', company='ＡＤＶＡＮＴＥＣＨ 研華股份有限公司', url='https://www.104.com.tw/job/u3'),
+                dict(job_no='4', job_name='四', company='臺灣合成股份有限公司', url='https://www.104.com.tw/job/u4'),
+            ] if args['page'] == 1 else []
+            return {'jobs': rows, 'total': 4, 'has_next': False}, None
+
+        service = Sources(mcp_call=provider)
+        first = await service.search(search(['104'], limit=1), exclude_companies=['工研院', 'advantech'])
+        self.assertEqual([job.source_job_id for job in first['items']], ['2'])
+        self.assertEqual(first['excluded_count'], 2)
+        # A company excluded after the first batch also drops rows already queued in the cursor.
+        second = await service.search(search(['104'], limit=1), continuation=first['continuation'],
+                                      exclude_companies=['工研院', 'advantech', '台灣合成'])
+        self.assertEqual(second['items'], [])
+        self.assertEqual(second['excluded_count'], 1)
+        self.assertFalse(second['can_continue'])
+
+    def test_exclude_companies_input_is_bounded(self):
+        self.assertEqual(SearchInput(criteria={'keyword': '採購'}, exclude_companies=['工研院', '工研院']).exclude_companies, ['工研院'])
+        for names in (['A'], ['x' * 81], ['公司'] * 21, ['股份有限公司']):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                SearchInput(criteria={'keyword': '採購'}, exclude_companies=names)
+
     async def test_continuation_rejects_changed_page_size_before_network(self):
         calls = []
 

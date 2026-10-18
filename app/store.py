@@ -366,6 +366,37 @@ class Store:
             ORDER BY m.rowid,CAST(e.key AS INTEGER),CAST(j.key AS INTEGER)""", (conversation_id,)).fetchall()
         return list(dict.fromkeys(row[0] for row in rows if row[0]))
 
+    @staticmethod
+    def conversation_state(db, conversation_id):
+        """Working-list state replayed from this conversation's saved events (the front end replays the same rules)."""
+        rows = db.execute("""SELECT e.value FROM messages m, json_each(m.content_json,'$.events') e
+            WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event') IN ('jobs','recommendations')
+            ORDER BY m.rowid,CAST(e.key AS INTEGER)""", (conversation_id,)).fetchall()
+        companies, shortlist, removed = [], [], {}
+        for row in rows:
+            event = json.loads(row[0])
+            data = event.get('data') or {}
+            if event.get('event') == 'jobs':
+                companies = list(dict.fromkeys([*companies, *data.get('excluded_companies', [])]))
+                for job_id in data.get('excluded_job_ids', []):
+                    removed[job_id] = {'job_id': job_id, 'by': 'company', 'reason': '公司已排除'}
+            else:
+                ids = [item.get('job_id') for item in data.get('items', []) if item.get('job_id')]
+                if ids:
+                    shortlist = list(dict.fromkeys(ids))
+                for item in data.get('removed', []):
+                    removed[item['job_id']] = {'job_id': item['job_id'], 'by': 'agent', 'reason': item.get('reason', '')}
+                for job_id in ids:
+                    removed.pop(job_id, None)
+        dismissed = []
+        for (content,) in db.execute("""SELECT content_json FROM messages WHERE conversation_id=? AND role='user'
+                AND json_extract(content_json,'$.search_dismissed') IS NOT NULL ORDER BY rowid""", (conversation_id,)):
+            for ids in json.loads(content).get('search_dismissed', {}).values():
+                dismissed.extend(ids)
+        return {'shortlist': [job_id for job_id in shortlist if job_id not in removed],
+                'excluded_companies': companies, 'removed': list(removed.values()),
+                'dismissed_ids': list(dict.fromkeys(dismissed))}
+
     def messages(self, cursor=None, limit=20, conversation_id=None, request_id=None, user_id=None):
         with self.connect() as db:
             condition = 'rowid<?'

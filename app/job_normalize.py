@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 import re
 from typing import Any
+import unicodedata
 from urllib.parse import urlsplit
 
 from .store import Job
@@ -43,6 +44,25 @@ class _TextParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self._ignored:
             self.parts.append(data)
+
+
+_COMPANY_PUNCTUATION = re.compile(r"[\s_\-‐‑–—·・.,，、/／()（）\[\]【】「」]+")
+_COMPANY_LEGAL_FORMS = ("股份有限公司", "有限公司", "財團法人", "社團法人")
+
+
+def company_key(value: Any) -> str:
+    """Comparable company text: width/case folded, 臺→台, punctuation and legal-form words removed."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("臺", "台")
+    text = _COMPANY_PUNCTUATION.sub("", text)
+    for form in _COMPANY_LEGAL_FORMS:
+        text = text.replace(form, "")
+    return text
+
+
+def company_excluded(company_name: Any, excluded_keys: Iterable[str]) -> bool:
+    """True when any excluded key (already passed through company_key) occurs in the company name."""
+    key = company_key(company_name)
+    return bool(key) and any(len(excluded) >= 2 and excluded in key for excluded in excluded_keys)
 
 
 def _clean_text(value: Any, *, redact_contacts: bool = True) -> str | None:

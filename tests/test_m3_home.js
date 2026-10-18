@@ -1731,6 +1731,42 @@ function testSearchTitleIsNotRepeatedWhenUnlabelled() {
   assert.equal(batches.elements.get("search-results-title").textContent, "本次搜尋 · 本次搜尋", "a keyword equal to the fallback wording is data, not a missing label");
 }
 
+async function testConversationWorkingListConverges() {
+  const home = createContext(); await settle();
+  const list = home.elements.get("search-results-list");
+  const job = (id, company) => ({id, source: "104", title: `T${id}`, company_name: company, url: `https://jobs.example/${id}`});
+  const mainCards = () => list.children.filter(item => item.className === "job-card item");
+  const featuredIds = () => mainCards().filter(card => all(card, item => item.className === "job-featured").length).map(card => card.dataset.jobId);
+  const removedSection = () => list.children.find(item => item.className === "removed-jobs");
+  const first = home.context.chatMessage("assistant", "", "running");
+  home.context.renderChatEvent(first, "jobs", {search_id: "w-1", criteria: {keyword: "研發替代役"}, items: [job("w1", "工研院"), job("w2", "光寶"), job("w3", "直得")]});
+  home.context.renderChatEvent(first, "recommendations", {items: [{job_id: "w1", reasons: ["舊理由"]}, {job_id: "w2"}]});
+  assert.deepEqual(featuredIds(), ["w1", "w2"]);
+
+  // The user asks to drop one company and refine: the newer shortlist replaces the old one instead of accumulating.
+  const second = home.context.chatMessage("assistant", "", "running");
+  home.context.renderChatEvent(second, "jobs", {search_id: "w-2", criteria: {keyword: "研發替代役"}, excluded_job_ids: ["w1"], items: [job("w4", "研華")]});
+  home.context.renderChatEvent(second, "recommendations", {items: [{job_id: "w4"}, {job_id: "w2"}], removed: [{job_id: "w3", reason: "需要外派"}]});
+  assert.deepEqual(mainCards().map(card => card.dataset.jobId), ["w4", "w2"], "removed jobs leave the main list and the shortlist keeps the agent's order");
+  assert.deepEqual(featuredIds(), ["w4", "w2"], "only the latest recommendation is featured");
+  assert.doesNotMatch(mainCards().map(card => card.textContent).join(), /舊理由/, "fit notes from an older shortlist are not shown");
+  const removed = removedSection();
+  assert.ok(removed, "removed jobs stay reachable");
+  assert.equal(removed.tagName, "DETAILS"); assert.equal(removed.open, false, "the removed section starts collapsed");
+  assert.equal(removed.children[0].textContent, "已移出 2");
+  assert.match(removed.textContent, /公司已排除/); assert.match(removed.textContent, /移出原因：需要外派/);
+  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（4 筆）");
+
+  // Recommending a removed job again brings it back.
+  home.context.renderChatEvent(second, "recommendations", {items: [{job_id: "w3"}]});
+  assert.deepEqual(featuredIds(), ["w3"]);
+  assert.equal(removedSection().children[0].textContent, "已移出 1");
+
+  // A conversation switch clears the working list together with the search batches.
+  vm.runInContext("searchStates.clear(); resetConversationWork();", home.context);
+  assert.equal(vm.runInContext("conversationWork.shortlist.length + conversationWork.removed.size", home.context), 0);
+}
+
 const CHAT_WIDTH_KEY = "job-companion-chat-width";
 
 class ThrowingStorage {
@@ -1955,12 +1991,13 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testChatHeadingMenuOpensClosesAndRunsItems();
   testChatHeadingMarkupMovesLatestButtonOutOfHeading();
   testSearchTitleIsNotRepeatedWhenUnlabelled();
+  await testConversationWorkingListConverges();
   testSplitterMarkup();
   await testChatWidthClampsAndReclampsOnResize();
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 33 checks passed");
+  console.log("test_m3_home: 34 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
