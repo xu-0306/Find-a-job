@@ -1908,6 +1908,64 @@ async function testUnloadedRecommendationsSurviveReloadAndOlderPages() {
   assert.doesNotMatch(panel.textContent, /過期分頁理由/);
 }
 
+async function testUpdatedRecommendationsSurviveOlderPages() {
+  for (const initial of [[], [{job_id: "recover-job", reasons: ["old-reason"]}]]) {
+    for (const recovery of ["live", "snapshot"]) {
+      // Also exercise a page without notes: replay must use the updated cache, not the first page's cache.
+      for (const pageHasRecommendations of [true, false]) {
+        const home = createContext(); await settle();
+        const search = {search_id: "recover-search", items: [{id: "recover-job", title: "合成職缺", source: "104"}]};
+        const recommendation = {job_id: "recover-job", reasons: ["new-reason"], concerns: ["new-concern"], unknowns: ["new-unknown"]};
+        const working = {shortlist: ["recover-job"], removed: []};
+        const plain = {role: "assistant", content: {text: "普通舊訊息", status: "completed", events: []}};
+        const api = home.context.api;
+        let messagePages = 0;
+        home.context.api = async (path, options) => {
+          if (!path.startsWith("/api/messages")) return api(path, options);
+          messagePages++;
+          return path.includes("cursor=older")
+            ? {items: [plain], next_cursor: null, conversation_state: {...working,
+                ...(pageHasRecommendations ? {recommendations: [recommendation]} : {})}}
+            : {items: [plain], next_cursor: "older", conversation_state: {...working, searches: [search], recommendations: initial}};
+        };
+        await home.context.loadMessages(false, "conversation-1");
+        const state = vm.runInContext('searchStates.get("recover-search")', home.context);
+        const panel = home.elements.get("search-results-list");
+        if (recovery === "live") {
+          const reply = home.context.chatMessage("assistant", "", "running");
+          home.context.renderChatEvent(reply, "recommendations", {items: [recommendation], replace: true});
+        } else {
+          home.state.input.value = "更新推薦";
+          home.state.chatSnapshots.set("request-1", {request_id: "request-1", conversation_id: "conversation-1", items: [
+            {id: 701, request_id: "request-1", role: "user", content: {text: "更新推薦", status: "completed"}},
+            {id: 702, request_id: "request-1", role: "assistant", content: {text: "快照回覆", status: "completed",
+              events: [{event: "recommendations", data: {items: [recommendation], replace: true}}]}}
+          ]});
+          home.context.ChatSSE.read = async (_reader, handler) => {
+            await handler("recommendations", {items: [{...recommendation, reasons: ["stream-reason"]}], replace: true});
+            assert.equal(state.recommendations.get("recover-job")?.reasons[0], "stream-reason");
+            throw new Error("stream ended");
+          };
+          await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+          assert.equal(home.state.fetchCalls.length, 1, "recovery does not send a second POST");
+          assert.equal(home.state.chatSnapshotRequests.length, 1, "the completed snapshot is restored");
+          assert.equal(messagePages, 1, "snapshot completion skips the first-page reload");
+          assert.equal(vm.runInContext("activeChat", home.context), null);
+        }
+        assert.equal(state.recommendations.get("recover-job")?.reasons[0], "new-reason", recovery);
+        await home.context.loadMessages(true);
+        assert.equal(messagePages, 2, "the older page was loaded");
+        assert.equal(vm.runInContext('searchStates.get("recover-search")', home.context), state);
+        assert.equal(state.recommendations.get("recover-job")?.reasons[0], "new-reason",
+          `${recovery}: initial=${JSON.stringify(initial)}, pageHasRecommendations=${pageHasRecommendations}`);
+        for (const note of ["new-reason", "new-concern", "new-unknown"]) assert.ok(panel.textContent.includes(note), note);
+        assert.doesNotMatch(panel.textContent, /old-reason|stream-reason/);
+        assert.equal(vm.runInContext('conversationWork.shortlist.join()', home.context), "recover-job");
+      }
+    }
+  }
+}
+
 async function testReplacedRecommendationsDoNotSurviveRebuild() {
   const home = createContext(); await settle();
   const search = {search_id: "replaced-rec", items: [{id: "a"}, {id: "b"}, {id: "c"}]};
@@ -2256,6 +2314,7 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testHistoryPagesUseTheServerWorkingList();
   await testUnrelatedEditKeepsRecommendationReasons();
   await testUnloadedRecommendationsSurviveReloadAndOlderPages();
+  await testUpdatedRecommendationsSurviveOlderPages();
   await testReplacedRecommendationsDoNotSurviveRebuild();
   await testEditedContinuationRebuildsTheSameSearch();
   await testDelayedConversationRefreshIsDiscarded();
@@ -2266,7 +2325,7 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 42 checks passed");
+  console.log("test_m3_home: 43 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

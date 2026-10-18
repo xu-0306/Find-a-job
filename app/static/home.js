@@ -34,7 +34,7 @@ function applyConversationWork(state) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: String(item.by || "agent"), reason: String(item.reason || "")});
   }
   if (Array.isArray(state.recommendations)) conversationWork.recommendations = state.recommendations;
-  // Keep the first page's authoritative notes when older pages replay obsolete recommendation events.
+  // Keep the latest authoritative or live notes when older pages replay obsolete recommendation events.
   if (conversationWork.recommendations) {
     for (const search of searchStates.values()) search.recommendations.clear();
     for (const recommendation of conversationWork.recommendations) {
@@ -806,8 +806,9 @@ function updateSearchState(data, message, {historical = false, render = true} = 
   if (render) renderSearchResultsPanel();
   return state;
 }
-function updateRecommendations(data, message) {
+function updateRecommendations(data, message, {historical = false} = {}) {
   const items = Array.isArray(data?.items) ? data.items : [];
+  const current = historical ? null : new Map((conversationWork.recommendations || []).map(item => [String(item.job_id), item]));
   const recommendationIds = items.map(recommendation => String(recommendation?.job_id ?? jobIdentifier(recommendation?.job))).filter(Boolean);
   const explicitState = data?.search_id ? stateForSearch(data.search_id) : null;
   let state = explicitState;
@@ -817,6 +818,7 @@ function updateRecommendations(data, message) {
     const job = recommendation?.job || recommendation;
     const id = String(recommendation?.job_id ?? jobIdentifier(job));
     if (!id) continue;
+    current?.set(id, {...recommendation, job_id: id});
     // A recommendation without search_id may span multiple search calls in
     // one reply. Keep each recommendation on the batch that already owns it;
     // an unknown full job remains available in the chat citation only.
@@ -837,6 +839,9 @@ function updateRecommendations(data, message) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: "agent", reason: String(item.reason || "")});
   }
   for (const id of recommendationIds) conversationWork.removed.delete(id);
+  // Live events and restored snapshots supersede the page cache; history must not overwrite it.
+  if (current) conversationWork.recommendations = conversationWork.shortlist
+    .filter(id => !conversationWork.removed.has(id)).map(id => current.get(id)).filter(Boolean);
   renderSearchResultsPanel();
   return state;
 }
@@ -1430,7 +1435,7 @@ function renderChatEvent(message, name, data, historical = false) {
       message.resultsButton = resultsButton; container.append(resultsButton);
     }
   } else if (name === "review") reviewContent(container, data, {company_name: data.company_name});
-  else if (name === "recommendations") updateRecommendations(data, message);
+  else if (name === "recommendations") updateRecommendations(data, message, {historical});
   else if (name === "job_detail") {
     const item = data.identity_verified && data.item ? data.item : null;
     const detailId = String(data.job_id || jobIdentifier(item));

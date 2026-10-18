@@ -1371,10 +1371,9 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             # The first page also carries the recent searches, so the panel does not depend on which messages are loaded.
             searches = store.conversation_searches(db, conversation_id, auth['user_id']) if cursor is None else None
         result = store.messages(parse_cursor(cursor) if cursor is not None else None, limit, conversation_id, user_id=auth['user_id'])
-        result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed')}
+        result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed', 'recommendations')}
         if searches is not None:
             result['conversation_state']['searches'] = searches
-            result['conversation_state']['recommendations'] = working['recommendations']
         return result
 
     @app.patch('/api/searches/{search_id}')

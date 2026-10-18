@@ -319,6 +319,8 @@ class WorkspaceChecks(unittest.TestCase):
         older = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2, 'cursor': latest['next_cursor']}).json()
         self.assertFalse(any(e['event'] == 'recommendations' and e['data']['items'][0]['job_id'] == beta
                              for m in older['items'] for e in m['content']['events']))
+        self.assertNotIn('searches', older['conversation_state'])
+        self.assertEqual(older['conversation_state'].pop('recommendations'), recommendations)
         self.assertEqual(older['conversation_state'], expected)
         self.assertNotIn('conversation_state', self.client.get('/api/messages').json())
 
