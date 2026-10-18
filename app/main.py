@@ -229,18 +229,22 @@ class APIError(Exception):
         self.status, self.code, self.message = status, code, message
 
 
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_TOTAL = 50 * 1024 * 1024
+
+
 async def read_chat_request(request):
-    """Keep the existing JSON and multipart contracts for one transient attachment."""
+    """JSON text, or multipart text with 1–5 transient `resume` attachments (each ≤20 MiB, together ≤50 MiB)."""
     content_type = request.headers.get('content-type', '').split(';')[0].lower()
-    limit = resume_pdf.MAX_BYTES + 65536 if content_type == 'multipart/form-data' else 65536
+    limit = MAX_ATTACHMENT_TOTAL + 65536 if content_type == 'multipart/form-data' else 65536
 
     async def bounded_stream():
         total = 0
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(60):
             async for chunk in request.stream():
                 total += len(chunk)
                 if total > limit:
-                    raise MultiPartException('上傳內容過大，附件最多 20 MiB。')
+                    raise MultiPartException('上傳內容過大，附件合計最多 50 MiB。')
                 yield chunk
 
     try:
@@ -249,33 +253,41 @@ async def read_chat_request(request):
             return ChatInput.model_validate(json.loads(raw)), None
         if content_type != 'multipart/form-data':
             raise APIError(415, 'invalid_content_type', '請送出文字訊息或附上一份檔案。')
-        parser = MultiPartParser(request.headers, bounded_stream(), max_files=1, max_fields=5, max_part_size=40000)
+        parser = MultiPartParser(request.headers, bounded_stream(), max_files=MAX_ATTACHMENTS, max_fields=5, max_part_size=40000)
         # Private attachment bytes stay in memory, rather than spooling to disk.
         parser.spool_max_size = limit
         form = await parser.parse()
         try:
-            fields = set(form.keys())
-            if not {'text', 'request_id', 'resume'} <= fields or not fields <= {'text', 'request_id', 'resume', 'conversation_id', 'edit_message_id', 'edit_request_id'} or len(form.multi_items()) != len(fields):
-                raise APIError(422, 'invalid_input', '請送出文字訊息與一份附件。')
-            body = ChatInput.model_validate({key: form[key] for key in fields if key != 'resume'})
-            file = form['resume']
-            if not hasattr(file, 'read') or not file.filename:
-                raise APIError(422, 'invalid_resume', '請附上一份 PDF、圖片、Markdown 或文字檔。')
-            filename = file.filename.replace('\\', '/').split('/')[-1]
-            extension = Path(filename).suffix.lower()
-            if extension not in chat_files.EXTENSIONS:
-                raise APIError(422, 'invalid_resume', '支援 PDF、PNG／JPEG／WebP、Markdown 與 TXT。')
-            data = await file.read(resume_pdf.MAX_BYTES + 1)
-            if not data or len(data) > resume_pdf.MAX_BYTES:
-                raise APIError(422, 'invalid_resume', '附件大小須介於 1 byte 與 20 MiB。')
-            filename = ''.join(c for c in filename if c.isprintable())[:120]
-            return body, {'data': data, 'filename': filename, 'extension': extension}
+            items = form.multi_items()
+            fields = {key for key, _ in items if key != 'resume'}
+            files = [value for key, value in items if key == 'resume']
+            if (not {'text', 'request_id'} <= fields or not fields <= {'text', 'request_id', 'conversation_id', 'edit_message_id', 'edit_request_id'}
+                    or len(items) - len(files) != len(fields) or not 1 <= len(files) <= MAX_ATTACHMENTS):
+                raise APIError(422, 'invalid_input', f'請送出文字訊息與 1～{MAX_ATTACHMENTS} 個附件。')
+            body = ChatInput.model_validate({key: form[key] for key in fields})
+            uploads, total = [], 0
+            for file in files:
+                if not hasattr(file, 'read') or not file.filename:
+                    raise APIError(422, 'invalid_resume', '請附上 PDF、圖片、Markdown 或文字檔。')
+                filename = file.filename.replace('\\', '/').split('/')[-1]
+                extension = Path(filename).suffix.lower()
+                if extension not in chat_files.EXTENSIONS:
+                    raise APIError(422, 'invalid_resume', '支援 PDF、PNG／JPEG／WebP、Markdown 與 TXT。')
+                data = await file.read(resume_pdf.MAX_BYTES + 1)
+                if not data or len(data) > resume_pdf.MAX_BYTES:
+                    raise APIError(422, 'invalid_resume', '每個附件大小須介於 1 byte 與 20 MiB。')
+                total += len(data)
+                if total > MAX_ATTACHMENT_TOTAL:
+                    raise APIError(422, 'invalid_resume', '附件合計最多 50 MiB。')
+                filename = ''.join(c for c in filename if c.isprintable())[:120]
+                uploads.append({'data': data, 'filename': filename, 'extension': extension})
+            return body, uploads
         finally:
             await form.close()
     except (ValidationError, ValueError, UnicodeError):
         raise APIError(422, 'invalid_input', '欄位格式不符，請檢查輸入。') from None
     except MultiPartException:
-        raise APIError(422, 'invalid_resume', '上傳格式不符或內容過大；請只附上一份最多 20 MiB 的檔案。') from None
+        raise APIError(422, 'invalid_resume', f'上傳格式不符或內容過大；最多 {MAX_ATTACHMENTS} 個檔案，每個 20 MiB、合計 50 MiB。') from None
     except TimeoutError:
         raise APIError(408, 'upload_timeout', '上傳等候時間已到，請稍後重試。') from None
 
@@ -1464,10 +1476,10 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
 
     @app.post('/api/chat')
     async def start_chat(request: Request, auth=Depends(user)):
-        body, upload = await read_chat_request(request)
+        body, uploads = await read_chat_request(request)
         initial_search = None
         if body.action:
-            if body.edit_message_id or upload:
+            if body.edit_message_id or uploads:
                 raise APIError(422, 'invalid_input', '續查請單獨送出，不與訊息編輯或附件混用。')
             with store.connect() as db:
                 conversation_view(db, body.conversation_id, auth['user_id'])
@@ -1491,7 +1503,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                     raise APIError(404, 'message_missing', '找不到這則使用者訊息，請重新整理對話。')
                 if original['request_id'] != body.edit_request_id:
                     raise APIError(409, 'message_changed', '這則訊息已被修改，請重新整理後再編輯。')
-                if json.loads(original['content_json']).get('attachments') and not upload:
+                if json.loads(original['content_json']).get('attachments') and not uploads:
                     raise APIError(422, 'attachment_required', '原附件未保存，請重新附上檔案再生成回覆。')
             settings = DEFAULT_SETTINGS | store.get(db, 'services', {})
             key = store.get(db, 'llm_api_key', '')
@@ -1507,15 +1519,19 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             protocol = test['protocol']
         resume_context = None
         attachments = []
-        if upload:
+        if uploads:
             if app.state.resume_lock.locked():
                 raise APIError(429, 'resume_busy', '另一份附件正在解析，請稍候再送出。')
+            resume_context = []
             try:
+                # One lock covers the whole message, so attachments parse one at a time.
                 async with app.state.resume_lock:
-                    resume_context, metadata = await chat_files.prepare(upload)
+                    for upload in uploads:
+                        context, metadata = await chat_files.prepare(upload)
+                        resume_context.append(context); attachments.append(metadata)
             except resume_pdf.ResumeError as exc:
-                raise APIError(422, 'invalid_resume', str(exc)) from None
-            attachments = [metadata]
+                prefix = f'{upload["filename"]}：' if len(uploads) > 1 else ''
+                raise APIError(422, 'invalid_resume', prefix + str(exc)) from None
             # Parsing yields: another chat can have started, or this client disconnected.
             if await request.is_disconnected():
                 raise APIError(400, 'upload_cancelled', '附件上傳已取消，訊息尚未保存。')

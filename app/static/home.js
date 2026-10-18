@@ -10,7 +10,7 @@ let switchingConversation = false;
 let activeChat = null;
 let pendingChatAction = null;
 let editOrigin = null;
-let previousValidAttachment = null;
+let previousValidAttachments = [];
 const CHAT_RETRY_LIMIT = 5;
 const CHAT_RETRY_DELAY_MS = 5000;
 const chatSearchResults = new WeakMap();
@@ -973,7 +973,7 @@ function signedOut() {
   $("#conversation-history-status").setAttribute("aria-busy", "false"); $("#more-conversations").disabled = false;
   $("#chat-form").reset(); $("#chat-status").textContent = ""; $("#cancel-chat").hidden = true;
   editOrigin = null; $("#message-edit-banner").hidden = true; $("#message-edit-status").textContent = "";
-  previousValidAttachment = null; clearChatFileDrag();
+  previousValidAttachments = []; clearChatFileDrag();
   updateResumeSelection(); updateChatCount();
   $("#review-dialog").close(); $("#review-result").replaceChildren();
   $("#conversation-history-dialog").close(); $("#rename-conversation-dialog").close(); $("#delete-conversation-dialog").close();
@@ -1698,9 +1698,10 @@ function clearAcceptedComposer(operation) {
   if (operation.composerCleared) return;
   const input = $("#chat-form [name=text]");
   if (input.value.trim() === operation.text.trim()) input.value = "";
-  if (operation.attachment && $("#resume-file").files?.[0] === operation.attachment) {
+  const selected = [...($("#resume-file").files || [])];
+  if (operation.attachments.length && selected.length === operation.attachments.length && selected.every((file, index) => file === operation.attachments[index])) {
     $("#resume-file").value = "";
-    previousValidAttachment = null;
+    previousValidAttachments = [];
     updateResumeSelection();
   }
   operation.composerCleared = true;
@@ -1819,7 +1820,7 @@ function unlockChatAfterRecovery(operation) {
 }
 function prepareMessageEdit(text, attachments = [], messageId, requestId, element) {
   const input = $("#chat-form [name=text]");
-  const file = $("#resume-file").files?.[0];
+  const file = $("#resume-file").files?.length;
   if (activeChat || switchingConversation) {
     setChatStatus("回覆進行中，請等候完成後再編輯。", "error");
     return;
@@ -1986,7 +1987,9 @@ $("#toggle-quick-options").addEventListener("click", () => {
   $("#toggle-quick-options").setAttribute("aria-expanded", String(!panel.hidden));
   $("#toggle-quick-options").textContent = panel.hidden ? "展開建議" : "收起建議";
 });
+const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024;
 function attachmentKind(file) {
   const extension = String(file?.name || "").split(".").pop().toLowerCase();
   if (extension === "pdf") return "PDF";
@@ -1995,47 +1998,80 @@ function attachmentKind(file) {
   return "";
 }
 function attachmentError(files) {
-  if (!files || files.length !== 1) return "一次只能附加一個檔案；原附件與訊息草稿已保留。";
-  const file = files[0];
-  if (!file.size) return "檔案是空的；原附件與訊息草稿已保留。";
-  if (file.size > MAX_ATTACHMENT_BYTES) return "檔案超過 20 MiB 上限；原附件與訊息草稿已保留。";
-  if (!attachmentKind(file)) return "支援 PDF、PNG／JPEG／WebP、Markdown 或 TXT；原附件與訊息草稿已保留。";
+  if (!files?.length) return "沒有可附加的檔案；原附件與訊息草稿已保留。";
+  if (files.length > MAX_ATTACHMENTS) return `最多附加 ${MAX_ATTACHMENTS} 個檔案；原附件與訊息草稿已保留。`;
+  for (const file of files) {
+    if (!file.size) return `${file.name} 是空檔案；原附件與訊息草稿已保留。`;
+    if (file.size > MAX_ATTACHMENT_BYTES) return `${file.name} 超過 20 MiB 上限；原附件與訊息草稿已保留。`;
+    if (!attachmentKind(file)) return "支援 PDF、PNG／JPEG／WebP、Markdown 或 TXT；原附件與訊息草稿已保留。";
+  }
+  if (files.reduce((total, file) => total + file.size, 0) > MAX_ATTACHMENT_TOTAL_BYTES) return "附件合計超過 50 MiB；原附件與訊息草稿已保留。";
   return "";
 }
-function updateResumeSelection() {
-  const file = $("#resume-file").files?.[0];
-  $("#resume-selection").hidden = !file;
-  $("#resume-name").textContent = file ? `${file.name} · ${attachmentKind(file)} · ${(file.size / 1024).toFixed(0)} KiB` : "";
+// New picks and drops add to the current selection; the same file picked twice is kept once.
+function mergeAttachments(current, added) {
+  const key = file => [file.name, file.size, file.lastModified ?? ""].join("|");
+  const seen = new Set(current.map(key));
+  return [...current, ...added.filter(file => !seen.has(key(file)) && seen.add(key(file)))];
 }
-function restorePreviousAttachment() {
+function setAttachmentInput(files) {
   const input = $("#resume-file");
-  if (!previousValidAttachment) { input.value = ""; updateResumeSelection(); return; }
+  if (!files.length) { input.value = ""; return true; }
   try {
     const transfer = new DataTransfer();
-    transfer.items.add(previousValidAttachment);
+    for (const file of files) transfer.items.add(file);
     input.files = transfer.files;
+    return true;
   } catch (_) {
-    input.value = ""; previousValidAttachment = null;
+    input.value = ""; return false;
   }
+}
+function removeAttachment(file) {
+  if (activeChat) return;
+  previousValidAttachments = [...($("#resume-file").files || [])].filter(item => item !== file);
+  if (!setAttachmentInput(previousValidAttachments)) previousValidAttachments = [];
+  updateResumeSelection(); updateChatCount();
+}
+function updateResumeSelection() {
+  const files = [...($("#resume-file").files || [])];
+  $("#resume-selection").hidden = !files.length;
+  const list = $("#resume-name"); list.replaceChildren();
+  for (const file of files) {
+    const chip = node("span", undefined, "attachment-chip");
+    chip.append(node("span", `${file.name} · ${attachmentKind(file)} · ${(file.size / 1024).toFixed(0)} KiB`));
+    const remove = node("button", "×"); remove.type = "button";
+    remove.setAttribute("aria-label", `移除 ${file.name}`); remove.title = `移除 ${file.name}`;
+    remove.addEventListener("click", () => removeAttachment(file));
+    chip.append(remove); list.append(chip);
+  }
+  // A separate "remove all" only helps once there is more than one file.
+  $("#remove-resume").hidden = files.length < 2;
+}
+function restorePreviousAttachment() {
+  if (!setAttachmentInput(previousValidAttachments)) previousValidAttachments = [];
   updateResumeSelection();
 }
-function attachmentPrompt(file) {
-  const kind = attachmentKind(file);
+function attachmentPrompt(files) {
+  if (files.length > 1) return "請根據這些檔案整理技能與經驗的重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
+  const kind = attachmentKind(files[0]);
   if (kind === "PDF") return "請根據這份履歷整理技能與經驗，並搜尋適合我的職缺；缺少的條件請先和我確認。";
   if (kind === "圖片") return "請根據這張圖片整理重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
   return "請根據這份文件整理重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
 }
 function acceptAttachmentSelection(files) {
-  const error = activeChat ? "回覆進行中，暫時無法更換附件；原附件與訊息草稿已保留。" : attachmentError(files);
+  const merged = mergeAttachments(previousValidAttachments, [...(files || [])]);
+  const error = activeChat ? "回覆進行中，暫時無法更換附件；原附件與訊息草稿已保留。" : attachmentError(merged);
   if (error) {
     restorePreviousAttachment(); setChatStatus(error, "error"); updateChatCount(); return false;
   }
-  const file = files[0];
-  previousValidAttachment = file;
+  if (!setAttachmentInput(merged)) {
+    restorePreviousAttachment(); setChatStatus("無法加入這些檔案；原附件與訊息草稿已保留。", "error"); updateChatCount(); return false;
+  }
+  previousValidAttachments = merged;
   const text = $("#chat-form [name=text]");
-  if (!text.value.trim()) text.value = attachmentPrompt(file);
+  if (!text.value.trim()) text.value = attachmentPrompt(merged);
   updateResumeSelection(); updateChatCount();
-  setChatStatus("已附加檔案；可以修改訊息後再按送出。");
+  setChatStatus(merged.length > 1 ? `已附加 ${merged.length} 個檔案；可以修改訊息後再按送出。` : "已附加檔案；可以修改訊息後再按送出。");
   return true;
 }
 function transferHasFiles(event) {
@@ -2057,15 +2093,18 @@ function showChatFileDrag() {
   overlay.hidden = false;
 }
 $("#resume-file").addEventListener("click", () => {
-  previousValidAttachment = $("#resume-file").files?.[0] || previousValidAttachment;
+  const files = [...($("#resume-file").files || [])];
+  if (files.length) previousValidAttachments = files;
 });
 $("#resume-file").addEventListener("change", () => {
-  const files = $("#resume-file").files;
-  if (!files?.length) { previousValidAttachment = null; updateResumeSelection(); updateChatCount(); return; }
+  const files = [...($("#resume-file").files || [])];
+  // A cancelled picker clears the native input; keep what was already attached.
+  if (!files.length) { restorePreviousAttachment(); updateChatCount(); return; }
   acceptAttachmentSelection(files);
 });
 $("#remove-resume").addEventListener("click", () => {
-  previousValidAttachment = null; $("#resume-file").value = ""; updateResumeSelection();
+  if (activeChat) return;
+  previousValidAttachments = []; $("#resume-file").value = ""; updateResumeSelection(); updateChatCount();
 });
 $("#chat").addEventListener("dragenter", event => {
   if (!transferHasFiles(event)) return;
@@ -2089,14 +2128,8 @@ $("#chat").addEventListener("drop", event => {
   const files = event.dataTransfer?.files;
   if (activeChat) setChatStatus("回覆進行中，暫時無法更換附件；原附件與訊息草稿已保留。", "error");
   else {
-    const error = attachmentError(files);
-    if (error) setChatStatus(error, "error");
-    else {
-      try {
-        $("#resume-file").files = files;
-        $("#resume-file").dispatchEvent(new Event("change", {bubbles: true}));
-      } catch (_) { setChatStatus("無法讀取拖入的檔案；原附件與訊息草稿已保留。", "error"); }
-    }
+    previousValidAttachments = [...($("#resume-file").files || [])];
+    acceptAttachmentSelection([...(files || [])]);
   }
   clearChatFileDrag();
 });
@@ -2126,8 +2159,9 @@ async function postChatWithRetry(operation) {
       operation.requestSent = true;
       const headers = {"X-CSRF-Token": operation.csrfToken};
       let body;
-      if (operation.attachment) {
-        body = new FormData(); body.append("text", operation.text); body.append("request_id", operation.id); body.append("conversation_id", operation.conversationId); body.append("resume", operation.attachment);
+      if (operation.attachments.length) {
+        body = new FormData(); body.append("text", operation.text); body.append("request_id", operation.id); body.append("conversation_id", operation.conversationId);
+        for (const file of operation.attachments) body.append("resume", file);
         if (operation.action) body.append("action", JSON.stringify(operation.action));
         if (operation.editMessage) { body.append("edit_message_id", operation.editMessage.messageId); body.append("edit_request_id", operation.editMessage.requestId); }
       } else {
@@ -2169,7 +2203,7 @@ async function postChatWithRetry(operation) {
 function addOptimisticChatMessages(operation) {
   clearAcceptedComposer(operation);
   if (operation.messagesAdded) return;
-  const attachments = operation.attachment ? [{filename: operation.attachment.name}] : [];
+  const attachments = operation.attachments.map(file => ({filename: file.name}));
   operation.userElement = chatMessage("user", operation.text, "completed", [], attachments, null, operation.id, operation.editMessage?.messageId);
   operation.replyElement = chatMessage("assistant", "", "running", [], [], null, operation.id);
   operation.replyText = "";
@@ -2183,14 +2217,14 @@ $("#chat-form").addEventListener("submit", async event => {
   if (switchingConversation) { setChatStatus("正在載入另一段對話，請稍候再送出。", "error"); return; }
   if (!selectedConversationId) { setChatStatus("目前沒有選取的對話，請先新增一段對話。", "error"); return; }
   const input = $("#chat-form [name=text]"); const text = input.value.trim();
-  const attachment = $("#resume-file").files?.[0];
+  const attachments = [...($("#resume-file").files || [])];
   if (!text) { setChatStatus("請先輸入想說的話。", "error"); return; }
   if (editOrigin && editOrigin.conversationId !== String(selectedConversationId)) {
     setChatStatus("這則訊息屬於另一段對話；請取消編輯，或切回原對話後再送出。", "error"); return;
   }
   const editMessage = editOrigin;
   let operation;
-    try { operation = {id: crypto.randomUUID(), conversationId: String(selectedConversationId), csrfToken, text, attachment, editMessage, action: pendingChatAction, controller: new AbortController(), accepted: false}; pendingChatAction = null; }
+    try { operation = {id: crypto.randomUUID(), conversationId: String(selectedConversationId), csrfToken, text, attachments, editMessage, action: pendingChatAction, controller: new AbortController(), accepted: false}; pendingChatAction = null; }
   catch (_) { setChatStatus("訊息尚未送出：無法準備訊息，請使用本機或 HTTPS 網址開啟網站。你的文字已保留。", "error"); return; }
   activeChat = operation;
   updateConversationControls();
@@ -2198,7 +2232,7 @@ $("#chat-form").addEventListener("submit", async event => {
   input.readOnly = true;
   $("#resume-file").disabled = true; $("#remove-resume").disabled = true;
   $("#cancel-chat").hidden = false; $("#refresh-messages").disabled = true; $("#more-messages").disabled = true;
-  setChatStatus(attachment ? "正在上傳並解析附件…" : "正在送出訊息…");
+  setChatStatus(attachments.length ? "正在上傳並解析附件…" : "正在送出訊息…");
   let completed = false;
   let keepActive = false;
   try {

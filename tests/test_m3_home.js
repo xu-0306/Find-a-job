@@ -294,7 +294,7 @@ function keyForTest() {
     state.fetchCalls.push({path, options});
     if (path === "/api/chat") {
       const payload = options.body instanceof FormData
-        ? {text: options.body.get("text"), request_id: options.body.get("request_id"), conversation_id: options.body.get("conversation_id"), edit_message_id: options.body.get("edit_message_id"), edit_request_id: options.body.get("edit_request_id"), resume: options.body.get("resume")}
+        ? {text: options.body.get("text"), request_id: options.body.get("request_id"), conversation_id: options.body.get("conversation_id"), edit_message_id: options.body.get("edit_message_id"), edit_request_id: options.body.get("edit_request_id"), resume: options.body.get("resume"), resumes: options.body.getAll("resume")}
         : JSON.parse(options.body);
       state.chatRequestId = payload.request_id; state.chatPayloads.push(payload);
       return {ok: true, status: 200, headers: {get: () => "text/event-stream"}, body: {getReader: () => ({})}};
@@ -855,15 +855,16 @@ async function testDraftShortcutsPortraitsAndResume() {
   assert.equal(home.state.fileInput.files.length, 0);
   assert.equal(home.state.input.value, "");
   assert.equal(home.elements.get("resume-selection").hidden, true);
-  let lastValidBoundary = null;
-  for (const size of [5 * 1024 * 1024 + 1, 20 * 1024 * 1024, 20 * 1024 * 1024 + 1]) {
-    const candidate = {name: "boundary.pdf", size};
+  // Picks add to the selection; a file over 20 MiB is rejected and the earlier valid files stay selected.
+  const accepted = [];
+  for (const [name, size] of [["boundary.pdf", 5 * 1024 * 1024 + 1], ["boundary-max.pdf", 20 * 1024 * 1024], ["too-large.pdf", 20 * 1024 * 1024 + 1]]) {
+    const candidate = {name, size};
     home.state.fileInput.files = [candidate];
     await home.state.fileInput.dispatch("change");
     const allowed = size <= 20 * 1024 * 1024;
-    if (allowed) lastValidBoundary = candidate;
-    assert.equal(home.state.fileInput.files.length, 1, "invalid replacement keeps the last valid file");
-    assert.equal(home.state.fileInput.files[0], lastValidBoundary);
+    if (allowed) accepted.push(candidate);
+    assert.equal(home.state.fileInput.files.length, accepted.length, "valid picks accumulate and an invalid pick adds nothing");
+    assert.ok(accepted.every((file, index) => home.state.fileInput.files[index] === file));
     assert.equal(home.elements.get("resume-selection").hidden, false);
     if (!allowed) assert.match(home.elements.get("chat-status").textContent, /20 MiB/);
   }
@@ -871,7 +872,8 @@ async function testDraftShortcutsPortraitsAndResume() {
   assert.match(message.textContent, /<unsafe>\.pdf · 2 頁/);
   home.state.fileInput.files = [new File(["x"], "other.exe")];
   await home.state.fileInput.dispatch("change");
-  assert.equal(home.state.fileInput.files[0], lastValidBoundary, "unsupported replacement keeps the existing attachment");
+  assert.ok(home.state.fileInput.files.length === 2 && accepted.every((file, index) => home.state.fileInput.files[index] === file),
+    "an unsupported pick keeps the existing attachments");
   const late = createContext(); await settle();
   late.state.input.value = "未接受前的私人草稿";
   late.state.fileInput.files = [file];
@@ -916,7 +918,8 @@ async function testAttachmentDropSelectionAndBoundaries() {
   assert.equal(overImage.defaultPrevented, true); assert.equal(overImage.dataTransfer.dropEffect, "copy");
   const dropImage = makeDrag([image]); await panel.dispatch("drop", dropImage);
   assert.equal(dropImage.defaultPrevented, true);
-  assert.equal(home.state.fileInput.files[0], image, "valid image drop replaces the native input selection");
+  assert.ok(home.state.fileInput.files.length === 2 && home.state.fileInput.files[0] === oldFile && home.state.fileInput.files[1] === image,
+    "a valid image drop adds to the existing selection");
   assert.equal(home.state.input.value, "草稿不要改動", "valid drop keeps a nonempty draft");
   assert.equal(overlay.hidden, true);
   assert.equal(home.state.fetchCalls.some(item => item.path === "/api/chat"), false, "dropping a file never sends it automatically");
@@ -924,26 +927,33 @@ async function testAttachmentDropSelectionAndBoundaries() {
   for (const files of [
     [new File(["bad"], "unsupported.exe")],
     [{name: "large.txt", size: 20 * 1024 * 1024 + 1}],
-    [new File(["image"], "one.png"), new File(["text"], "two.md")],
+    [1, 2, 3, 4].map(index => new File(["text"], `extra-${index}.md`)),
   ]) {
     const event = makeDrag(files); await panel.dispatch("drop", event);
     assert.equal(event.defaultPrevented, true);
-    assert.equal(home.state.fileInput.files[0], image, "invalid, oversized and multiple drops preserve the selected attachment");
+    assert.ok(home.state.fileInput.files.length === 2 && home.state.fileInput.files[1] === image,
+      "invalid, oversized and over-five drops preserve the selected attachments");
     assert.equal(home.state.input.value, "草稿不要改動", "invalid drops preserve the draft");
     assert.match(home.elements.get("chat-status").textContent, /保留/);
   }
   home.state.fileInput.files = [new File(["bad"], "unsupported.exe")];
   await home.state.fileInput.dispatch("change");
-  assert.equal(home.state.fileInput.files[0], image, "invalid picker selection rolls back to the prior valid attachment");
+  assert.ok(home.state.fileInput.files.length === 2 && home.state.fileInput.files[1] === image, "invalid picker selection rolls back to the prior valid attachments");
+  assert.equal(home.elements.get("remove-resume").hidden, false, "remove-all appears once two files are attached");
+  await home.elements.get("remove-resume").click();
+  assert.equal(home.state.fileInput.files.length, 0); assert.equal(home.elements.get("resume-selection").hidden, true);
 
   home.state.input.value = "";
   const pdf = new File(["resume"], "resume.pdf", {type: "application/pdf"});
   home.state.fileInput.files = [pdf]; await home.state.fileInput.dispatch("change");
   assert.match(home.state.input.value, /這份履歷/, "blank drafts get the existing PDF-specific prompt");
+  await all(home.elements.get("resume-name"), item => item.tagName === "BUTTON")[0].click();
+  assert.equal(home.state.fileInput.files.length, 0, "a chip's remove button drops that file");
   home.state.input.value = "";
   const imagePrompt = new File(["image"], "portrait.jpg", {type: "image/jpeg"});
   await panel.dispatch("drop", makeDrag([imagePrompt]));
   assert.match(home.state.input.value, /這張圖片/, "blank drafts get an image-aware prompt");
+  await all(home.elements.get("resume-name"), item => item.tagName === "BUTTON")[0].click();
   home.state.input.value = "";
   const markdown = new File(["# Notes"], "notes.markdown", {type: "text/markdown"});
   await panel.dispatch("drop", makeDrag([markdown]));
@@ -1731,6 +1741,33 @@ function testSearchTitleIsNotRepeatedWhenUnlabelled() {
   assert.equal(batches.elements.get("search-results-title").textContent, "本次搜尋 · 本次搜尋", "a keyword equal to the fallback wording is data, not a missing label");
 }
 
+async function testUpToFiveAttachmentsAreSentTogether() {
+  const home = createContext(); await settle();
+  const files = [1, 2, 3, 4, 5].map(index => new File([`resume ${index}`], `履歷${index}.pdf`, {type: "application/pdf"}));
+  home.state.input.value = "";
+  home.state.fileInput.files = files.slice(0, 2); await home.state.fileInput.dispatch("change");
+  assert.match(home.state.input.value, /這些檔案/, "several files get a multi-file prompt");
+  home.state.fileInput.files = files.slice(1, 5); await home.state.fileInput.dispatch("change");
+  assert.deepEqual(home.state.fileInput.files.map(file => file.name), files.map(file => file.name), "re-picking a file keeps one copy");
+  assert.equal(all(home.elements.get("resume-name"), item => item.className === "attachment-chip").length, 5);
+  home.state.fileInput.files = [new File(["six"], "第六份.pdf")]; await home.state.fileInput.dispatch("change");
+  assert.equal(home.state.fileInput.files.length, 5, "a sixth file is rejected");
+  assert.match(home.elements.get("chat-status").textContent, /最多附加 5 個檔案/);
+  await all(home.elements.get("resume-name"), item => item.tagName === "BUTTON")[4].click();
+  assert.equal(home.state.fileInput.files.length, 4);
+  const sized = createContext(); await settle();
+  sized.state.fileInput.files = [{name: "a.pdf", size: 20 * 1024 * 1024}, {name: "b.pdf", size: 20 * 1024 * 1024}]; await sized.state.fileInput.dispatch("change");
+  assert.equal(sized.state.fileInput.files.length, 2);
+  sized.state.fileInput.files = [{name: "c.pdf", size: 20 * 1024 * 1024}]; await sized.state.fileInput.dispatch("change");
+  assert.match(sized.elements.get("chat-status").textContent, /合計超過 50 MiB/, "the combined size is capped even under five files");
+  assert.equal(sized.state.fileInput.files.length, 2);
+  home.state.input.value = "請比較這幾份履歷";
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  const payload = home.state.chatPayloads.at(-1);
+  assert.deepEqual(payload.resumes, files.slice(0, 4), "every attachment is sent in one multipart request");
+  assert.equal(home.state.fileInput.files.length, 0, "an accepted send clears the selection");
+}
+
 async function testConversationWorkingListConverges() {
   const home = createContext(); await settle();
   const list = home.elements.get("search-results-list");
@@ -1992,12 +2029,13 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   testChatHeadingMarkupMovesLatestButtonOutOfHeading();
   testSearchTitleIsNotRepeatedWhenUnlabelled();
   await testConversationWorkingListConverges();
+  await testUpToFiveAttachmentsAreSentTogether();
   testSplitterMarkup();
   await testChatWidthClampsAndReclampsOnResize();
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 34 checks passed");
+  console.log("test_m3_home: 35 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
