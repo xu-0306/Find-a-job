@@ -90,6 +90,51 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(len(self.search_calls), 2)
         self.assertEqual([data['phase'] for event, data in exhausted if event == 'tool_status' and data.get('call_id')], ['started', 'interrupted'])
 
+    def test_search_history_refresh_batches_jobs_and_favorites(self):
+        from contextlib import nullcontext
+        import sqlite3
+        from unittest.mock import patch
+
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = (item['id'] for item in first['items'])
+        # More ids than SQLite's legacy parameter limit, including a job no longer in the jobs table.
+        missing = [{'id': f'missing-{i}', 'title': 'saved snapshot'} for i in range(1000)]
+        saved = [first | {'items': [first['items'][0], *missing[:500]], '_continuation': {'private': True}},
+                 first | {'items': [first['items'][1], *missing[500:]], 'can_continue': False}]
+        self.store.save_reply('first', {'text': '', 'status': 'completed',
+                                      'events': [{'event': 'jobs', 'data': event} for event in saved]})
+        with self.store.connect(write=True) as db:
+            current = json.loads(db.execute('SELECT payload_json FROM jobs WHERE id=?', (alpha,)).fetchone()[0])
+            current['summary'] = 'current detail'
+            db.execute('UPDATE jobs SET payload_json=? WHERE id=?', (encode(current), alpha))
+            db.execute("INSERT INTO favorites VALUES(?, 'default', '2026-10-18')", (alpha,))
+            db.execute("UPDATE messages SET content_json=json_set(content_json,'$.search_dismissed',json(?)) WHERE request_id='first' AND role='user'",
+                       (encode({first['search_id']: [beta]}),))
+        expected = json.loads(encode(saved))
+        for event in expected:
+            event.pop('_continuation', None)
+            event['dismissed_ids'] = [beta]
+            for item in event['items']:
+                if item['id'] == alpha:
+                    item.update(current)
+                item['is_favorite'] = item['id'] == alpha
+        with self.store.connect() as db:
+            db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+            queries = []
+            db.set_trace_callback(queries.append)
+            searches = self.store.conversation_searches(db, 'legacy', 'default')
+            self.assertEqual(searches, expected)
+            lookups = lambda: [sql for sql in queries if sql.startswith('SELECT') and ('FROM jobs ' in sql or 'FROM favorites ' in sql)]
+            self.assertLessEqual(len(lookups()), 4, 'job and favorite reads scale with chunks, not candidates')
+            queries.clear()
+            with patch.object(self.store, 'connect', return_value=nullcontext(db)):
+                history = self.store.messages(conversation_id='legacy', user_id='default')
+            self.assertEqual([event['data'] for message in history['items'] for event in message['content']['events']], expected)
+            self.assertLessEqual(len(lookups()), 4, 'message history shares the batch refresh path')
+            self.assertTrue(all(not item['is_favorite'] for event in self.store.conversation_searches(db, 'legacy', None)
+                                for item in event['items']), 'an unspecified user does not inherit another user favorites')
+
     def test_cross_conversation_cannot_continue_or_dismiss(self):
         self.configure()
         first, _ = self.first()

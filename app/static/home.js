@@ -34,12 +34,25 @@ function applyConversationWork(state) {
 }
 // Replays the conversation's recent searches (oldest first) into the panel, whichever messages are loaded.
 function replayConversationSearches(searches) {
-  for (const search of Array.isArray(searches) ? searches : []) if (search?.search_id) updateSearchState(search);
+  const reset = new Set();
+  for (const search of Array.isArray(searches) ? searches : []) {
+    if (!search?.search_id) continue;
+    const state = stateForSearch(search.search_id);
+    if (!reset.has(state.id)) {
+      // Messages keep references to this object, so reset it in place before replaying all its events.
+      Object.assign(state, createSearchState(state.id), {serverBacked: true});
+      reset.add(state.id);
+    }
+    updateSearchState(search, null, {render: false});
+  }
 }
 async function refreshConversationWork(conversationId = selectedConversationId) {
-  if (!conversationId) return;
+  if (activeChat || !conversationId) return;
+  const request = ++messageLoadRequest;
+  const requestToken = csrfToken;
   const result = await api(`/api/messages?${new URLSearchParams({conversation_id: String(conversationId), limit: "1"})}`);
-  if (String(conversationId) !== selectedConversationId) return;
+  if (activeChat || !csrfToken || requestToken !== csrfToken || request !== messageLoadRequest
+      || String(conversationId) !== selectedConversationId) return;
   const searches = result.conversation_state?.searches;
   if (Array.isArray(searches)) {
     // An edit can drop a reply together with its searches; their candidates leave the panel too.
@@ -739,9 +752,18 @@ function renderSearchResultsPanel() {
   if (removed.length) list.append(removedSection());
   list.append(continueFooter(state, counts.total));
 }
-function updateSearchState(data, message) {
+function updateSearchState(data, message, {historical = false, render = true} = {}) {
   if (!data || typeof data !== "object") return null;
   const requestedId = data.search_id ? String(data.search_id) : (activeSearchId || `conversation:${selectedConversationId || ""}`);
+  const saved = searchStates.get(requestedId);
+  if (historical && saved?.serverBacked) {
+    for (const item of Array.isArray(data.items) ? data.items : []) if (!saved.jobs.has(jobIdentifier(item))) mergeJob(saved, item);
+    if (message) {
+      chatSearchResults.set(message, [...(chatSearchResults.get(message) || []), ...(data.items || []).map(item => ({...item, id: jobIdentifier(item)})).filter(item => item.id)]);
+      chatSearchMetadata.set(message, saved);
+    }
+    return saved;
+  }
   if (activeSearchId !== requestedId) {
     activeSearchState = stateForSearch(requestedId);
     // A new batch belongs in the conversation aggregate by default. The
@@ -768,7 +790,7 @@ function updateSearchState(data, message) {
     chatSearchResults.set(message, [...(chatSearchResults.get(message) || []), ...(data.items || []).map(item => ({...item, id: jobIdentifier(item)})).filter(item => item.id)]);
     chatSearchMetadata.set(message, state);
   }
-  renderSearchResultsPanel();
+  if (render) renderSearchResultsPanel();
   return state;
 }
 function updateRecommendations(data, message) {
@@ -1366,7 +1388,7 @@ function finishToolProgress(message, status = "completed") {
   details.children[0].textContent = status === "completed" ? "工作進度（已完成）" : "工作進度（已中斷）";
   details.open = false;
 }
-function renderChatEvent(message, name, data) {
+function renderChatEvent(message, name, data, historical = false) {
   const container = $(".chat-bubble", message);
   if (name === "preference_proposal") {
     const card = node("article", undefined, "item");
@@ -1375,7 +1397,7 @@ function renderChatEvent(message, name, data) {
     action(button, async () => { showPage("preferences"); await loadPreferences(data.id); });
     card.append(button); container.append(card);
   } else if (name === "jobs") {
-    const state = updateSearchState(data, message);
+    const state = updateSearchState(data, message, {historical});
     const details = node("details", undefined, "chat-search-log");
     details.append(node("summary", "搜尋紀錄與限制"));
     for (const source of data.source_results || []) {
@@ -1601,7 +1623,7 @@ function chatActionIcon() {
   svg.append(use);
   return svg;
 }
-function chatMessage(role, text, status = "completed", events = [], attachments = [], createdAt = null, requestId = null, messageId = null) {
+function chatMessage(role, text, status = "completed", events = [], attachments = [], createdAt = null, requestId = null, messageId = null, historical = false) {
   const card = node("article", undefined, `chat-message ${role === "user" ? "chat-user" : ""}`);
   if (requestId) card.dataset.requestId = String(requestId);
   card.dataset.role = role;
@@ -1634,7 +1656,7 @@ function chatMessage(role, text, status = "completed", events = [], attachments 
   }
   for (const event of events) {
     if (event.event === "tool_status") renderToolProgress(card, event.data);
-    else renderChatEvent(card, event.event, event.data);
+    else renderChatEvent(card, event.event, event.data, historical);
   }
   renderChatRecommendations(card, text);
   if (status === "completed" || status === "interrupted" || status === "failed") finishToolProgress(card, status);
@@ -1671,7 +1693,7 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   const fragment = document.createDocumentFragment();
   for (const item of result.items) {
     const requestId = item.request_id ? String(item.request_id) : null;
-    fragment.append(chatMessage(item.role, item.content.text, item.content.status, item.content.events, item.content.attachments, item.created_at, requestId, item.id));
+    fragment.append(chatMessage(item.role, item.content.text, item.content.status, item.content.events, item.content.attachments, item.created_at, requestId, item.id, true));
   }
   if (more) $("#chat-list").prepend(fragment);
   else $("#chat-list").replaceChildren(fragment);
@@ -2261,6 +2283,7 @@ $("#chat-form").addEventListener("submit", async event => {
     try { operation = {id: crypto.randomUUID(), conversationId: String(selectedConversationId), csrfToken, text, attachments, editMessage, action: pendingChatAction, controller: new AbortController(), accepted: false}; pendingChatAction = null; }
   catch (_) { setChatStatus("訊息尚未送出：無法準備訊息，請使用本機或 HTTPS 網址開啟網站。你的文字已保留。", "error"); return; }
   activeChat = operation;
+  messageLoadRequest++;
   updateConversationControls();
   const submit = $("#chat-form button[type=submit]"); submit.disabled = true; submit.textContent = "送出中…";
   input.readOnly = true;

@@ -24,7 +24,9 @@ def enabled_sources(services):
 
 
 # A source number standing alone, not an address, wage or other quantity ("104號"、"時薪518"、"A1111B").
-_SOURCE_MENTION = re.compile(r'(?<![0-9a-z$.])(?<!薪)(?:104|518|1111)(?![0-9a-z.]|\s*(?:號|号|巷|弄|樓|楼|路|街|段|區|元|塊|萬|千|百|個|天|年|月|小時|分))')
+_SOURCE_MENTION = re.compile(
+    r'(?<![0-9a-z$])(?:(?:www\.)?(?:104|518|1111)\.com\.tw(?![0-9a-z-]|\.[0-9a-z-])|'
+    r'(?<!\.)(?<!薪)(?:104|518|1111)(?![0-9a-z]|\.[0-9a-z]|\s*(?:號|号|巷|弄|樓|楼|路|街|段|區|元|塊|萬|千|百|個|天|年|月|小時|分)))')
 
 
 def requested_sources(arguments, enabled, user_text, continuation=False):

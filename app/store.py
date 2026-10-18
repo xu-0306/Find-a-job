@@ -402,17 +402,27 @@ class Store:
                 'excluded_companies': companies, 'removed': list(removed.values()),
                 'dismissed_ids': list(dict.fromkeys(dismissed))}
 
-    def _refresh_search_event(self, db, data, user_id):
-        """A saved jobs event as clients see it: no cursor, current dismissals, current job data and favorites."""
-        data.pop('_continuation', None)
-        if data.get('search_id'):
-            data['dismissed_ids'] = self.search_dismissed(db, data)
-        for job in data.get('items', []):
-            current = db.execute('SELECT payload_json FROM jobs WHERE id=?', (job.get('id'),)).fetchone()
-            if current:
-                job.update(json.loads(current[0]))
-            job['is_favorite'] = bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (job.get('id'), user_id)).fetchone())
-        return data
+    def _refresh_search_events(self, db, events, user_id):
+        """Saved jobs events as clients see them, with job and favorite reads shared across events."""
+        jobs = [job for data in events for job in data.get('items', [])]
+        ids = list(dict.fromkeys(job.get('id') for job in jobs if job.get('id')))
+        current, favorites = {}, set()
+        # Leave room for the user id under SQLite's legacy 999-parameter limit.
+        for offset in range(0, len(ids), 900):
+            batch = ids[offset:offset + 900]
+            placeholders = ','.join('?' for _ in batch)
+            current.update((row[0], json.loads(row[1])) for row in db.execute(
+                f'SELECT id,payload_json FROM jobs WHERE id IN ({placeholders})', batch))
+            favorites.update(row[0] for row in db.execute(
+                f'SELECT job_id FROM favorites WHERE user_id=? AND job_id IN ({placeholders})', [user_id, *batch]))
+        for data in events:
+            data.pop('_continuation', None)
+            if data.get('search_id'):
+                data['dismissed_ids'] = self.search_dismissed(db, data)
+        for job in jobs:
+            job.update(current.get(job.get('id'), {}))
+            job['is_favorite'] = job.get('id') in favorites
+        return events
 
     def conversation_searches(self, db, conversation_id, user_id, limit=20):
         """The latest searches of the whole conversation, oldest first, so a client can rebuild its results panel
@@ -421,7 +431,7 @@ class Store:
             WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event')='jobs'
             AND json_extract(e.value,'$.data.search_id') IS NOT NULL
             ORDER BY m.rowid DESC,CAST(e.key AS INTEGER) DESC LIMIT ?""", (conversation_id, limit)).fetchall()
-        return [self._refresh_search_event(db, json.loads(row[0])['data'], user_id) for row in reversed(rows)]
+        return self._refresh_search_events(db, [json.loads(row[0])['data'] for row in reversed(rows)], user_id)
 
     def messages(self, cursor=None, limit=20, conversation_id=None, request_id=None, user_id=None):
         with self.connect() as db:
@@ -438,10 +448,11 @@ class Store:
             items = [dict(id=row['id'], request_id=row['request_id'], role=row['role'],
                           content=json.loads(row['content_json']), created_at=row['created_at'])
                      for row in reversed(rows[:limit])]
+            searches = []
             for message in items:
                 for event in message['content'].get('events', []):
                     if event.get('event') == 'jobs':
-                        self._refresh_search_event(db, event['data'], user_id)
+                        searches.append(event['data'])
                     elif event.get('event') == 'recommendations':
                         for recommendation in event['data'].get('items', []):
                             job = recommendation.get('job')
@@ -450,4 +461,5 @@ class Store:
                                 if current:
                                     job.update(json.loads(current[0]))
                                 job['is_favorite'] = bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (job['id'], user_id)).fetchone())
+            self._refresh_search_events(db, searches, user_id)
             return {'items': items, 'next_cursor': str(rows[limit - 1]['seq']) if len(rows) > limit else None}

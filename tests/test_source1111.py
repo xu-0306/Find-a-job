@@ -197,14 +197,17 @@ class RouteChecks(unittest.TestCase):
         self.browser.call.assert_awaited_once()
         progress = [x for event, x in output if event == 'tool_status' and x.get('name') == 'search_jobs' and x.get('phase') == 'started']
         self.assertIn('104／1111', progress[0]['summary'], 'the progress label names the sources actually queried')
-        for index, text in enumerate(('只查 104 就好', '這次不要1111', '只查１０４')):
+        for index, text in enumerate(('只查 104 就好', '這次不要1111', '只查１０４', '只查 104.',
+                                      '只查 https://www.104.com.tw 的職缺', '只查1111.com.tw',
+                                      '104人力銀行', '用104跟518找', '1111 和 518')):
             with self.subTest(text=text):
                 self.configure(True, ['104'])
                 chosen = next(x for event, x in self.send(f'chosen-{index}', text) if event == 'jobs')
                 self.assertEqual(chosen['sources'], ['104'])
                 self.browser.call.assert_not_awaited()
         # Numbers that are addresses, wages or codes do not count as naming a source.
-        for index, text in enumerate(('中山區104號附近', '時薪518元以上', '代號A1111B')):
+        for index, text in enumerate(('中山區104號附近', '時薪518元以上', '代號A1111B',
+                                      '51040', '月薪 104 千', '$104', '104.5', 'x104.com.tw', '104.com.tw.evil.invalid')):
             with self.subTest(text=text):
                 self.configure(True, ['104'])
                 kept = next(x for event, x in self.send(f'number-{index}', text) if event == 'jobs')

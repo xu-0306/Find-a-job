@@ -1850,6 +1850,100 @@ async function testHistoryPagesUseTheServerWorkingList() {
   assert.equal(home.elements.get("search-results-panel").hidden, true);
 }
 
+async function testEditedContinuationRebuildsTheSameSearch() {
+  const home = createContext(); await settle();
+  const first = {search_id: "edit-search", items: [{id: "a"}], new_ids: ["a"], total_count: 1, can_continue: true};
+  const next = {...first, items: [{id: "b"}], new_ids: ["b"], total_count: 2, can_continue: false,
+    source_results: [{source: "104", status: "empty"}], filter_warnings: ["old warning"]};
+  home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {searches: [first, next]}});
+  await home.context.loadMessages(false, "conversation-edit");
+  home.context.savedMessage = home.context.chatMessage("assistant", "", "completed", [{event: "jobs", data: next}]);
+  const state = vm.runInContext('searchStates.get("edit-search")', home.context);
+  assert.deepEqual([...state.jobs.keys()], ["a", "b"]);
+  home.context.api = async () => ({conversation_state: {searches: [first]}});
+  let renders = 0;
+  const render = home.context.renderSearchResultsPanel;
+  home.context.renderSearchResultsPanel = () => { renders++; render(); };
+  await home.context.refreshConversationWork();
+  assert.deepEqual([...state.jobs.keys()], ["a"], "editing away the continuation removes its candidates");
+  assert.equal(vm.runInContext('chatSearchMetadata.get(savedMessage)', home.context), state, "message metadata keeps the same state object");
+  assert.equal(state.counts.total_count, 1);
+  assert.equal(state.canContinue, true);
+  assert.deepEqual([...state.newIds], ["a"]);
+  assert.equal(state.sourceResults.length, 0);
+  assert.equal(state.filterWarnings.length, 0);
+  assert.equal(renders, 1, "server replay renders the panel once");
+}
+
+async function testDelayedConversationRefreshIsDiscarded() {
+  for (const change of ["reply", "finished reply", "load", "refresh", "session"]) {
+    const home = createContext(); await settle();
+    vm.runInContext('selectedConversationId = "conversation-race"', home.context);
+    let resolve;
+    home.context.api = () => new Promise(done => { resolve = done; });
+    const pending = home.context.refreshConversationWork();
+    const oldResponse = resolve;
+    if (change === "reply") vm.runInContext('activeChat = {}', home.context);
+    if (change === "finished reply") {
+      home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {searches: []}});
+      home.state.input.value = "next turn";
+      await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    }
+    if (change === "load") {
+      const loaded = home.context.loadMessages();
+      resolve({items: [], next_cursor: null, conversation_state: {searches: []}});
+      await loaded;
+    }
+    if (change === "refresh") {
+      const refreshed = home.context.refreshConversationWork();
+      resolve({conversation_state: {searches: []}});
+      await refreshed;
+    }
+    if (change === "session") home.context.csrfToken = "different-session";
+    home.context.updateSearchState({search_id: "new-search", items: [{id: "new-job"}]});
+    home.context.applyConversationWork({shortlist: ["new-job"]});
+    oldResponse({conversation_state: {searches: [], shortlist: []}});
+    await pending;
+    assert.equal(vm.runInContext('searchStates.has("new-search")', home.context), true, change);
+    assert.equal(vm.runInContext('conversationWork.shortlist[0]', home.context), "new-job", change);
+  }
+}
+
+async function testOlderJobsKeepTheAuthoritativeSearchState() {
+  const home = createContext(); await settle();
+  const first = {search_id: "paged", items: [{id: "a", title: "old"}], criteria: {keyword: "old"}, sources: ["104"],
+    can_continue: true, total_count: 1, new_count: 1, duplicate_count: 0, new_ids: ["a"], dismissed_ids: [],
+    source_results: [{source: "104", status: "success"}], filter_warnings: ["old"]};
+  const latest = {...first, items: [{id: "a", title: "current"}, {id: "b"}], criteria: {keyword: "current"}, sources: ["518"],
+    can_continue: false, total_count: 3, new_count: 2, duplicate_count: 1, new_ids: ["b"], dismissed_ids: ["b"],
+    source_results: [{source: "518", status: "empty"}], filter_warnings: ["current"]};
+  const older = {...first, items: [...first.items, {id: "missing"}]};
+  home.context.api = async path => path.includes("cursor=older")
+    ? {items: [{role: "assistant", content: {text: "", status: "completed", events: [
+        {event: "jobs", data: older}, {event: "jobs", data: {...first, search_id: "outside-window"}}]}}], next_cursor: null}
+    : {items: [], next_cursor: "older", conversation_state: {searches: [latest]}};
+  await home.context.loadMessages(false, "conversation-pages");
+  await home.context.loadMessages(true);
+  const state = vm.runInContext('searchStates.get("paged")', home.context);
+  assert.equal(state.canContinue, false);
+  assert.equal(JSON.stringify(state.counts), JSON.stringify({new_count: 2, duplicate_count: 1, total_count: 3}));
+  for (const [actual, expected] of [[state.criteria, latest.criteria], [state.sources, latest.sources],
+    [state.sourceResults, latest.source_results], [state.filterWarnings, latest.filter_warnings]]) {
+    assert.equal(JSON.stringify(actual), JSON.stringify(expected));
+  }
+  assert.deepEqual([...state.newIds], ["b"]);
+  assert.deepEqual([...state.dismissed], ["b"]);
+  assert.equal(state.jobs.get("a").title, "current", "an old event cannot overwrite an existing job");
+  assert.ok(state.jobs.has("missing"), "older pages may supply missing candidates");
+  const message = home.elements.get("chat-list").children[0];
+  assert.equal(vm.runInContext('chatSearchResults', home.context).get(message)[0].id, "a");
+  assert.equal(vm.runInContext('searchStates.get("outside-window").canContinue', home.context), true,
+    "searches outside the server window keep the existing history behavior");
+  home.context.chatMessage("assistant", "", "completed", [{event: "jobs", data: {...latest, total_count: 4, can_continue: true}}]);
+  assert.equal(state.counts.total_count, 4, "a current reply snapshot can still advance the server-backed state");
+  assert.equal(state.canContinue, true);
+}
+
 const CHAT_WIDTH_KEY = "job-companion-chat-width";
 
 class ThrowingStorage {
@@ -2076,13 +2170,16 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   testSearchTitleIsNotRepeatedWhenUnlabelled();
   await testConversationWorkingListConverges();
   await testHistoryPagesUseTheServerWorkingList();
+  await testEditedContinuationRebuildsTheSameSearch();
+  await testDelayedConversationRefreshIsDiscarded();
+  await testOlderJobsKeepTheAuthoritativeSearchState();
   await testUpToFiveAttachmentsAreSentTogether();
   testSplitterMarkup();
   await testChatWidthClampsAndReclampsOnResize();
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 36 checks passed");
+  console.log("test_m3_home: 39 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
