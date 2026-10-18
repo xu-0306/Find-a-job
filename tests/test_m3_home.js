@@ -1819,24 +1819,35 @@ async function testHistoryPagesUseTheServerWorkingList() {
   const featuredIds = () => list.children.filter(item => item.className === "job-card item")
     .filter(card => all(card, item => item.className === "job-featured").length).map(card => card.dataset.jobId);
   const assistant = events => ({role: "assistant", content: {text: "", status: "completed", events}});
+  const cardIds = () => list.children.filter(item => item.className === "job-card item").map(card => card.dataset.jobId);
+  const search = {search_id: "h-1", criteria: {keyword: "品管"}, items: [job("h1"), job("h2"), job("h3")]};
   const state = {shortlist: ["h2"], removed: [{job_id: "h1", by: "agent", reason: "外派"}]};
-  const newest = [assistant([{event: "jobs", data: {search_id: "h-1", items: [job("h1"), job("h2")]}},
-                             {event: "recommendations", data: {items: [{job_id: "h2"}], removed: [{job_id: "h1", reason: "外派"}], replace: true}}])];
+  // The newest page holds no jobs event: the search happened many turns earlier.
+  const newest = [assistant([{event: "recommendations", data: {items: [{job_id: "h2"}], removed: [{job_id: "h1", reason: "外派"}], replace: true}}]),
+                  assistant([])];
   // The older page only knows the earlier recommendation of h1; replaying it last would undo the removal.
-  const older = [assistant([{event: "recommendations", data: {items: [{job_id: "h1"}], replace: true}}])];
+  const older = [assistant([{event: "jobs", data: search}, {event: "recommendations", data: {items: [{job_id: "h1"}], replace: true}}])];
   home.context.api = async path => path.includes("cursor=older")
     ? {items: older, next_cursor: null, conversation_state: state}
-    : {items: newest, next_cursor: "older", conversation_state: state};
+    : {items: newest, next_cursor: "older", conversation_state: {...state, searches: [search]}};
   await home.context.loadMessages(false, "conversation-h");
+  assert.equal(home.elements.get("search-results-panel").hidden, false, "the panel opens from the server's searches");
+  assert.deepEqual(cardIds(), ["h2", "h3"], "candidates come back although the search is not on the loaded page");
   assert.deepEqual(featuredIds(), ["h2"]);
   await home.context.loadMessages(true, "conversation-h");
   assert.deepEqual(featuredIds(), ["h2"], "loading an older page keeps the server's current shortlist");
+  assert.deepEqual(cardIds(), ["h2", "h3"]);
   assert.equal(vm.runInContext("conversationWork.removed.get('h1')?.reason", home.context), "外派");
   // After an edit the server's recomputed list replaces what the page replayed.
-  home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {shortlist: ["h1"], removed: []}});
+  home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {shortlist: ["h1"], removed: [], searches: [search]}});
   await home.context.refreshConversationWork("conversation-h");
   assert.deepEqual(featuredIds(), ["h1"]);
   assert.equal(vm.runInContext("conversationWork.removed.size", home.context), 0);
+  // An edit that removed the only search also removes its candidates.
+  home.context.api = async () => ({items: [], next_cursor: null, conversation_state: {shortlist: [], removed: [], searches: []}});
+  await home.context.refreshConversationWork("conversation-h");
+  assert.equal(vm.runInContext("searchStates.size", home.context), 0);
+  assert.equal(home.elements.get("search-results-panel").hidden, true);
 }
 
 const CHAT_WIDTH_KEY = "job-companion-chat-width";

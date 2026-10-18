@@ -1368,8 +1368,12 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             conversation_view(db, conversation_id, auth['user_id'])
             # The working list comes from the whole conversation, not from whichever pages the client has loaded.
             working = store.conversation_state(db, conversation_id)
+            # The first page also carries the recent searches, so the panel does not depend on which messages are loaded.
+            searches = store.conversation_searches(db, conversation_id, auth['user_id']) if cursor is None else None
         result = store.messages(parse_cursor(cursor) if cursor is not None else None, limit, conversation_id, user_id=auth['user_id'])
         result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed')}
+        if searches is not None:
+            result['conversation_state']['searches'] = searches
         return result
 
     @app.patch('/api/searches/{search_id}')
@@ -1463,11 +1467,15 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 arguments = sources.SearchInput.model_validate(previous['criteria_input'] | {'search_id': search_id})
             with store.connect() as db:
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
-                excluded_companies = list(dict.fromkeys([*store.conversation_state(db, conversation_id)['excluded_companies'],
-                                                         *arguments.exclude_companies, *requested_exclusions]))
+                # One name per normalised key, the earliest kept, so spelling variants do not pile up.
+                by_key = {}
+                for name in [*store.conversation_state(db, conversation_id)['excluded_companies'],
+                             *arguments.exclude_companies, *requested_exclusions]:
+                    by_key.setdefault(job_normalize.company_key(name), name)
+                excluded_companies = list(by_key.values())
                 user_text = (json.loads(row[0]).get('text') if (row := db.execute(
                     "SELECT content_json FROM messages WHERE request_id=? AND role='user'", (request_id,)).fetchone()) else '')
-            if len({job_normalize.company_key(name) for name in excluded_companies}) > MAX_EXCLUDED_COMPANIES:
+            if len(excluded_companies) > MAX_EXCLUDED_COMPANIES:
                 raise llm.LLMError('too_many_exclusions', f'這段對話排除的公司已超過 {MAX_EXCLUDED_COMPANIES} 家；請開新對話重新整理條件。')
             requested = sources.requested_sources(arguments, enabled, user_text, continuation=bool(previous))
             kept = [source for source in requested if source in enabled]

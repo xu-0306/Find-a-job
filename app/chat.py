@@ -178,11 +178,19 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
             async def execute(call, arguments):
                 summary = call['name']
                 if call['name'] == 'search_jobs':
-                    # The same source rule as the search itself, so the label names 1111 whenever it will be queried.
-                    enabled = sources.enabled_sources(settings)
-                    planned = [source for source in sources.requested_sources(arguments, enabled, user_text, continuation=bool(arguments.search_id))
+                    # The same source rule as the search itself, so the label names 1111 whenever it will be queried;
+                    # a continuation runs on its saved criteria, whatever the model passed.
+                    enabled, planned_input = sources.enabled_sources(settings), arguments
+                    if arguments.search_id:
+                        try:
+                            with store.connect() as db:
+                                saved = store.search_snapshot(db, current['conversation_id'], arguments.search_id)
+                            planned_input = sources.SearchInput.model_validate(saved['criteria_input'])
+                        except (LookupError, KeyError, ValueError):
+                            pass
+                    planned = [source for source in sources.requested_sources(planned_input, enabled, user_text, continuation=bool(arguments.search_id))
                                if source in enabled]
-                    summary = f'搜尋 {arguments.criteria.keyword} · {"／".join(planned or arguments.sources)}'
+                    summary = f'搜尋 {planned_input.criteria.keyword} · {"／".join(planned or planned_input.sources)}'
                 elif call['name'] == 'get_job_details':
                     summary = '讀取職缺詳細內容'
                 elif call['name'] == 'get_company_reviews':

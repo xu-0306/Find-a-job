@@ -402,6 +402,27 @@ class Store:
                 'excluded_companies': companies, 'removed': list(removed.values()),
                 'dismissed_ids': list(dict.fromkeys(dismissed))}
 
+    def _refresh_search_event(self, db, data, user_id):
+        """A saved jobs event as clients see it: no cursor, current dismissals, current job data and favorites."""
+        data.pop('_continuation', None)
+        if data.get('search_id'):
+            data['dismissed_ids'] = self.search_dismissed(db, data)
+        for job in data.get('items', []):
+            current = db.execute('SELECT payload_json FROM jobs WHERE id=?', (job.get('id'),)).fetchone()
+            if current:
+                job.update(json.loads(current[0]))
+            job['is_favorite'] = bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (job.get('id'), user_id)).fetchone())
+        return data
+
+    def conversation_searches(self, db, conversation_id, user_id, limit=20):
+        """The latest searches of the whole conversation, oldest first, so a client can rebuild its results panel
+        however few messages it has loaded."""
+        rows = db.execute("""SELECT e.value FROM messages m, json_each(m.content_json,'$.events') e
+            WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event')='jobs'
+            AND json_extract(e.value,'$.data.search_id') IS NOT NULL
+            ORDER BY m.rowid DESC,CAST(e.key AS INTEGER) DESC LIMIT ?""", (conversation_id, limit)).fetchall()
+        return [self._refresh_search_event(db, json.loads(row[0])['data'], user_id) for row in reversed(rows)]
+
     def messages(self, cursor=None, limit=20, conversation_id=None, request_id=None, user_id=None):
         with self.connect() as db:
             condition = 'rowid<?'
@@ -420,14 +441,7 @@ class Store:
             for message in items:
                 for event in message['content'].get('events', []):
                     if event.get('event') == 'jobs':
-                        event['data'].pop('_continuation', None)
-                        if event['data'].get('search_id'):
-                            event['data']['dismissed_ids'] = self.search_dismissed(db, event['data'])
-                        for job in event['data'].get('items', []):
-                            current = db.execute('SELECT payload_json FROM jobs WHERE id=?', (job.get('id'),)).fetchone()
-                            if current:
-                                job.update(json.loads(current[0]))
-                            job['is_favorite'] = bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (job.get('id'), user_id)).fetchone())
+                        self._refresh_search_event(db, event['data'], user_id)
                     elif event.get('event') == 'recommendations':
                         for recommendation in event['data'].get('items', []):
                             job = recommendation.get('job')

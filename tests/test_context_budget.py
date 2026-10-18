@@ -207,12 +207,16 @@ class CompactionChecks(unittest.TestCase):
     def test_parameter_errors_mentioning_the_window_are_not_overflow(self):
         self.configure()
         self.seed(3)
-        rejected = httpx.Response(400, json={'error': {'message': 'max_tokens: 300000 exceeds the model context window limit of 200000'}})
-        self.provider(lambda payload: rejected)
-        output = chats.events(self.client.post('/api/chat', json={'request_id': 'bad-parameter', 'text': '你好'}))
-        error = next(data for name, data in output if name == 'error')
-        self.assertEqual(error['code'], 'provider_http_error')
-        self.assertEqual(len(self.reply_calls), 1, 'a parameter error is not compacted and resent')
+        for index, message in enumerate(('max_tokens: 300000 exceeds the model context window limit of 200000',
+                                         'max_tokens: 8192 exceeds the context window of 4096',
+                                         'max_tokens plus the context length must not exceed the context window')):
+            with self.subTest(message=message):
+                rejected = httpx.Response(400, json={'error': {'message': message}})
+                self.provider(lambda payload, rejected=rejected: rejected)
+                output = chats.events(self.client.post('/api/chat', json={'request_id': f'bad-parameter-{index}', 'text': '你好'}))
+                error = next(data for name, data in output if name == 'error')
+                self.assertEqual(error['code'], 'provider_http_error')
+                self.assertEqual(len(self.reply_calls), 1, 'a parameter error is not compacted and resent')
 
     def test_repeated_overflow_reports_a_clear_error(self):
         self.configure(256_000)

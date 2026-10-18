@@ -197,12 +197,30 @@ class RouteChecks(unittest.TestCase):
         self.browser.call.assert_awaited_once()
         progress = [x for event, x in output if event == 'tool_status' and x.get('name') == 'search_jobs' and x.get('phase') == 'started']
         self.assertIn('104／1111', progress[0]['summary'], 'the progress label names the sources actually queried')
-        for index, text in enumerate(('只查 104 就好', '這次不要1111')):
+        for index, text in enumerate(('只查 104 就好', '這次不要1111', '只查１０４')):
             with self.subTest(text=text):
                 self.configure(True, ['104'])
                 chosen = next(x for event, x in self.send(f'chosen-{index}', text) if event == 'jobs')
                 self.assertEqual(chosen['sources'], ['104'])
                 self.browser.call.assert_not_awaited()
+        # Numbers that are addresses, wages or codes do not count as naming a source.
+        for index, text in enumerate(('中山區104號附近', '時薪518元以上', '代號A1111B')):
+            with self.subTest(text=text):
+                self.configure(True, ['104'])
+                kept = next(x for event, x in self.send(f'number-{index}', text) if event == 'jobs')
+                self.assertEqual(kept['sources'], ['104', '1111'])
+
+    def test_model_continuation_label_uses_the_saved_sources(self):
+        self.configure(True, ['1111'])
+        self.browser.call.return_value = page([row(str(i)) for i in range(1, 31)], size=30, total=31)
+        first = next(x for event, x in self.send('first', '只查1111') if event == 'jobs')
+        calls = iter([response(call=('next1', 'search_jobs', encode({'criteria': {'keyword': '品管'}, 'search_id': first['search_id']}))),
+                      response(text='已續查')])
+        self.app.state.llm_transport = __import__('httpx').MockTransport(lambda request: next(calls))
+        output = self.send('model-next', '再多給一些')
+        label = next(x['summary'] for event, x in output if event == 'tool_status' and x.get('name') == 'search_jobs' and x.get('phase') == 'started')
+        self.assertTrue(label.endswith('· 1111'), label)
+        self.assertEqual(next(x for event, x in output if event == 'jobs')['sources'], ['1111'])
 
     def test_explicit_disabled_1111_names_correct_source_and_detail_off(self):
         self.configure(explicit=['1111'])

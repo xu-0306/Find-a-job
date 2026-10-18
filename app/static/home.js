@@ -32,11 +32,25 @@ function applyConversationWork(state) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: String(item.by || "agent"), reason: String(item.reason || "")});
   }
 }
+// Replays the conversation's recent searches (oldest first) into the panel, whichever messages are loaded.
+function replayConversationSearches(searches) {
+  for (const search of Array.isArray(searches) ? searches : []) if (search?.search_id) updateSearchState(search);
+}
 async function refreshConversationWork(conversationId = selectedConversationId) {
   if (!conversationId) return;
   const result = await api(`/api/messages?${new URLSearchParams({conversation_id: String(conversationId), limit: "1"})}`);
   if (String(conversationId) !== selectedConversationId) return;
+  const searches = result.conversation_state?.searches;
+  if (Array.isArray(searches)) {
+    // An edit can drop a reply together with its searches; their candidates leave the panel too.
+    const valid = new Set(searches.map(search => String(search?.search_id)));
+    for (const id of [...searchStates.keys()]) if (!id.startsWith("conversation:") && !valid.has(id)) searchStates.delete(id);
+    if (activeSearchId && !searchStates.has(activeSearchId)) { activeSearchId = null; activeSearchState = null; }
+    if (resultSearchId && !searchStates.has(resultSearchId)) resultSearchId = null;
+    replayConversationSearches(searches);
+  }
   applyConversationWork(result.conversation_state);
+  if (!searchStates.size) { const panel = $("#search-results-panel"); if (panel) panel.hidden = true; }
   renderSearchResultsPanel();
 }
 let activeSearchId = null;
@@ -1652,6 +1666,7 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   if (changed || !more) {
     activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetConversationWork(); resetBasicReviews();
     const panel = $("#search-results-panel"); if (panel) panel.hidden = true;
+    replayConversationSearches(result.conversation_state?.searches);
   }
   const fragment = document.createDocumentFragment();
   for (const item of result.items) {

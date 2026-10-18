@@ -23,7 +23,8 @@ def enabled_sources(services):
             + (['1111'] if services.get('source_1111_enabled') is True else []))
 
 
-_SOURCE_MENTION = re.compile(r'(?<!\d)(?:104|518|1111)(?!\d)')
+# A source number standing alone, not an address, wage or other quantity ("104號"、"時薪518"、"A1111B").
+_SOURCE_MENTION = re.compile(r'(?<![0-9a-z$.])(?<!薪)(?:104|518|1111)(?![0-9a-z.]|\s*(?:號|号|巷|弄|樓|楼|路|街|段|區|元|塊|萬|千|百|個|天|年|月|小時|分))')
 
 
 def requested_sources(arguments, enabled, user_text, continuation=False):
@@ -34,7 +35,8 @@ def requested_sources(arguments, enabled, user_text, continuation=False):
     keeps its saved sources, since its cursor has no position for a newly added one.
     """
     requested = list(arguments.sources)
-    if not continuation and ('sources' not in arguments.model_fields_set or not _SOURCE_MENTION.search(user_text or '')):
+    text = unicodedata.normalize('NFKC', user_text or '').casefold()
+    if not continuation and ('sources' not in arguments.model_fields_set or not _SOURCE_MENTION.search(text)):
         requested += [source for source in enabled if source not in requested]
     return requested
 

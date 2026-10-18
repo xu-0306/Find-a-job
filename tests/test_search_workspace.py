@@ -205,10 +205,15 @@ class WorkspaceChecks(unittest.TestCase):
             self.script(('search_jobs', {'criteria': {'keyword': f'條件{batch}'}, 'exclude_companies': [f'公司{batch}-{i}' for i in range(20)]}), '好。')
             self.chat(f'exclude-{batch}')
         self.assertEqual(len(self.state()['excluded_companies']), 40)
-        self.script(('search_jobs', {'criteria': {'keyword': '條件2'}, 'exclude_companies': [f'公司2-{i}' for i in range(11)]}))
+        # Spelling variants of one company keep the first name and do not count again.
+        self.script(('search_jobs', {'criteria': {'keyword': '變體'}, 'exclude_companies': ['公司0-0', '公司0 0', '公司0／0', 'Meta', 'Meta-', 'META--']}), '好。')
+        self.chat('exclude-variants')
+        self.assertEqual(len(self.state()['excluded_companies']), 41)
+        self.assertEqual(self.state()['excluded_companies'][-1], 'Meta')
+        self.script(('search_jobs', {'criteria': {'keyword': '條件2'}, 'exclude_companies': [f'公司2-{i}' for i in range(10)]}))
         output = events(self.client.post('/api/chat', json={'request_id': 'exclude-2', 'text': '再排除'}))
         self.assertEqual(next(data['code'] for event, data in output if event == 'error'), 'too_many_exclusions')
-        self.assertEqual(len(self.state()['excluded_companies']), 40)
+        self.assertEqual(len(self.state()['excluded_companies']), 41)
 
     def test_recommendations_replace_shortlist_and_remove_jobs(self):
         self.configure()
@@ -255,7 +260,13 @@ class WorkspaceChecks(unittest.TestCase):
         self.chat('page-2')
         expected = {'shortlist': [beta], 'removed': [{'job_id': alpha, 'by': 'agent', 'reason': '外派'}]}
         latest = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2}).json()
+        searches = latest['conversation_state'].pop('searches')
         self.assertEqual(latest['conversation_state'], expected)
+        # The first page also carries the searches, although none of its messages hold the jobs event.
+        self.assertFalse(any(e['event'] == 'jobs' for m in latest['items'] for e in m['content']['events']))
+        self.assertEqual([search['search_id'] for search in searches], [first['search_id']])
+        self.assertEqual([job['id'] for job in searches[0]['items']], [alpha, beta])
+        self.assertNotIn('_continuation', searches[0])
         # An older page, which only holds the first recommendation, still reports the current list.
         older = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2, 'cursor': latest['next_cursor']}).json()
         self.assertFalse(any(e['event'] == 'recommendations' and e['data']['items'][0]['job_id'] == beta
