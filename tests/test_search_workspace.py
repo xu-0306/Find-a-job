@@ -306,6 +306,9 @@ class WorkspaceChecks(unittest.TestCase):
         expected = {'shortlist': [beta], 'removed': [{'job_id': alpha, 'by': 'agent', 'reason': '外派'}]}
         latest = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2}).json()
         searches = latest['conversation_state'].pop('searches')
+        recommendations = latest['conversation_state'].pop('recommendations')
+        self.assertEqual(recommendations, [{'job_id': beta, 'reasons': [], 'concerns': [], 'unknowns': [],
+                                          'job': first['items'][1]}])
         self.assertEqual(latest['conversation_state'], expected)
         # The first page also carries the searches, although none of its messages hold the jobs event.
         self.assertFalse(any(e['event'] == 'jobs' for m in latest['items'] for e in m['content']['events']))
@@ -318,6 +321,61 @@ class WorkspaceChecks(unittest.TestCase):
                              for m in older['items'] for e in m['content']['events']))
         self.assertEqual(older['conversation_state'], expected)
         self.assertNotIn('conversation_state', self.client.get('/api/messages').json())
+
+    def test_first_page_keeps_current_recommendations_outside_loaded_messages(self):
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = (item['id'] for item in first['items'])
+        self.script(('present_job_recommendations', {'items': [
+            {'job_id': alpha, 'reasons': ['已被取代']}, {'job_id': beta, 'reasons': ['舊理由']}]}), '舊精選。')
+        self.chat('recommend-old')
+        self.script(('present_job_recommendations', {'items': [
+            {'job_id': beta, 'reasons': ['符合技能'], 'concerns': ['需要輪班'], 'unknowns': ['薪資未知']},
+            {'job_id': alpha, 'reasons': ['稍後移出']}]}), '新精選。')
+        output = self.chat('recommend-current')
+        expected = next(data['items'] for name, data in output if name == 'recommendations')
+        requests = self.script('普通回答。')
+        self.chat('plain-after-recommendation')
+        model_working = next(json.loads(item['content'].split('\n', 1)[1]) for item in json.loads(requests[0])['input']
+                             if isinstance(item.get('content'), str) and '"shortlist"' in item['content'])
+        self.assertEqual(set(model_working), {'shortlist', 'excluded_companies', 'removed', 'dismissed_ids'})
+        self.assertNotIn('recommendations', model_working)
+        latest = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 2}).json()
+        self.assertFalse(any(e['event'] == 'recommendations' for m in latest['items'] for e in m['content']['events']))
+        self.assertEqual(latest['conversation_state']['recommendations'], expected)
+        self.assertEqual([item['job_id'] for item in expected], latest['conversation_state']['shortlist'])
+        # Removing only retains beta's original recommendation; it does not borrow older notes.
+        self.script(('present_job_recommendations', {'removed': [{'job_id': alpha, 'reason': '不適合'}]}), '已移出。')
+        self.chat('remove-alpha')
+        current = self.client.get('/api/messages', params={'conversation_id': 'legacy', 'limit': 1}).json()['conversation_state']
+        self.assertEqual(current['recommendations'], expected[:1])
+        self.assertEqual(current['shortlist'], [beta])
+        # Company exclusions also remove recommendations from the effective shortlist.
+        self.script(('search_jobs', {'criteria': {'keyword': '下一批'}, 'exclude_companies': ['來源公司 beta']}), '排除公司。')
+        self.chat('exclude-beta')
+        current = self.client.get('/api/messages', params={'conversation_id': 'legacy'}).json()['conversation_state']
+        self.assertEqual(current['recommendations'], [])
+        self.assertEqual(current['shortlist'], [])
+
+    def test_legacy_recommendation_items_and_edited_replacement(self):
+        self.configure()
+        first, _ = self.first()
+        alpha, beta = (item['id'] for item in first['items'])
+        def saved(*recommendations):
+            self.store.save_reply('first', {'text': '', 'status': 'completed', 'events': [
+                {'event': 'jobs', 'data': first},
+                *[{'event': 'recommendations', 'data': data} for data in recommendations]]})
+            return self.client.get('/api/messages', params={'conversation_id': 'legacy'}).json()['conversation_state']
+        old = {'items': [{'job_id': alpha, 'reasons': ['過期']}, {'job_id': beta, 'reasons': ['過期']} ]}
+        legacy = {'items': [{'job_id': beta}]}
+        current = saved(old, legacy)
+        self.assertEqual(current['recommendations'], [{'job_id': beta, 'reasons': [], 'concerns': [], 'unknowns': []}])
+        current = saved(old, {'items': [], 'replace': True})
+        self.assertEqual(current['recommendations'], [])
+        # Replacing the saved event during an edit drops its previous reasons.
+        current = saved({'items': [{'job_id': alpha, 'unknowns': ['新未知']} ]})
+        self.assertEqual(current['recommendations'], [{'job_id': alpha, 'reasons': [], 'concerns': [], 'unknowns': ['新未知']}])
+        self.assertEqual(saved()['recommendations'], [])
 
     def test_recommendations_reject_unknown_or_empty_changes(self):
         self.configure()

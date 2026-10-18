@@ -21,8 +21,10 @@ const searchStates = new Map();
 // The conversation's working list, replayed from jobs/recommendations events in
 // order with the same rules as Store.conversation_state: the latest
 // recommendation replaces the shortlist, and removed jobs leave the main list.
-const conversationWork = {shortlist: [], removed: new Map()};
-function resetConversationWork() { conversationWork.shortlist = []; conversationWork.removed.clear(); }
+const conversationWork = {shortlist: [], removed: new Map(), recommendations: null};
+function resetConversationWork() {
+  conversationWork.shortlist = []; conversationWork.removed.clear(); conversationWork.recommendations = null;
+}
 // The server replays the whole conversation in order; loaded pages and edits only approximate it.
 function applyConversationWork(state) {
   if (!state || typeof state !== "object") return;
@@ -30,6 +32,17 @@ function applyConversationWork(state) {
   conversationWork.removed.clear();
   for (const item of Array.isArray(state.removed) ? state.removed : []) {
     if (item?.job_id) conversationWork.removed.set(String(item.job_id), {by: String(item.by || "agent"), reason: String(item.reason || "")});
+  }
+  if (Array.isArray(state.recommendations)) conversationWork.recommendations = state.recommendations;
+  // Keep the first page's authoritative notes when older pages replay obsolete recommendation events.
+  if (conversationWork.recommendations) {
+    for (const search of searchStates.values()) search.recommendations.clear();
+    for (const recommendation of conversationWork.recommendations) {
+      const id = String(recommendation?.job_id || "");
+      if (!id || !conversationWork.shortlist.includes(id) || conversationWork.removed.has(id)) continue;
+      const owner = [...searchStates.values()].find(search => search.jobs.has(id));
+      if (owner) owner.recommendations.set(id, {...recommendation, job_id: id});
+    }
   }
 }
 // Replays the conversation's recent searches (oldest first) into the panel, whichever messages are loaded.

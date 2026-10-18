@@ -376,7 +376,7 @@ class Store:
         rows = db.execute("""SELECT e.value FROM messages m, json_each(m.content_json,'$.events') e
             WHERE m.conversation_id=? AND m.role='assistant' AND json_extract(e.value,'$.event') IN ('jobs','recommendations')
             ORDER BY m.rowid,CAST(e.key AS INTEGER)""", (conversation_id,)).fetchall()
-        companies, shortlist, removed = [], [], {}
+        companies, shortlist, removed, recommendations = [], [], {}, {}
         for row in rows:
             event = json.loads(row[0])
             data = event.get('data') or {}
@@ -389,6 +389,16 @@ class Store:
                 # Events saved before `replace` existed always carried a non-empty replacement list.
                 if data.get('replace', bool(ids)):
                     shortlist = list(dict.fromkeys(ids))
+                    recommendations = {}
+                    for item in data.get('items', []):
+                        if not item.get('job_id'):
+                            continue
+                        recommendation = {'job_id': item['job_id'], **{
+                            key: item[key] if isinstance(item.get(key), list) else []
+                            for key in ('reasons', 'concerns', 'unknowns')}}
+                        if isinstance(item.get('job'), dict):
+                            recommendation['job'] = item['job']
+                        recommendations[item['job_id']] = recommendation
                 for item in data.get('removed', []):
                     removed[item['job_id']] = {'job_id': item['job_id'], 'by': 'agent', 'reason': item.get('reason', '')}
                 for job_id in ids:
@@ -398,7 +408,8 @@ class Store:
                 AND json_extract(content_json,'$.search_dismissed') IS NOT NULL ORDER BY rowid""", (conversation_id,)):
             for ids in json.loads(content).get('search_dismissed', {}).values():
                 dismissed.extend(ids)
-        return {'shortlist': [job_id for job_id in shortlist if job_id not in removed],
+        shortlist = [job_id for job_id in shortlist if job_id not in removed]
+        return {'shortlist': shortlist, 'recommendations': [recommendations[job_id] for job_id in shortlist],
                 'excluded_companies': companies, 'removed': list(removed.values()),
                 'dismissed_ids': list(dict.fromkeys(dismissed))}
 

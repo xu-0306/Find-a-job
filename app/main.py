@@ -1374,6 +1374,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         result['conversation_state'] = {key: working[key] for key in ('shortlist', 'removed')}
         if searches is not None:
             result['conversation_state']['searches'] = searches
+            result['conversation_state']['recommendations'] = working['recommendations']
         return result
 
     @app.patch('/api/searches/{search_id}')

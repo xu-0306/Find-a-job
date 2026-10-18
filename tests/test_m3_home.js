@@ -1850,6 +1850,90 @@ async function testHistoryPagesUseTheServerWorkingList() {
   assert.equal(home.elements.get("search-results-panel").hidden, true);
 }
 
+async function testUnrelatedEditKeepsRecommendationReasons() {
+  const home = createContext(); await settle();
+  const search = {search_id: "kept-search", items: [{id: "kept-job", title: "合成職缺", source: "104"}]};
+  const recommendation = {job_id: "kept-job", reasons: ["符合技能"], concerns: ["需要輪班"], unknowns: ["薪資待確認"]};
+  const reply = home.context.chatMessage("assistant", "", "completed", [
+    {event: "jobs", data: search}, {event: "recommendations", data: {items: [recommendation]}}]);
+  const user = home.context.chatMessage("user", "無關問題", "completed", [], [], null, "unrelated", 501);
+  const answer = home.context.chatMessage("assistant", "普通回答", "completed", [], [], null, "unrelated", 502);
+  home.elements.get("chat-list").replaceChildren(reply, user, answer);
+  const state = vm.runInContext('searchStates.get("kept-search")', home.context);
+  const api = home.context.api;
+  let refreshes = 0;
+  home.context.api = async (path, options) => {
+    if (!path.startsWith("/api/messages")) return api(path, options);
+    refreshes++;
+    return {items: [], next_cursor: null, conversation_state: {
+      searches: [search], shortlist: ["kept-job"], removed: [], recommendations: [recommendation]}};
+  };
+  await all(user, item => item.className === "chat-message-edit")[0].click();
+  home.state.input.value = "修改無關問題";
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(home.state.chatPayloads.at(-1).edit_message_id, "501");
+  assert.equal(refreshes, 1, "completing an edit refreshes the working list");
+  assert.equal(vm.runInContext('searchStates.get("kept-search")', home.context), state);
+  assert.equal(vm.runInContext('chatSearchMetadata', home.context).get(reply), state);
+  assert.equal(JSON.stringify(state.recommendations.get("kept-job")), JSON.stringify(recommendation));
+  const panel = home.elements.get("search-results-list");
+  for (const note of [...recommendation.reasons, ...recommendation.concerns, ...recommendation.unknowns]) {
+    assert.ok(panel.textContent.includes(note), note);
+  }
+}
+
+async function testUnloadedRecommendationsSurviveReloadAndOlderPages() {
+  const home = createContext(); await settle();
+  const searches = [{search_id: "first-rec", items: [{id: "a", title: "最新標題", source: "104"}]},
+                    {search_id: "second-rec", items: [{id: "b", title: "另一職缺", source: "518"}]}];
+  const recommendations = [{job_id: "b", reasons: ["跨批次適合"], concerns: ["需搬家"], unknowns: ["工時未知"]},
+                           {job_id: "a", reasons: ["目前理由"], job: {id: "a", title: "舊事件標題"}}];
+  const older = {role: "assistant", content: {text: "", status: "completed", events: [
+    {event: "recommendations", data: {items: [{job_id: "a", reasons: ["過期分頁理由"]}]}}]}};
+  home.context.api = async path => path.includes("cursor=older")
+    ? {items: [older], next_cursor: null, conversation_state: {shortlist: ["b", "a"], removed: []}}
+    : {items: [{role: "assistant", content: {text: "普通回答", events: []}}], next_cursor: "older",
+       conversation_state: {searches, recommendations, shortlist: ["b", "a"], removed: []}};
+  await home.context.loadMessages(false, "conversation-rec");
+  const first = vm.runInContext('searchStates.get("first-rec")', home.context);
+  const second = vm.runInContext('searchStates.get("second-rec")', home.context);
+  assert.equal(first.recommendations.get("a")?.reasons[0], "目前理由");
+  assert.equal(second.recommendations.get("b")?.unknowns[0], "工時未知");
+  assert.equal(first.recommendations.has("b"), false, "recommendations stay on their owning search");
+  assert.equal(first.jobs.get("a").title, "最新標題", "recommendation snapshots do not overwrite refreshed jobs");
+  const panel = home.elements.get("search-results-list");
+  for (const note of ["跨批次適合", "需搬家", "工時未知", "目前理由"]) assert.ok(panel.textContent.includes(note), note);
+  await home.context.loadMessages(true);
+  assert.equal(first.recommendations.get("a")?.reasons[0], "目前理由", "older pages cannot replace the current reasons");
+  assert.doesNotMatch(panel.textContent, /過期分頁理由/);
+}
+
+async function testReplacedRecommendationsDoNotSurviveRebuild() {
+  const home = createContext(); await settle();
+  const search = {search_id: "replaced-rec", items: [{id: "a"}, {id: "b"}, {id: "c"}]};
+  const old = {items: [{job_id: "a", reasons: ["已取代理由"]}, {job_id: "b", reasons: ["同職缺舊理由"]},
+                      {job_id: "c", reasons: ["已移出理由"]}]};
+  let working = {searches: [search], shortlist: ["b"], removed: [{job_id: "c", reason: "不適合"}],
+                 recommendations: [{job_id: "b", reasons: ["新版理由"]}]};
+  home.context.api = async () => ({items: [{role: "assistant", content: {text: "", status: "completed",
+    events: [{event: "recommendations", data: old}]}}], next_cursor: null, conversation_state: working});
+  await home.context.loadMessages(false, "conversation-replaced");
+  const state = vm.runInContext('searchStates.get("replaced-rec")', home.context);
+  assert.deepEqual([...state.recommendations.keys()], ["b"]);
+  assert.equal(state.recommendations.get("b")?.reasons[0], "新版理由");
+  assert.doesNotMatch(home.elements.get("search-results-list").textContent, /已取代理由|同職缺舊理由|已移出理由/);
+  // Editing away the recommendation yields no reasons, even on the same still-owned job.
+  working = {...working, shortlist: [], recommendations: []};
+  await home.context.refreshConversationWork();
+  assert.equal(vm.runInContext('searchStates.get("replaced-rec")', home.context), state);
+  assert.equal(state.recommendations.size, 0);
+  // A legacy item with missing notes and job data is still a valid recommendation.
+  working = {...working, shortlist: ["a"], recommendations: [{job_id: "a"}]};
+  await home.context.refreshConversationWork();
+  assert.deepEqual([...state.recommendations.keys()], ["a"]);
+  assert.doesNotMatch(home.elements.get("search-results-list").textContent, /已取代理由|新版理由/);
+}
+
 async function testEditedContinuationRebuildsTheSameSearch() {
   const home = createContext(); await settle();
   const first = {search_id: "edit-search", items: [{id: "a"}], new_ids: ["a"], total_count: 1, can_continue: true};
@@ -2170,6 +2254,9 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   testSearchTitleIsNotRepeatedWhenUnlabelled();
   await testConversationWorkingListConverges();
   await testHistoryPagesUseTheServerWorkingList();
+  await testUnrelatedEditKeepsRecommendationReasons();
+  await testUnloadedRecommendationsSurviveReloadAndOlderPages();
+  await testReplacedRecommendationsDoNotSurviveRebuild();
   await testEditedContinuationRebuildsTheSameSearch();
   await testDelayedConversationRefreshIsDiscarded();
   await testOlderJobsKeepTheAuthoritativeSearchState();
@@ -2179,7 +2266,7 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 39 checks passed");
+  console.log("test_m3_home: 42 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
