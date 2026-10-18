@@ -70,6 +70,7 @@ function editModelProfile(profile = null) {
   form.elements.name.value = profile?.name || "";
   for (const key of modelConnectionFields)
     form.elements[key].value = profile ? profile[key] : $("#services").elements[key].value;
+  form.elements.llm_context_window.value = (profile ? profile.llm_context_window : Number($("#services").elements.llm_context_window.value)) || "";
   form.elements.llm_api_key.required = !profile;
   $("#model-profile-title").textContent = profile ? "編輯模型設定" : "新增模型設定";
   $("#model-profile-key-help").textContent = profile ? "已儲存金鑰不會顯示；留白保留原值，填入新金鑰即可替換。" : "請填入這組模型的金鑰。保存後可在列表按「套用」。";
@@ -101,6 +102,7 @@ $("#model-profile-form").addEventListener("submit", async event => {
   if (modelProfilesBusy) return;
   const form = event.currentTarget;
   const values = Object.fromEntries(new FormData(form));
+  values.llm_context_window = Number(values.llm_context_window) || 0;
   const ident = editingModelId;
   setModelProfilesBusy(true);
   $("#model-profile-editor-status").textContent = "正在保存…";

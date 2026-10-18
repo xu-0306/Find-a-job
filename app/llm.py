@@ -11,6 +11,11 @@ import httpx
 from .llm_wire import build_payload, decode_event
 from .store import encode
 
+# Providers report an over-long prompt with different codes and wording; these cover OpenAI-compatible,
+# Anthropic and common relay responses. Only the bounded error body is inspected and it is never shown to users.
+OVERFLOW_MARKERS = ('context_length_exceeded', 'context length', 'context window', 'maximum context',
+                    'prompt is too long', 'too many tokens', 'input is too long', 'request_too_large')
+OVERFLOW_MESSAGE = '對話內容超過模型可處理的長度，精簡後仍無法送出；請開新對話，或在後台確認上下文視窗設定。'
 PROTOCOL_PATHS = {'responses': '/responses', 'chat_completions': '/chat/completions',
                   'anthropic_messages': '/messages'}
 
@@ -83,6 +88,14 @@ async def stream_model(client, settings, key, protocol, messages, tools, force_t
         async with client.stream('POST', endpoint(settings['llm_base_url'], protocol), json=payload, headers=headers) as response:
             if response.status_code != 200:
                 status = response.status_code
+                if status in (400, 413):
+                    body = b''
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > 8192:
+                            break
+                    if status == 413 or any(marker in body.decode('utf-8', 'replace').lower() for marker in OVERFLOW_MARKERS):
+                        raise LLMError('context_overflow', OVERFLOW_MESSAGE)
                 code = 'authentication_failed' if status in (401, 403) else 'rate_limited' if status == 429 else 'provider_http_error'
                 raise LLMError(code, f'模型服務回傳 HTTP {status}（{protocol}），請在後台檢查設定。', status in (404, 405, 501),
                                retryable=status == 429 or (500 <= status < 600 and status != 501))

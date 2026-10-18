@@ -355,8 +355,19 @@ def _call_event(ctx: dict, key: object, call_id: object, name: object, arguments
     return [{"kind": "tool_call", "id": call_id, "name": name, "arguments": arguments}]
 
 
-def _provider_error(ctx: dict) -> list[dict]:
+def _provider_error(ctx: dict, event: object = None) -> list[dict]:
+    if _is_overflow(event):
+        return _error(ctx, "context_overflow", "對話內容超過模型可處理的長度。")
     return _error(ctx, "provider_error", "模型服務發生錯誤，請稍後再試。")
+
+
+def _is_overflow(event: object) -> bool:
+    # Only the structured OpenAI-style code is trusted inside a stream; error text is not parsed here.
+    if not isinstance(event, Mapping):
+        return False
+    response = event.get("response")
+    candidates = [event, event.get("error"), response.get("error") if isinstance(response, Mapping) else None]
+    return any(isinstance(item, Mapping) and item.get("code") == "context_length_exceeded" for item in candidates)
 
 
 def _response_call(
@@ -441,6 +452,8 @@ def _decode_responses(event: object, ctx: dict) -> list[dict]:
         if item_type != "function_call":
             return []
         return _response_call(ctx, output_index, item=item)
+    if event_type == "response.failed" and _is_overflow(event):
+        return _provider_error(ctx, event)
     if event_type in {"response.incomplete", "response.failed", "response.cancelled"}:
         return _error(ctx, "incomplete", "模型未完成回覆。")
     if event_type in {"response.refusal.delta", "response.refusal.done"}:
@@ -451,7 +464,7 @@ def _decode_responses(event: object, ctx: dict) -> list[dict]:
             return _error(ctx, "incomplete", "模型未完成回覆。")
         return _done(ctx)
     if event_type == "error":
-        return _provider_error(ctx)
+        return _provider_error(ctx, event)
     # Lifecycle, usage and content bookkeeping events are optional for this
     # codec; only text and completed function calls cross the seam.
     return []
@@ -488,7 +501,7 @@ def _decode_chat(event: object, ctx: dict) -> list[dict]:
         raise _invalid()
     event = dict(event)
     if "error" in event or event.get("type") == "error":
-        return _provider_error(ctx)
+        return _provider_error(ctx, event)
     choices = event.get("choices")
     if choices is None:
         return []
@@ -587,8 +600,10 @@ def _decode_anthropic(event: object, ctx: dict) -> list[dict]:
         stop_reason = delta.get("stop_reason")
         if stop_reason is not None:
             stop_reason = _string(stop_reason)
-            if stop_reason in {"refusal", "model_context_window_exceeded"}:
-                return _error(ctx, "refusal" if stop_reason == "refusal" else "incomplete", "模型拒絕此請求。" if stop_reason == "refusal" else "模型未完成回覆。")
+            if stop_reason == "refusal":
+                return _error(ctx, "refusal", "模型拒絕此請求。")
+            if stop_reason == "model_context_window_exceeded":
+                return _error(ctx, "context_overflow", "對話內容超過模型可處理的長度。")
             if stop_reason in {"max_tokens"}:
                 return _error(ctx, "incomplete", "模型未完成回覆。")
         return []

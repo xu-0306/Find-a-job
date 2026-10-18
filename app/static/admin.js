@@ -830,6 +830,7 @@ function renderLLMSettings(settings) {
   const form = $("#services");
   for (const key of ["llm_base_url", "llm_model"]) form.elements[key].value = settings[key] || "";
   form.elements.llm_protocol.value = settings.llm_protocol || "auto";
+  form.elements.llm_context_window.value = settings.llm_context_window || "";
   form.elements.llm_api_key.value = "";
   form.elements.clear_llm_api_key.checked = false;
   $('[data-status=llm_api_key]').textContent = settings.llm_api_key.configured ? "已設定 ••••••••" : "尚未設定";
@@ -905,7 +906,7 @@ formAction($("#services"), async () => {
   const vapid_subject = form.elements.vapid_subject.value.trim();
   if (!validVapidSubject(vapid_subject)) throw new Error("VAPID 聯絡 URI 必須是 mailto 有效 email 或 HTTPS URL。");
   const values = {llm_base_url: form.elements.llm_base_url.value.trim(), llm_model: form.elements.llm_model.value.trim(),
-    llm_protocol: form.elements.llm_protocol.value, admin_local_only: form.elements.admin_local_only.checked,
+    llm_protocol: form.elements.llm_protocol.value, llm_context_window: Number(form.elements.llm_context_window.value) || 0, admin_local_only: form.elements.admin_local_only.checked,
     source_518_enabled: form.elements.source_518_enabled.getAttribute("aria-checked") === "true",
     source_1111_enabled: form.elements.source_1111_enabled.getAttribute("aria-checked") === "true", vapid_subject,
     search_provider: form.elements.search_provider.value || null,

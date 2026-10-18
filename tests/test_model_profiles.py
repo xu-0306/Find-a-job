@@ -105,6 +105,30 @@ class ModelProfileChecks(unittest.TestCase):
             kwargs = {"json": CONNECTION} if method == "put" else {}
             self.assertEqual(getattr(self.client, method)(BASE + "/" + second["id"] + suffix, **kwargs).status_code, 404)
 
+    def test_context_window_is_validated_saved_and_applied_without_retesting(self):
+        for window in (1000, 31_999, 2_000_001, -1):
+            with self.subTest(window=window):
+                self.assertEqual(self.client.post(BASE, json=CONNECTION | {"llm_context_window": window}).status_code, 422)
+                self.assertEqual(self.client.put("/api/admin/settings", json={"llm_context_window": window}).status_code, 422)
+        large = self.create(llm_context_window=1_000_000)
+        self.assertEqual(large["llm_context_window"], 1_000_000)
+        default = self.create(llm_api_key="synthetic-key-b")
+        self.assertEqual(default["llm_context_window"], 0, "0 means the built-in default budget")
+        self.client.post(BASE + "/" + large["id"] + "/apply")
+        self.assertEqual(self.stored("services")["llm_context_window"], 1_000_000)
+        signature = llm.signature(self.stored("services"), CONNECTION["llm_api_key"])
+        self.assertEqual(self.client.put("/api/admin/settings", json={"llm_context_window": 500_000}).json()["llm_context_window"], 500_000)
+        self.assertEqual(llm.signature(self.stored("services"), CONNECTION["llm_api_key"]), signature,
+                         "changing the window does not invalidate the connection test")
+        # A profile saved before this setting existed applies the default.
+        with self.store.connect(write=True) as db:
+            profiles = self.store.get(db, "model_profiles")
+            del profiles[1]["llm_context_window"]
+            self.store.put(db, "model_profiles", profiles)
+        self.assertEqual(self.client.get(BASE).json()["items"][1]["llm_context_window"], 0)
+        self.assertEqual(self.client.post(BASE + "/" + default["id"] + "/apply").status_code, 200)
+        self.assertEqual(self.stored("services")["llm_context_window"], 0)
+
     def test_active_state_includes_key_even_with_identical_model_url_and_protocol(self):
         a, b = self.create(), self.create(llm_api_key="synthetic-key-b")
         self.client.post(BASE + "/" + b["id"] + "/apply")

@@ -14,6 +14,15 @@ class LLMSettings(Input):
     llm_base_url: str | None = Field(default=None, max_length=2000)
     llm_model: str | None = Field(default=None, max_length=200)
     llm_protocol: Protocol | None = None
+    # Tokens the model accepts; 0 means the default budget in context_budget.
+    llm_context_window: int | None = Field(default=None, ge=0, le=2_000_000)
+
+    @field_validator("llm_context_window")
+    @classmethod
+    def valid_window(cls, value):
+        if value and value < 32_000:
+            raise ValueError("上下文視窗須為 0（預設）或 32,000～2,000,000")
+        return value
 
     @field_validator("llm_base_url")
     @classmethod
@@ -35,6 +44,7 @@ class ProfileInput(LLMSettings):
     llm_base_url: str = Field(min_length=1, max_length=2000)
     llm_model: str = Field(min_length=1, max_length=200)
     llm_protocol: Protocol = "auto"
+    llm_context_window: int = Field(default=0, ge=0, le=2_000_000)
     llm_api_key: str = Field(default="", max_length=4096)
 
 
@@ -56,6 +66,7 @@ class ProfileCollection(Input):
 def profile_view(profile, settings, key):
     # A profile is identified by its UUID, never its model or provider name.
     return {**{field: profile[field] for field in ("id", "name", *CONNECTION_FIELDS)},
+            "llm_context_window": profile.get("llm_context_window", 0),
             "llm_api_key": {"configured": bool(profile["llm_api_key"]), "mask": "••••••••"},
             "is_active": all(profile[field] == settings.get(field) for field in CONNECTION_FIELDS)
                          and profile["llm_api_key"] == key}

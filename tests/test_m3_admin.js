@@ -709,7 +709,7 @@ async function testSourceSwitchesLoadToggleAndSave() {
   harness.context.loadModelProfiles = async () => {};
   const servicesSave = script.match(/^formAction\(\$\("#services"\), async \(\) => \{[\s\S]*?^\}\);/m);
   assert.ok(servicesSave, "services save handler should be extractable");
-  const names = ["llm_base_url", "llm_model", "llm_protocol", "vapid_subject", "search_provider", "admin_local_only",
+  const names = ["llm_base_url", "llm_model", "llm_protocol", "llm_context_window", "vapid_subject", "search_provider", "admin_local_only",
     "source_518_enabled", "source_1111_enabled", "llm_api_key", "brave_api_key", "tavily_api_key", "clear_llm_api_key", "clear_brave_api_key", "clear_tavily_api_key"];
   const elements = Object.fromEntries(names.map(name => [name, {value: "", checked: false}]));
   for (const name of ["source_518_enabled", "source_1111_enabled"]) {
@@ -770,6 +770,16 @@ async function testSourceSwitchesLoadToggleAndSave() {
       assertSwitch(name, !enabled);
     }
   }
+  // The context window is sent as a number (blank means the 0 default) and rendered back from settings.
+  elements.llm_context_window.value = "500000";
+  await listeners.submit({preventDefault() {}});
+  assert.equal(saved.llm_context_window, 500000);
+  elements.llm_context_window.value = "";
+  await listeners.submit({preventDefault() {}});
+  assert.equal(saved.llm_context_window, 0);
+  stored.llm_context_window = 256000; await harness.context.loadSettings();
+  assert.equal(elements.llm_context_window.value, 256000);
+  delete stored.llm_context_window;
   form.reset();
   assertSwitch("source_518_enabled", true);
   assertSwitch("source_1111_enabled", false);

@@ -34,7 +34,7 @@ from .model_profiles import LLMSettings, ProfileInput, StoredProfile, CONNECTION
 
 STATIC = Path(__file__).parent / "static"
 SECRET_FIELDS = ("llm_api_key", "brave_api_key", "tavily_api_key")
-DEFAULT_SETTINGS = {"llm_base_url": "", "llm_model": "", "llm_protocol": "auto", "admin_local_only": True, "source_518_enabled": True, "source_1111_enabled": False, "vapid_subject": ""}
+DEFAULT_SETTINGS = {"llm_base_url": "", "llm_model": "", "llm_protocol": "auto", "llm_context_window": 0, "admin_local_only": True, "source_518_enabled": True, "source_1111_enabled": False, "vapid_subject": ""}
 
 
 async def finish_file_operation(function, *args, **kwargs):
@@ -668,6 +668,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             _, profile = find_model_profile(db, ident)
             services = DEFAULT_SETTINGS | store.get(db, "services", {})
             services.update({field: profile[field] for field in CONNECTION_FIELDS})
+            # Profiles saved before the context setting existed use the default budget.
+            services["llm_context_window"] = profile.get("llm_context_window", 0)
             store.put(db, "services", services)
             store.put(db, "llm_api_key", profile["llm_api_key"])
             return settings_view(store, db)

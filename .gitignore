@@ -33,6 +33,7 @@
 !/tests/test_chat_retry.py
 !/tests/test_conversations.py
 !/tests/test_model_profiles.py
+!/tests/test_context_budget.py
 !/tests/test_m1.py
 !/tests/test_m2_cards.js
 !/tests/test_m2_chat_sse.js
