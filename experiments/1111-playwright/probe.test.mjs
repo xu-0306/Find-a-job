@@ -3,7 +3,7 @@ import { after, before, test } from 'node:test';
 import { mkdtemp, readFile, rm, rmdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { failureStatus, readDetail, runProbe, searchUrl, validateDetail, validateSearch } from './probe.mjs';
+import { failureStatus, readDetail, readSearch, runProbe, searchUrl, validateDetail, validateSearch } from './probe.mjs';
 
 const driverName = process.env.PROBE_DRIVER || 'playwright';
 assert.ok(['playwright', 'patchright'].includes(driverName), 'unknown PROBE_DRIVER');
@@ -27,30 +27,58 @@ before(async () => {
 after(async () => { await browser?.close(); });
 
 // Synthetic DOM based on observed anchors, headings and pagination; never visits the live site.
-function sourceFixture(number, { repeat = false, fullPage = false } = {}) {
+function sourceFixture(number, { repeat = false, fullPage = false, richFields = false, invalidFields = false } = {}) {
   const ids = number === 1 || repeat ? (fullPage ? ['101', '103', '105'] : ['101'])
     : (fullPage ? ['202', '204'] : ['202']);
   const limit = fullPage ? 3 : 1;
   const totalCount = fullPage ? 5 : 2;
-  return { pagination: { page: number, limit, totalCount, totalPage: Math.ceil(totalCount / limit) }, hits: ids.map(jobId => ({ jobId })) };
+  const fields = {
+    '101': { salary: '面議（經常性薪資達4萬元或以上）', workCity: { name: '合成市北區' } },
+    '103': { salary: '月薪 35,000元~50,000元', workCity: { name: '合成市南區' } },
+    '105': { salary: '月薪 50,000元以上', workCity: { name: '合成市東區' } },
+    '202': { salary: '時薪 220元~400元', workCity: { name: '合成市西區' } },
+    '204': { salary: '論件計酬 5,000元~50,000元', workCity: { name: '合成市中央區' } },
+  };
+  if (invalidFields) {
+    fields['101'] = { workCity: { name: '合成市北區' } };
+    fields['103'] = { salary: '月薪 35,000元~50,000元', workCity: null };
+    fields['105'] = { salary: '月薪 50,000元以上', workCity: { name: 42 } };
+    fields['202'] = { salary: '時薪 220元~400元', workCity: { name: 'x'.repeat(501) } };
+  }
+  return { pagination: { page: number, limit, totalCount, totalPage: Math.ceil(totalCount / limit) },
+    hits: ids.map(jobId => ({ jobId, ...(richFields ? fields[jobId] : {}) })) };
 }
 
 function nuxtFixture({ pagination, hits }) {
   const values = [{ apiJob: 1 }, { result: 2 }, { pagination: 3, hits: 8 },
     { page: 4, limit: 5, totalCount: 6, totalPage: 7 },
     pagination.page, pagination.limit, pagination.totalCount, pagination.totalPage, []];
-  for (const { jobId } of hits) {
+  for (const hit of hits) {
+    const { jobId } = hit;
     const ref = values.length;
     values[8].push(ref);
-    values.push({ jobId: ref + 1 }, jobId);
+    const record = { jobId: ref + 1 };
+    values.push(record, jobId);
+    if (hit.salary !== undefined) { record.salary = values.length; values.push(hit.salary); }
+    if (hit.workCity !== undefined) {
+      record.workCity = values.length;
+      if (hit.workCity === null) values.push(null);
+      else {
+        const city = {};
+        values.push(city);
+        if (hit.workCity.name !== undefined) { city.name = values.length; values.push(hit.workCity.name); }
+      }
+    }
   }
   return JSON.stringify(values);
 }
 
-function searchFixture(number, { repeat = false, wrongQuery = false, delayed = false, missingCompany = false, fullPage = false, neverComplete = false, responseMetadata = false } = {}) {
-  const id = number === 1 || repeat ? '101' : '202';
+function searchFixture(number, { repeat = false, wrongQuery = false, delayed = false, missingCompany = false, fullPage = false,
+  neverComplete = false, responseMetadata = false } = {}) {
   const source = sourceFixture(number, { repeat, fullPage });
-  const extraCards = source.hits.slice(1).map(({ jobId }) => '<div class="job-card__content"><a href="/job/' + jobId + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789" title="測試公司"><h2>測試公司</h2></a></div>').join('');
+  const cardIds = source.hits.map(({ jobId }) => jobId);
+  const id = cardIds[0] || (number === 1 || repeat ? '101' : '202');
+  const extraCards = cardIds.slice(1).map(jobId => '<div class="job-card__content"><a href="/job/' + jobId + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789" title="測試公司"><h2>測試公司</h2></a></div>').join('');
   return `<title>測試搜尋</title><h1>${wrongQuery ? '別的工作' : '採購'} 全部工作職缺</h1>
     <input placeholder="工作職稱、公司名、技能專長..." value="採購">
     <div class="job-card__content"><a href="/job/${id}?mid=searchlist"><h2>採購 ${id}</h2></a>
@@ -204,6 +232,82 @@ test('waits for every source ID, including a shorter last page and an API update
   assert.deepEqual(report.pages.map(p => p.completeness.expectedCount), [3, 2]);
   assert.deepEqual(report.pages.map(p => p.completeness.source), ['html-ssr', 'search-response']);
   assert.ok(requests.includes('/api/v1/search/jobs/'));
+});
+
+async function readSearchFixture(source, { reverseCards = false, metadata = nuxtFixture(source) } = {}) {
+  const context = await browser.newContext();
+  try {
+    const hits = reverseCards ? [...source.hits].reverse() : source.hits;
+    const html = '<title>Synthetic search</title><h1>採購</h1>'
+      + '<input placeholder="工作職稱、公司名、技能專長..." value="採購">'
+      + hits.map(({ jobId }) => '<div class="job-card__content"><a href="/job/' + jobId
+        + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789"><h2>測試公司</h2></a></div>').join('')
+      + '<script id="__NUXT_DATA__" type="application/json">' + metadata + '</script>';
+    await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: html }));
+    const page = await context.newPage();
+    const url = new URL(searchUrl('採購'));
+    url.searchParams.set('page', String(source.pagination.page));
+    await page.goto(url.href, { waitUntil: 'load' });
+    return await page.evaluate(readSearch);
+  } finally { await context.close(); }
+}
+
+test('readSearch maps synthetic SSR salary/location fields by jobId', async () => {
+  // Without readSearch field extraction, initialResult.fields is absent; positional mapping swaps reordered cards.
+  const expected = [
+    [['105', '月薪 50,000元以上', '合成市東區'], ['103', '月薪 35,000元~50,000元', '合成市南區'],
+      ['101', '面議（經常性薪資達4萬元或以上）', '合成市北區']],
+    [['204', '論件計酬 5,000元~50,000元', '合成市中央區'], ['202', '時薪 220元~400元', '合成市西區']],
+  ];
+  for (const number of [1, 2]) {
+    const source = sourceFixture(number, { fullPage: true, richFields: true });
+    const state = await readSearchFixture(source, { reverseCards: true });
+    assert.deepEqual(state.initialResult.ids, source.hits.map(hit => hit.jobId));
+    const fields = new Map(state.initialResult.fields.map(field => [field.id, field]));
+    assert.deepEqual(state.jobs.map(job => {
+      const field = fields.get(job.id);
+      return [job.id, field?.salary, field?.location];
+    }), expected[number - 1]);
+  }
+});
+
+test('readSearch omits invalid optional SSR fields and keeps complete metadata', async () => {
+  // Without null-safe fixture serialization, workCity:null throws before evaluation.
+  // Without optional-field validation, missing/null/non-string/501-char/blank values leak or abort metadata.
+  for (const number of [1, 2]) {
+    const state = await readSearchFixture(sourceFixture(number, { fullPage: true, richFields: true, invalidFields: true }));
+    const expected = number === 1
+      ? [{ id: '101', location: '合成市北區' }, { id: '103', salary: '月薪 35,000元~50,000元' },
+        { id: '105', salary: '月薪 50,000元以上' }]
+      : [{ id: '202', salary: '時薪 220元~400元' },
+        { id: '204', salary: '論件計酬 5,000元~50,000元', location: '合成市中央區' }];
+    assert.deepEqual(state.initialResult.fields, expected);
+    assert.doesNotThrow(() => validateSearch(state, searchUrl('採購'), number));
+  }
+  const hits = [], expected = [];
+  for (const invalid of [undefined, null, 42, 'x'.repeat(501), '   ']) {
+    const salaryId = String(301 + hits.length);
+    hits.push({ jobId: salaryId, salary: invalid, workCity: { name: '合成市' } });
+    expected.push({ id: salaryId, location: '合成市' });
+    const locationId = String(301 + hits.length);
+    hits.push({ jobId: locationId, salary: '時薪 220元', workCity: { name: invalid } });
+    expected.push({ id: locationId, salary: '時薪 220元' });
+  }
+  const source = { pagination: { page: 1, limit: hits.length, totalCount: hits.length, totalPage: 1 }, hits };
+  const state = await readSearchFixture(source);
+  assert.deepEqual(state.initialResult.fields, expected);
+  assert.doesNotThrow(() => validateSearch(state, searchUrl('採購'), 1));
+});
+
+test('readSearch rejects an out-of-range SSR jobId reference even when a card matches its number', async () => {
+  // With deref(jobId), 9999 becomes a valid ID matching the card and completeness incorrectly passes.
+  const source = { pagination: { page: 1, limit: 1, totalCount: 1, totalPage: 1 }, hits: [{ jobId: '9999' }] };
+  const values = JSON.parse(nuxtFixture(source));
+  values[values[8][0]].jobId = 9999;
+  const state = await readSearchFixture(source, { metadata: JSON.stringify(values) });
+  assert.deepEqual(state.initialResult.ids, ['undefined']);
+  assert.equal(state.initialResult.fields[0].id, 'undefined');
+  assert.throws(() => validateSearch(state, searchUrl('採購'), 1), /incomplete_page/);
 });
 
 test('a stable partial page never passes completeness', async () => {

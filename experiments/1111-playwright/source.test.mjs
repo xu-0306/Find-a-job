@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import './source.budget.test.mjs';
-import { before, after, test } from 'node:test';
+import { after, test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
 import { runSource, resolveArea, validateInput, SINGLE_AREA_MS, MAX_BUDGET_MS } from './source.mjs';
 let browser;
-before(async () => {
+async function prepareBrowser() {
+  if (browser) return;
   browser = await chromium.launch();
   // Initialize Chinese text/layout before the bounded checks; browser.close cleans up this page.
   const readyPage = await browser.newPage();
@@ -18,7 +19,7 @@ before(async () => {
       && heading.checkVisibility({ visibilityProperty: true, opacityProperty: true })
       && heading.getBoundingClientRect().width > 0;
   }, null, { timeout: 30000 });
-}, { timeout: 30000 });
+}
 after(async () => { await browser?.close(); });
 const catalogue = [
   { code: 100100, level: 2, name: '台北市' }, { code: 100101, level: 3, parentCode: 100100, name: '中正區' },
@@ -32,6 +33,7 @@ function nuxt(page, ids, total) {
   return JSON.stringify(values);
 }
 async function fixture(input, options = {}) {
+  await prepareBrowser();
   const context = await browser.newContext();
   const requests = [];
   let closed = false;
@@ -197,3 +199,95 @@ test('final stalled DOM read keeps prior validation failure without extending de
   await assert.rejects(waitForValidDom({ evaluate: () => new Promise(() => {}) }, () => {}, () => {}, 10), /dom_read_timeout/);
 });
 
+
+async function mockSearchMetadata(fields, apiHits) {
+  const ids = fields.map(field => field.id);
+  const jobs = [...ids].reverse().map(id => ({ id, title: 'Synthetic job', company: 'Synthetic company',
+    url: 'https://www.1111.com.tw/job/' + id, companyUrl: 'https://www.1111.com.tw/corp/123' }));
+  const pagination = { page: 1, limit: ids.length, totalCount: ids.length, totalPage: 1 };
+  let currentUrl, onResponse, closed = false;
+  const page = {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, bringToFront: async () => {},
+    on: (event, listener) => { assert.equal(event, 'response'); onResponse = listener; },
+    off: (event, listener) => { assert.equal(event, 'response'); assert.equal(listener, onResponse); onResponse = undefined; },
+    goto: async url => {
+      currentUrl = url;
+      if (apiHits) await onResponse({
+        url: () => 'https://www.1111.com.tw/api/v1/search/jobs/?page=1', ok: () => true,
+        json: async () => ({ result: { pagination, hits: apiHits } }),
+      });
+    },
+    evaluate: async read => {
+      assert.equal(read.name, 'readSearch');
+      return { url: currentUrl, heading: search.keyword, keywordInput: search.keyword, jobs,
+        initialResult: { ...pagination, ids, fields, source: 'html-ssr' } };
+    },
+  };
+  const result = await runSource({ pages: () => [page], close: async () => { closed = true; } },
+    { ...search, page: 1 }, 1000);
+  assert.equal(closed, true); assert.equal(onResponse, undefined);
+  return result;
+}
+
+const searchFields = [
+  { id: '101', salary: '面議（經常性薪資達4萬元或以上）', location: '合成市北區' },
+  { id: '103', salary: '月薪 35,000元~50,000元', location: '合成市南區' },
+  { id: '105', salary: '月薪 50,000元以上', location: '合成市東區' },
+  { id: '202', salary: '時薪 220元~400元', location: '合成市西區' },
+  { id: '204', salary: '論件計酬 5,000元~50,000元', location: '合成市中央區' },
+];
+
+test('runSource attaches SSR fields by jobId with reordered cards', async () => {
+  // Without the worker field join, salary/location are absent; positional joins assign another job's values.
+  const result = await mockSearchMetadata(searchFields);
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(result.jobs.map(({ id, salary, location }) => ({ id, salary, location })), [...searchFields].reverse());
+});
+
+test('runSource attaches API fields by jobId without borrowing SSR fields', async () => {
+  // Without API extraction/join values disappear; using SSR fields returns stale values or fills intentional gaps.
+  const apiHits = [
+    { jobId: '105', salary: 'API monthly 50000', workCity: { name: 'API east' } },
+    { jobId: '101', salary: 'API negotiable', workCity: { name: 'API north' } },
+    { jobId: '204', workCity: { name: 'API centre' } },
+    { jobId: '103', salary: 'API monthly 35000', workCity: { name: 'API south' } },
+    { jobId: '202', salary: 'API hourly 220' },
+  ];
+  const result = await mockSearchMetadata(searchFields, apiHits);
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(result.jobs.map(job => [job.id, job.salary, job.location]), [
+    ['204', undefined, 'API centre'], ['202', 'API hourly 220', undefined],
+    ['105', 'API monthly 50000', 'API east'], ['103', 'API monthly 35000', 'API south'],
+    ['101', 'API negotiable', 'API north'],
+  ]);
+  assert.equal(Object.hasOwn(result.jobs[0], 'salary'), false);
+  assert.equal(Object.hasOwn(result.jobs[1], 'location'), false);
+});
+
+test('runSource keeps complete pages ok after invalid optional fields are omitted', async () => {
+  // Without optional API validation, malformed values leak; without the join, each valid counterpart disappears.
+  // SSR fields here represent readSearch's sanitized output, whose parsing is covered in probe.test.mjs.
+  const fields = [], hits = [];
+  for (const invalid of [undefined, null, 42, 'x'.repeat(501), '   ']) {
+    const salaryId = String(301 + fields.length);
+    fields.push({ id: salaryId, location: 'Synthetic city' });
+    hits.push({ jobId: salaryId, salary: invalid, workCity: { name: 'Synthetic city' } });
+    const locationId = String(301 + fields.length);
+    fields.push({ id: locationId, salary: 'Hourly 220' });
+    hits.push({ jobId: locationId, salary: 'Hourly 220', workCity: { name: invalid } });
+  }
+  for (const workCity of [undefined, null]) {
+    const id = String(301 + fields.length);
+    fields.push({ id, salary: 'Hourly 220' });
+    hits.push({ jobId: id, salary: 'Hourly 220', workCity });
+  }
+  for (const apiHits of [undefined, hits]) {
+    const result = await mockSearchMetadata(fields, apiHits);
+    assert.equal(result.status, 'ok');
+    assert.deepEqual(result.jobs.map(job => {
+      const { id, salary, location } = job;
+      assert.equal(Object.hasOwn(job, salary === undefined ? 'salary' : 'location'), false);
+      return { id, ...(salary === undefined ? {} : { salary }), ...(location === undefined ? {} : { location }) };
+    }), [...fields].reverse());
+  }
+});

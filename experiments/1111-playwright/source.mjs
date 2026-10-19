@@ -4,6 +4,15 @@ import { readSearch, readDetail, searchUrl, validateSearch, validateDetail, eval
 
 const ORIGIN = 'https://www.1111.com.tw';
 const AREA_URL = `${ORIGIN}/api/v1/codeCategories/city`;
+const optionalSearchField = value => typeof value === 'string' && value.trim() && value.length <= 500 ? value.trim() : undefined;
+const apiFieldsFor = hit => {
+  const city = hit?.workCity;
+  return {
+    id: String(hit?.jobId),
+    ...(optionalSearchField(city?.name) ? { location: optionalSearchField(city.name) } : {}),
+    ...(optionalSearchField(hit?.salary) ? { salary: optionalSearchField(hit.salary) } : {}),
+  };
+};
 const failed = () => ({ status: 'failed', message: '1111 資料尚未完整載入或格式已變更，請稍後再試。' });
 const unsupported = message => ({ status: 'unsupported', message });
 // Matches Python SINGLE_AREA_SECONDS: navigation (30s) plus DOM validation (15s).
@@ -141,7 +150,8 @@ export async function runSource(context, input, timeoutMs = 30000, now = () => p
           const responseUrl = new URL(response.url());
           if (responseUrl.origin !== ORIGIN || responseUrl.pathname !== '/api/v1/search/jobs/' || !response.ok()) return;
           const { result } = await response.json();
-          responseResult = { ...result.pagination, ids: result.hits.map(job => String(job.jobId)) };
+          responseResult = { ...result.pagination, ids: result.hits.map(job => String(job.jobId)),
+            fields: result.hits.map(apiFieldsFor), source: 'search-response' };
         } catch { responseResult = undefined; }
       };
       page.on('response', onResponse);
@@ -154,7 +164,13 @@ export async function runSource(context, input, timeoutMs = 30000, now = () => p
             || job.url !== `${ORIGIN}/job/${job.id}`
             || !/^https:\/\/www\.1111\.com\.tw\/corp\/\d{1,32}\/?$/.test(job.companyUrl))) throw new Error('invalid job identity');
       }, operationTimeout());
-      return { status: 'ok', jobs: result.jobs, page: input.page, page_size: metadata.limit,
+      const fieldsById = new Map((metadata.fields || []).map(field => [field.id, field]));
+      const jobs = result.jobs.map(job => {
+        const fields = fieldsById.get(job.id);
+        return fields ? { ...job, ...(fields.location ? { location: fields.location } : {}),
+          ...(fields.salary ? { salary: fields.salary } : {}) } : job;
+      });
+      return { status: 'ok', jobs, page: input.page, page_size: metadata.limit,
         total: metadata.totalCount, has_next: input.page * metadata.limit < metadata.totalCount,
         warnings: input.page === MAX_SEARCH_PAGES && input.page * metadata.limit < metadata.totalCount ? ['1111 實驗來源目前最多查詢前 5 頁。'] : [] };
     }

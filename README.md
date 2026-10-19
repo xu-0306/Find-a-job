@@ -68,7 +68,7 @@ npm.cmd ci --prefix experiments/1111-playwright --ignore-scripts --no-audit --no
 
 啟用後會開啟獨立 Chrome 視窗，以新的暫存設定檔讀取公開頁面；不使用個人瀏覽器設定檔或登入資料。每次只處理一個瀏覽器工作，遇到驗證或逾時會回報來源受阻／失敗，不會當成零筆職缺，也不會自動安裝套件或代替使用者解驗證。既有 Docker 映像未包含這個選用執行環境。
 
-目前支援不指定地區或單一可可靠對應的地區；地區取自 1111 官方代碼資料，無法對應或多地區查詢會明確回報不支援。職缺薪資與地點欄位尚未可靠解析，須至來源核對，最低月薪篩選也不保證。短期測試曾成功取得兩頁，但仍會遇到人工驗證，不能視為每日無人操作已穩定。
+目前支援不指定地區或多地區查詢，一次最多 10 個縣市或行政區；同一個瀏覽器會逐區查詢，時間不足的地區可在後續續查。地點與薪資取自搜尋結果，最低月薪篩選仍不保證。短期測試曾成功取得兩頁，但仍會遇到人工驗證，不能視為每日無人操作已穩定。
 
 此版本將資料庫升級至 schema 7，加入 1111 職缺與每日基線；可還原舊版 4／5／6 備份並升級。部署前先保存可還原快照；升級後的資料庫不可直接交給舊版程式。
 ### 資料
@@ -166,7 +166,7 @@ npm.cmd ci --prefix experiments/1111-playwright --ignore-scripts --no-audit --no
 
 Run this in the new deployment checkout. The adapter opens its own headed Chrome with a fresh temporary profile, serializes browser work, and reports challenges/timeouts as failures rather than empty results. It neither uses personal browser sessions nor installs dependencies automatically. The existing Docker image does not include this optional runtime.
 
-Search supports no location filter or one location matched against 1111's official catalog; unsupported locations or multiple locations fail explicitly. Salary and location fields are not yet reliably parsed, and minimum monthly salary filtering is not guaranteed. Check the original listing. Successful two-page trials do not establish unattended reliability.
+Search supports nationwide or multiple locations, up to 10 cities or districts per call. One browser queries each location in sequence, and locations that run out of time can continue later. Salary and location are taken from search results; minimum monthly salary filtering is not guaranteed. Successful two-page trials do not establish unattended reliability.
 
 Deployment upgrades the database to schema 7. Backups from schemas 4/5/6 can still be restored and upgraded. Preserve a recoverable snapshot before deployment; do not open an upgraded database with older code.
 ### Data

@@ -20,6 +20,12 @@ export function searchUrl(keyword, area = '') {
 export function readSearch() {
   const jobs = [];
   const seen = new Set();
+  const optionalField = value => typeof value === 'string' && value.trim() && value.length <= 500 ? value.trim() : undefined;
+  const fieldsFor = (id, salary, location) => ({
+    id: String(id),
+    ...(optionalField(location) ? { location: optionalField(location) } : {}),
+    ...(optionalField(salary) ? { salary: optionalField(salary) } : {}),
+  });
   for (const a of document.querySelectorAll('.job-card__content a[href*="/job/"][href*="mid=searchlist"]')) {
     const url = new URL(a.getAttribute('href'), location.href);
     const id = url.pathname.match(/^\/job\/(\d+)\/?$/)?.[1];
@@ -41,9 +47,16 @@ export function readSearch() {
     const data = values?.find(value => value && !Array.isArray(value) && Object.hasOwn(value, 'apiJob'));
     const result = values[values[data.apiJob].result];
     const pagination = values[result.pagination];
+    const hits = values[result.hits];
+    const deref = value => Number.isSafeInteger(value) && value >= 0 && value < values.length ? values[value] : value;
+    const fields = hits.map(ref => {
+      const hit = values[ref];
+      const city = deref(hit.workCity);
+      return fieldsFor(values[hit.jobId], deref(hit.salary), deref(city?.name));
+    });
     initialResult = {
       ...Object.fromEntries(['page', 'limit', 'totalCount', 'totalPage'].map(key => [key, values[pagination[key]]])),
-      ids: values[result.hits].map(ref => String(values[values[ref].jobId])), source: 'html-ssr',
+      ids: hits.map(ref => String(values[values[ref].jobId])), fields, source: 'html-ssr',
     };
   } catch { /* Missing or changed metadata must fail completeness validation. */ }
   return {

@@ -8,8 +8,8 @@
 
 - 在欲部署的 checkout 安裝 Node.js 20+、Google Chrome，於本目錄執行 npm.cmd ci --ignore-scripts --no-audit --no-fund。來源使用有視窗的 Chrome，需要可開啟瀏覽器的桌面環境，不會自動安裝依賴。
 - Python 透過 JSON stdin/stdout 呼叫 source.mjs；一次一個瀏覽器操作、60 秒總上限，取消時清理自己啟動的程序。每次使用全新臨時 profile；不沿用私人 cookie、不點驗證框、不自動重試。
-- 搜尋支援全國或單一縣市／行政區，使用 1111 官方 /api/v1/codeCategories/city 目錄精確對應名稱；多地區或無法唯一對應時明示不支援，不能默默改查全國。每輪最多前五頁，完整性仍依來源分頁 metadata 與職缺 ID 核對。
-- 搜尋卡片的薪資／工作地點尚未可靠解析，保留未知與提醒；不保證最低薪資篩選。詳細內容經職缺及公司身分核對後提供。
+- 搜尋支援全國或多個縣市／行政區，一次最多 10 個地區；使用 1111 官方 /api/v1/codeCategories/city 目錄精確對應名稱，同一個瀏覽器逐區查詢，時間不足的地區可續查。每輪最多前五頁，完整性仍依來源分頁 metadata 與職缺 ID 核對。
+- 搜尋卡片的薪資／工作地點取自搜尋結果，缺少或格式不合時保留未知與提醒；不保證最低薪資篩選。詳細內容經職缺及公司身分核對後提供。
 - 載入逾時、人機驗證或不支援格式會回傳來源診斷，保留其他來源結果，不當成成功零筆，也不完成該来源的每日基線。
 - npm.cmd test 執行本機合成頁面的 probe.test.mjs、source.test.mjs 與 session.test.mjs；GitHub Actions 也跑這些離線檢查，不連線 1111。合併 main 不觸發部署。
 

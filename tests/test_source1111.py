@@ -536,6 +536,26 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
             stop.assert_awaited_once_with(process)
         self.assertFalse(bridge.lock.locked())
 
+    async def test_search_rows_keep_optional_location_salary_and_dynamic_warning(self):
+        # Removing the parser fields makes both values disappear and keeps the obsolete shared warning.
+        payload = page([row('901') | {'location': '台南市善化區', 'salary': '月薪 35,000元~50,000元'}])
+        result = search_rows(payload, 1)[0]
+        self.assertEqual(result['location'], '台南市善化區')
+        self.assertEqual(result['salary_text'], '月薪 35,000元~50,000元')
+        self.assertEqual(result['filter_warnings'], ['1111 為實驗來源，可能因人機驗證受阻，請至來源核對。'])
+        # A present field must never be reported as missing; the other field must be.
+        for field, present, absent in [('location', '地點', '薪資'), ('salary', '薪資', '地點')]:
+            missing = search_rows(page([row('902') | {field: 'x'}]), 1)[0]
+            self.assertIn(absent + '未能解析', missing['filter_warnings'][0])
+            self.assertNotIn(present, missing['filter_warnings'][0])
+
+    async def test_search_rows_optional_fields_reject_invalid_values_without_page_failure(self):
+        # Without per-field bounds/type checks, invalid optional metadata aborts or exceeds Job's 500-char limit.
+        result = search_rows(page([row('903') | {'location': 42, 'salary': ' ' * 3}]), 1)[0]
+        self.assertIsNone(result['location']); self.assertIsNone(result['salary_text'])
+        result = search_rows(page([row('904') | {'location': 'z' * 501, 'salary': '月薪 50,000元以上'}]), 1)[0]
+        self.assertIsNone(result['location']); self.assertEqual(result['salary_text'], '月薪 50,000元以上')
+
     async def test_full_page_overflow_and_continuation_preserve_unknowns(self):
         browser = AsyncMock()
         browser.call.side_effect = [page([row('123'), row('456')], size=2, total=3), page([row('789')], number=2, size=2, total=3)]

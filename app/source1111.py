@@ -74,10 +74,22 @@ def search_rows(payload, page):
         corp = company_id(row.get('companyUrl'))
         if not corp:
             raise BrowserError('unsupported', '1111 職缺缺少可靠的公司識別資料。')
+        def optional_text(value):
+            if not isinstance(value, str):
+                return None
+            text = _clean_text(value)
+            return text if text and len(text) <= 500 else None
+
+        location = optional_text(row.get('location'))
+        salary = optional_text(row.get('salary'))
+        missing = [label for label, value in (('地點', location), ('薪資', salary)) if value is None]
+        warning = '1111 為實驗來源，可能因人機驗證受阻'
+        if missing:
+            warning += '；' + '、'.join(missing) + '未能解析'
+        warning += '，請至來源核對。'
         rows.append(dict(source_job_id=row['id'], title=title, company_name=company, company_source_id=corp,
-                         url='https://www.1111.com.tw/job/' + row['id'] + '/', location=None, salary_text=None,
-                         summary=_clean_text(row.get('text')),
-                         filter_warnings=['1111 為實驗來源，可能因人機驗證受阻；地點與薪資尚未可靠解析，請至來源核對。']))
+                         url='https://www.1111.com.tw/job/' + row['id'] + '/', location=location, salary_text=salary,
+                         summary=_clean_text(row.get('text')), filter_warnings=[warning]))
     return rows
 
 
