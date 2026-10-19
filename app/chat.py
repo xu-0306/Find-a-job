@@ -1,6 +1,7 @@
 """One bounded chat task per application; durable claims live in SQLite."""
 import asyncio
 import json
+import time
 
 import httpx
 
@@ -11,7 +12,13 @@ from .store import encode, now
 MAX_ROUNDS = 8
 # Hard cap on history rows read per turn; the token budget decides how many of them are sent.
 HISTORY_LIMIT = 200
-CHAT_SECONDS = 180
+CHAT_SECONDS = 240
+FINISH_RESERVE_SECONDS = 45
+# Conservative scheduling allowances, not provider SLAs: leave time to decide a tool,
+# generate a summary, or complete a short retry stream before the hard cap.
+TOOL_MODEL_ALLOWANCE_SECONDS = 20
+COMPACT_ALLOWANCE_SECONDS = 30
+RETRY_STREAM_ALLOWANCE_SECONDS = 10
 MAX_RETRIES = 5
 RETRY_DELAY_SECONDS = 5
 SYSTEM = ('你是溫暖、低壓力的求職陪伴助手。用繁體中文回覆，尊重使用者的步調。'
@@ -52,6 +59,8 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
     store = app.state.store
     content = {'text': '', 'events': [], 'status': 'running'}
     public_error = None
+    deadline = time.monotonic() + CHAT_SECONDS
+    had_success = False
     try:
         async with asyncio.timeout(CHAT_SECONDS):
             with store.connect() as db:
@@ -125,7 +134,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 show_summary(summary_state['text'])
 
             async def summarize(client, covered):
-                nonlocal summary_state
+                nonlocal summary_state, had_success
                 ids = [item['id'] for item in covered]
                 prior = summary_state
                 through = prior.get('through_id')
@@ -143,7 +152,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                            {'role': 'user', 'content': encode({'previous_summary': prior.get('text'), 'messages': fresh})}]
                 text = ''
                 try:
-                    async for event in stream_model(client, settings, key, protocol, request, tools, no_tools=True):
+                    async for event in stream_model(client, settings, key, protocol, request, tools, no_tools=True, had_success=had_success):
                         if event['kind'] == 'text_delta':
                             text += event['text']
                             if len(text) > 4000:
@@ -151,6 +160,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 except LLMError:
                     # Summaries are best effort: without one the reply still goes ahead on the trimmed history.
                     return prior.get('text')
+                had_success = True
                 text = text.strip()[:4000]
                 if not text:
                     return prior.get('text')
@@ -169,6 +179,8 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 if not dropped:
                     return
                 history_end -= len(dropped); dropped_count += len(dropped)
+                if deadline - time.monotonic() <= FINISH_RESERVE_SECONDS + COMPACT_ALLOWANCE_SECONDS:
+                    return
                 text = await summarize(client, kept[:dropped_count])
                 if not text:
                     return
@@ -206,7 +218,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 content['events'].append({'event': 'tool_status', 'data': progress})
                 store.save_reply(request_id, content, auth_hash)
                 queue.put_nowait(('tool_status', dict(progress)))
-                result, public_event = await invoke(call['name'], arguments)
+                result, public_event = await invoke(call['name'], arguments, deadline=deadline, finish_reserve=FINISH_RESERVE_SECONDS)
                 if public_event:
                     content['events'].append({'event': public_event[0], 'data': public_event[1]})
                     store.save_reply(request_id, content, auth_hash)
@@ -231,18 +243,22 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 overflow_retried = False
                 for round_no in range(MAX_ROUNDS):
                     # 最後一輪不允許工具，讓模型用已取得的資料收尾（同 LangChain early_stopping_method="generate"）。
-                    last = round_no == MAX_ROUNDS - 1
                     await compact(client)
                     turn_base = content['text']
+                    finish_after_error = False
                     while True:
-                        send = messages + [{'role': 'user', 'content': '工具使用次數已達本輪上限，請只根據已取得的資料直接回覆，說明尚未查到的部分。'}] if last else messages
+                        time_last = finish_after_error or deadline - time.monotonic() <= FINISH_RESERVE_SECONDS + TOOL_MODEL_ALLOWANCE_SECONDS
+                        last = time_last or round_no == MAX_ROUNDS - 1
+                        finish_message = ('時間將到，請只根據已取得的資料回覆，說明尚未查到的部分' if time_last else
+                                          '工具使用次數已達本輪上限，請只根據已取得的資料直接回覆，說明尚未查到的部分。')
+                        send = messages + [{'role': 'user', 'content': finish_message}] if last else messages
                         calls, turn_text = [], ''
                         try:
                             with store.connect() as db:
                                 if not db.execute("SELECT 1 FROM sessions WHERE id_hash=? AND role='user' AND expires_at>?",
                                                   (auth_hash, now().isoformat())).fetchone():
                                     raise LLMError('session_revoked', '登入已失效，請重新登入。')
-                            async for event in stream_model(client, settings, key, protocol, send, tools, no_tools=last):
+                            async for event in stream_model(client, settings, key, protocol, send, tools, no_tools=last, had_success=had_success):
                                 if event['kind'] == 'text_delta':
                                     text = event['text']
                                     if len(turn_base) + len(turn_text) + len(text) > 100000:
@@ -258,6 +274,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                                     calls.append({name: event[name] for name in ('id', 'name', 'arguments')})
                                     if len(calls) > 10 or len(event['arguments']) > 16000:
                                         raise LLMError('invalid_tool', '工具請求超過上限，請調整後重試。')
+                            had_success = True
                             if not calls and not turn_text.strip():
                                 raise LLMError('empty_reply', '模型未提供回覆，請稍後再試。', retryable=True)
                             if not turn_text and content['text'] != turn_base:
@@ -274,6 +291,12 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                                 continue
                             if not exc.retryable or retries >= MAX_RETRIES:
                                 raise
+                            remaining = deadline - time.monotonic()
+                            if remaining <= RETRY_DELAY_SECONDS + RETRY_STREAM_ALLOWANCE_SECONDS:
+                                raise
+                            # Recompute the next request with tools disabled when only finishing fits.
+                            if not last and remaining <= FINISH_RESERVE_SECONDS + TOOL_MODEL_ALLOWANCE_SECONDS + RETRY_DELAY_SECONDS:
+                                finish_after_error = True
                             retries += 1
                             queue.put_nowait(('retry', {'attempt': retries, 'max_attempts': MAX_RETRIES,
                                 'delay_seconds': RETRY_DELAY_SECONDS,
@@ -283,6 +306,8 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                         content['status'] = 'completed'
                         break
                     if last:
+                        if time_last:
+                            raise LLMError('time_limit', '這次回覆時間將到，模型仍要求使用工具；已取得的內容保留，請再要求補查。')
                         raise LLMError('round_limit', '這次工具往返已達上限，請分成較小的問題再試。')
                     # Validate the entire batch before any proposal can be committed.
                     validated = []

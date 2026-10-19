@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -190,6 +190,144 @@ class ChatChecks(unittest.TestCase):
         self.assertTrue(source.closed)
         self.assertEqual(self.history()[-1]['content']['status'], 'interrupted')
 
+    def test_time_reserve_uses_last_round_to_finish_from_collected_data(self):
+        requests = []
+        clock = Mock(); clock.monotonic.return_value = 100
+        async def provider(request):
+            payload = json.loads(request.content); requests.append(payload)
+            if len(requests) == 1:
+                clock.monotonic.return_value = 100.2
+                return response(call=('collected', 'list_preferences', '{}'))
+            return response(text='根據已取得的資料完成整理，尚未查到其他地區。')
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        with patch.object(chat, 'CHAT_SECONDS', 2), patch.object(chat, 'FINISH_RESERVE_SECONDS', 1.9), \
+                patch.object(chat, 'TOOL_MODEL_ALLOWANCE_SECONDS', 0), patch.object(chat, 'time', clock):
+            output = events(self.send('finish-time'))
+        self.assertEqual(output[-1][1]['status'], 'completed', output)
+        self.assertEqual(len(requests), 2)
+        self.assertNotIn('tool_choice', requests[0])
+        self.assertEqual(requests[1]['tool_choice'], 'none')
+        self.assertIn('時間將到', encode(requests[1]))
+        self.assertIn('已取得', self.history()[-1]['content']['text'])
+        self.assertFalse(any(event == 'error' for event, _ in output))
+
+    def test_time_finish_tool_request_has_distinct_error_and_no_effect(self):
+        self.app.state.llm_transport = httpx.MockTransport(lambda request: response(call=('late', 'propose_preference_change',
+            encode({'operation': 'create', 'after': CRITERIA}))))
+        with patch.object(chat, 'CHAT_SECONDS', 2), patch.object(chat, 'FINISH_RESERVE_SECONDS', 3):
+            output = events(self.send('late-tool'))
+        error = next(value for event, value in output if event == 'error')
+        self.assertEqual(error['code'], 'time_limit')
+        self.assertIn('時間', error['message'])
+        self.assertNotIn('往返', error['message'])
+        self.assertFalse(self.client.get('/api/preferences').json()['proposals'])
+
+    def test_mid_turn_forbidden_is_not_a_configuration_error(self):
+        calls = []
+        def provider(request):
+            calls.append(request)
+            return response(text='已取得資料。', call=('ok', 'list_preferences', '{}')) if len(calls) == 1 else httpx.Response(403)
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        output = events(self.send('refused'))
+        error = next(value for event, value in output if event == 'error')
+        self.assertEqual(error['code'], 'provider_refused')
+        self.assertFalse(error['retryable'])
+        self.assertNotIn('請在後台檢查設定', error['message'])
+        self.assertIn('已取得資料', self.history()[-1]['content']['text'])
+        self.assertEqual(len(calls), 2)
+
+    def test_unavailable_retry_stops_before_reserved_time(self):
+        calls = []
+        clock = Mock(); clock.monotonic.return_value = 100
+        async def provider(request):
+            calls.append(request)
+            clock.monotonic.return_value = 100.2
+            return httpx.Response(503, json={'error': {'type': 'service_unavailable', 'message': KEY}})
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        with patch.object(chat, 'CHAT_SECONDS', 2), patch.object(chat, 'FINISH_RESERVE_SECONDS', 1.9), \
+                patch.object(chat, 'RETRY_DELAY_SECONDS', .01), patch.object(chat, 'time', clock):
+            output = events(self.send('busy-time'))
+        error = next(value for event, value in output if event == 'error')
+        self.assertEqual(error['code'], 'provider_unavailable')
+        self.assertTrue(error['retryable'])
+        self.assertNotIn('請在後台檢查設定', error['message'])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(event == 'retry' for event, _ in output))
+        self.assertNotIn(KEY, encode(output))
+
+    def test_finish_round_retries_busy_rate_limit_empty_and_interrupted_stream(self):
+        for index, failure in enumerate([httpx.Response(503), httpx.Response(429), response(), response(text='片段', complete=False)]):
+            requests = []
+            def provider(request):
+                requests.append(json.loads(request.content))
+                return failure if len(requests) == 1 else response(text='收尾完成')
+            self.app.state.llm_transport = httpx.MockTransport(provider)
+            with patch.object(chat, 'CHAT_SECONDS', 40), patch.object(chat, 'RETRY_DELAY_SECONDS', 0):
+                output = events(self.send(f'finish-retry-{index}'))
+            self.assertEqual(output[-1][1]['status'], 'completed', output)
+            self.assertEqual(len(requests), 2)
+            self.assertTrue(all(item['tool_choice'] == 'none' for item in requests))
+            self.assertEqual(sum(name == 'retry' for name, _ in output), 1)
+            self.assertEqual(self.history()[-1]['content']['text'], '收尾完成')
+
+    def test_tool_retry_switches_to_finish_when_full_tool_retry_does_not_fit(self):
+        requests = []
+        clock = Mock(); clock.monotonic.return_value = 100
+        def provider(request):
+            requests.append(json.loads(request.content))
+            # Initial remaining=70 permits tools; the failed request uses 4s.
+            clock.monotonic.return_value = 104
+            return httpx.Response(503) if len(requests) == 1 else response(text='用既有資料收尾')
+        self.app.state.llm_transport = httpx.MockTransport(provider)
+        async def no_wait(_): pass
+        # Patch only the retry wait; fake monotonic leaves 66s on the next iteration,
+        # proving the error path itself selects finishing rather than an elapsed sleep.
+        with patch.object(chat, 'CHAT_SECONDS', 70), patch.object(chat, 'time', clock), \
+                patch('app.chat.asyncio.sleep', side_effect=no_wait):
+            output = events(self.send('retry-to-finish'))
+        self.assertEqual(output[-1][1]['status'], 'completed', output)
+        self.assertEqual(len(requests), 2)
+        self.assertNotIn('tool_choice', requests[0])
+        self.assertEqual(requests[1]['tool_choice'], 'none')
+        self.assertIn('時間將到', encode(requests[1]))
+
+    def test_finish_retry_stream_budget_boundary_and_retry_cap(self):
+        for index, (remaining, expected_calls) in enumerate([(15, 1), (15.01, 2)]):
+            requests = []
+            def provider(request):
+                requests.append(json.loads(request.content))
+                return httpx.Response(503) if len(requests) == 1 else response(text='完成')
+            self.app.state.llm_transport = httpx.MockTransport(provider)
+            async def no_wait(_): pass
+            clock = Mock(); clock.monotonic.return_value = 100
+            with patch.object(chat, 'CHAT_SECONDS', remaining), patch.object(chat, 'time', clock), \
+                    patch('app.chat.asyncio.sleep', side_effect=no_wait):
+                result = self.send(f'boundary-{index}')
+                self.assertEqual(result.status_code, 200, result.text)
+                output = events(result)
+            self.assertEqual(len(requests), expected_calls)
+            self.assertEqual(output[-1][1]['status'], 'completed' if expected_calls == 2 else 'interrupted')
+        self.app.state.llm_transport = httpx.MockTransport(lambda request: httpx.Response(503))
+        with patch.object(chat, 'CHAT_SECONDS', 40), patch.object(chat, 'RETRY_DELAY_SECONDS', 0), \
+                patch.object(chat, 'MAX_RETRIES', 2):
+            output = events(self.send('retry-cap'))
+        self.assertEqual(sum(name == 'retry' for name, _ in output), 2)
+        self.assertEqual(next(data['code'] for name, data in output if name == 'error'), 'provider_unavailable')
+
+    def test_tool_entry_budget_boundary(self):
+        for index, (seconds, permits_tools) in enumerate([(64.99, False), (65, False), (65.01, True)]):
+            requests = []
+            def provider(request):
+                requests.append(json.loads(request.content)); return response(text='完成')
+            self.app.state.llm_transport = httpx.MockTransport(provider)
+            clock = Mock(); clock.monotonic.return_value = 100
+            with patch.object(chat, 'CHAT_SECONDS', seconds), patch.object(chat, 'time', clock):
+                result = self.send(f'tool-entry-{index}')
+                self.assertEqual(result.status_code, 200, result.text)
+                output = events(result)
+            self.assertEqual(output[-1][1]['status'], 'completed')
+            self.assertEqual('tool_choice' not in requests[0], permits_tools)
+
     def test_round_limit_and_stale_revision_never_change_preferences(self):
         count = 0
         def provider(request):
@@ -266,8 +404,14 @@ class ChatChecks(unittest.TestCase):
             self.app.state.llm_transport=httpx.MockTransport(refused)
             result=self.admin_test()
             self.assertEqual(result.status_code,503)
-            self.assertIn(f'HTTP {status}', result.json()['error']['message'])
-            self.assertIn('responses', result.json()['error']['message'])
+            if status == 429:
+                expected = ('rate_limited', '模型服務目前請求過多，請稍後再試')
+            elif 500 <= status < 600:
+                expected = ('provider_unavailable', f'模型服務暫時無法回應（HTTP {status}），請稍後再試')
+            else:
+                expected = ('authentication_failed' if status in (401, 403) else 'provider_http_error',
+                            f'模型服務回傳 HTTP {status}（responses），請在後台檢查設定。')
+            self.assertEqual((result.json()['error']['code'], result.json()['error']['message']), expected)
             self.assertEqual(len(requests),1)
             self.assertNotIn(KEY,result.text)
         requests=[]

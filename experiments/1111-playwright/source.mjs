@@ -6,12 +6,25 @@ const ORIGIN = 'https://www.1111.com.tw';
 const AREA_URL = `${ORIGIN}/api/v1/codeCategories/city`;
 const failed = () => ({ status: 'failed', message: '1111 資料尚未完整載入或格式已變更，請稍後再試。' });
 const unsupported = message => ({ status: 'unsupported', message });
+// Matches Python SINGLE_AREA_SECONDS: navigation (30s) plus DOM validation (15s).
+export const SINGLE_AREA_MS = 45000;
+// Mirrors app/source1111.py; the consistency regression test locks units and formulas.
+export const STARTUP_MS = 20000;
+export const LAUNCH_TIMEOUT_MS = 15000;
+export const WORKER_GRACE_MS = 8000;
+export const MAX_AREAS = 10;
+export const MAX_SEARCH_PAGES = 5;
+export const MAX_BUDGET_MS = STARTUP_MS + SINGLE_AREA_MS * MAX_AREAS;
+const workerBudget = input => input.budget_ms ?? STARTUP_MS + SINGLE_AREA_MS * Math.max(1, input.area_names?.length || 0);
+const timeLimited = () => ({ status: 'time_limited', message: '時間不足，此地區未查；可按續查補查。' });
 
-function validateInput(input) {
+export function validateInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid input');
+  if (input.budget_ms !== undefined && (!Number.isSafeInteger(input.budget_ms)
+      || input.budget_ms <= 0 || input.budget_ms > MAX_BUDGET_MS)) throw new Error('invalid budget');
   if (input.action === 'search') {
     if (typeof input.keyword !== 'string' || !input.keyword.trim() || input.keyword.length > 200
-        || !Array.isArray(input.area_names) || input.area_names.length > 10
+        || !Array.isArray(input.area_names) || input.area_names.length > MAX_AREAS
         || input.area_names.some(name => typeof name !== 'string' || !name.trim() || name.length > 100)
         || !Number.isSafeInteger(input.page) || input.page < 1) throw new Error('invalid search');
   } else if (input.action === 'detail') {
@@ -47,25 +60,79 @@ export function resolveArea(names, catalogue) {
   return matches.length === 1 ? matches[0] : null;
 }
 
-export async function runSource(context, input, timeoutMs = 30000) {
+export async function runSource(context, input, timeoutMs = 30000, now = () => performance.now()) {
+  const deadline = now() + workerBudget(input);
+  let areaDeadline = deadline;
+  const remaining = () => Math.max(1, Math.floor(areaDeadline - now()));
+  const operationTimeout = (cap = timeoutMs) => Math.min(cap, remaining());
   let page;
   let onResponse;
+  async function failure() {
+    const diagnosticMs = Math.min(1000, Math.floor(deadline - now()));
+    if (page && diagnosticMs > 0) {
+      try {
+        const state = await evaluateWithTimeout(page, () => ({ title: document.title, text: document.body.innerText.slice(0, 2000) }), diagnosticMs);
+        if (failureStatus(state) === 'blocked_or_loading' || /驗證您是人類|確認您是人類|Verify you are human/i.test(state.text)) {
+          return { status: 'blocked', message: '1111 目前停在載入或人機驗證，請稍後再試。' };
+        }
+      } catch { /* Never expose raw browser diagnostics. */ }
+    }
+    return failed();
+  }
   try {
     validateInput(input);
-    if (input.action === 'search' && input.page > 5) return unsupported('1111 實驗來源目前最多查詢前 5 頁。');
-    if (input.action === 'search' && input.area_names.length > 1) return unsupported('1111 實驗來源目前只支援單一地區，請選擇一個縣市或行政區。');
-    let area = '';
+    if (input.action === 'search' && input.page > MAX_SEARCH_PAGES) return unsupported('1111 實驗來源目前最多查詢前 5 頁。');
+    let catalogue;
     if (input.action === 'search' && input.area_names.length) {
-      const response = await context.request.get(AREA_URL, { timeout: Math.min(timeoutMs, 10000), headers: { 'Accept-Language': 'zh-TW' } });
+      const response = await context.request.get(AREA_URL, { timeout: operationTimeout(Math.min(timeoutMs, 10000)), headers: { 'Accept-Language': 'zh-TW' } });
       if (!response.ok()) return unsupported('1111 官方地區資料目前無法取得，請稍後再試。');
-      area = resolveArea(input.area_names, await response.json());
-      if (area === null) return unsupported('1111 官方地區資料無法唯一對應指定地區，請選擇其他單一縣市或行政區。');
+      catalogue = await response.json();
     }
     page = context.pages()[0] || await context.newPage();
-    page.setDefaultTimeout(timeoutMs);
-    page.setDefaultNavigationTimeout(timeoutMs);
+    page.setDefaultTimeout(operationTimeout());
+    page.setDefaultNavigationTimeout(operationTimeout());
     await page.bringToFront();
     if (input.action === 'search') {
+      const results = [];
+      let blocked = false;
+      for (const name of input.area_names.length ? input.area_names : ['']) {
+        const area = name ? resolveArea([name], catalogue) : '';
+        let result;
+        if (deadline - now() < SINGLE_AREA_MS) {
+          result = timeLimited();
+        } else if (area === null) {
+          result = unsupported('1111 官方地區資料無法唯一對應指定地區，請選擇其他縣市或行政區。');
+        } else if (blocked) {
+          result = { status: 'blocked', message: '1111 同一瀏覽器已遇到人機驗證，此地區未查，請稍後再試。' };
+        } else {
+          areaDeadline = Math.min(deadline, now() + SINGLE_AREA_MS);
+          page.setDefaultTimeout(operationTimeout());
+          page.setDefaultNavigationTimeout(operationTimeout());
+          try {
+            result = await searchPage(area);
+          } catch {
+            result = await failure();
+            blocked = result.status === 'blocked';
+          } finally {
+            if (onResponse) page.off('response', onResponse);
+            onResponse = undefined;
+          }
+        }
+        results.push({ area_name: name, ...result });
+      }
+      // One/no area keeps the original payload; batches contain that same payload per named area.
+      if (input.area_names.length <= 1 && results[0].status !== 'time_limited') {
+        const { area_name, ...result } = results[0];
+        return result;
+      }
+      return { status: 'ok', areas: results };
+    }
+    const job = { ...input.job, url: `${ORIGIN}/job/${input.job.id}` };
+    await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: operationTimeout() });
+    const detail = await waitForValidDom(page, readDetail, state => validateDetail(state, job), operationTimeout());
+    return { status: 'ok', detail: { ...detail, id: job.id, company: job.company, companyUrl: job.companyUrl } };
+
+    async function searchPage(area) {
       const url = new URL(searchUrl(input.keyword, area));
       url.searchParams.set('page', String(input.page));
       let responseResult;
@@ -78,7 +145,7 @@ export async function runSource(context, input, timeoutMs = 30000) {
         } catch { responseResult = undefined; }
       };
       page.on('response', onResponse);
-      await page.goto(url.href, { waitUntil: 'domcontentloaded' });
+      await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: operationTimeout() });
       let metadata;
       const result = await waitForValidDom(page, readSearch, state => {
         metadata = responseResult?.page === input.page ? responseResult : state.initialResult;
@@ -86,25 +153,13 @@ export async function runSource(context, input, timeoutMs = 30000) {
         if (state.jobs.some(job => !/^\d{1,32}$/.test(job.id)
             || job.url !== `${ORIGIN}/job/${job.id}`
             || !/^https:\/\/www\.1111\.com\.tw\/corp\/\d{1,32}\/?$/.test(job.companyUrl))) throw new Error('invalid job identity');
-      }, timeoutMs);
+      }, operationTimeout());
       return { status: 'ok', jobs: result.jobs, page: input.page, page_size: metadata.limit,
         total: metadata.totalCount, has_next: input.page * metadata.limit < metadata.totalCount,
-        warnings: input.page === 5 && input.page * metadata.limit < metadata.totalCount ? ['1111 實驗來源目前最多查詢前 5 頁。'] : [] };
+        warnings: input.page === MAX_SEARCH_PAGES && input.page * metadata.limit < metadata.totalCount ? ['1111 實驗來源目前最多查詢前 5 頁。'] : [] };
     }
-    const job = { ...input.job, url: `${ORIGIN}/job/${input.job.id}` };
-    await page.goto(job.url, { waitUntil: 'domcontentloaded' });
-    const detail = await waitForValidDom(page, readDetail, state => validateDetail(state, job), timeoutMs);
-    return { status: 'ok', detail: { ...detail, id: job.id, company: job.company, companyUrl: job.companyUrl } };
   } catch {
-    if (page) {
-      try {
-        const state = await evaluateWithTimeout(page, () => ({ title: document.title, text: document.body.innerText.slice(0, 2000) }), Math.min(timeoutMs, 1000));
-        if (failureStatus(state) === 'blocked_or_loading' || /驗證您是人類|確認您是人類|Verify you are human/i.test(state.text)) {
-          return { status: 'blocked', message: '1111 目前停在載入或人機驗證，請稍後再試。' };
-        }
-      } catch { /* Do not expose browser diagnostics through the subprocess protocol. */ }
-    }
-    return failed();
+    return await failure();
   } finally {
     if (onResponse) page?.off('response', onResponse);
     await context.close().catch(() => {});
@@ -126,19 +181,26 @@ async function main() {
     console.log(JSON.stringify({ status: 'failed', message: '1111 查詢參數不正確。' }));
     return;
   }
+  console.log(JSON.stringify(await runWorker(input)));
+}
+
+export async function runWorker(input, { loadChromium = async () => (await import('patchright')).chromium,
+    now = () => performance.now() } = {}) {
+  const started = now();
   let context;
   let result;
   try {
-    const { chromium } = await import('patchright');
+    const chromium = await loadChromium();
     // Empty profile creates an isolated temporary session; no challenge clicks or retries.
-    context = await chromium.launchPersistentContext('', { channel: 'chrome', headless: false, viewport: null, timeout: 15000 });
-    result = await runSource(context, input);
+    context = await chromium.launchPersistentContext('', { channel: 'chrome', headless: false, viewport: null, timeout: LAUNCH_TIMEOUT_MS });
+    const budget = workerBudget(input);
+    result = await runSource(context, { ...input, budget_ms: Math.max(1, Math.floor(budget - (now() - started))) }, 30000, now);
   } catch {
     result = unsupported('1111 實驗來源需要已安裝 Chrome 與 Patchright 的桌面環境。');
   } finally {
     await context?.close().catch(() => {});
   }
-  console.log(JSON.stringify(result));
+  return result;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

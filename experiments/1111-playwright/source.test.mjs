@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import './source.budget.test.mjs';
 import { before, after, test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
-import { runSource, resolveArea } from './source.mjs';
+import { runSource, resolveArea, validateInput, SINGLE_AREA_MS, MAX_BUDGET_MS } from './source.mjs';
 let browser;
 before(async () => {
   browser = await chromium.launch();
@@ -34,8 +35,10 @@ async function fixture(input, options = {}) {
   const context = await browser.newContext();
   const requests = [];
   let closed = false;
-  const wrapper = { pages: () => context.pages(), newPage: () => context.newPage(),
-    request: { get: async url => { assert.equal(url, 'https://www.1111.com.tw/api/v1/codeCategories/city'); return { ok: () => true, json: async () => catalogue }; } },
+  let catalogueRequests = 0;
+  let pageCount = 0;
+  const wrapper = { pages: () => context.pages(), newPage: () => { pageCount++; return context.newPage(); },
+    request: { get: async url => { catalogueRequests++; assert.equal(url, 'https://www.1111.com.tw/api/v1/codeCategories/city'); return { ok: () => true, json: async () => options.catalogue || catalogue }; } },
     close: async () => { closed = true; await context.close(); } };
   await context.route('**/*', route => {
     const url = new URL(route.request().url()); requests.push(url.href);
@@ -46,12 +49,12 @@ async function fixture(input, options = {}) {
       ${(options.partial ? ids.slice(0, 1) : ids).map(id => `<div class="job-card__content"><a href="/job/${id}?mid=searchlist"><h2>測試職缺 ${id}</h2></a><a href="/corp/123"><h2>測試公司</h2></a></div>`).join('')}
       <script id="__NUXT_DATA__" type="application/json">${nuxt(number, ids, options.empty ? 0 : 7)}</script>`;
     const detail = `<h1>${options.wrongTitle ? '另一職缺' : '測試職缺 501'}</h1><a href="/corp/123">測試公司</a><h2>工作內容</h2><h3>職缺描述</h3><p>合成職缺說明，負責資料整理。</p><h3>工作待遇</h3><p>測試薪資</p>`;
-    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: options.blocked ? '<title>Loading...</title><body></body>' : url.pathname === '/search/job' ? search : detail });
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: options.blocked || options.blockedArea === url.searchParams.get('c0') ? '<title>Loading...</title><body></body>' : url.pathname === '/search/job' ? search : detail });
   });
   // DOM correctness must not depend on sub-second CI browser startup.
   const result = await runSource(wrapper, input, 5000);
   assert.equal(closed, true);
-  return { result, requests };
+  return { result, requests, catalogueRequests, pageCount };
 }
 const search = { action: 'search', keyword: '測試工作', area_names: [], page: 3 };
 const detail = { action: 'detail', job: { id: '501', url: 'https://www.1111.com.tw/job/501', title: '測試職缺 501', company: '測試公司', companyUrl: 'https://www.1111.com.tw/corp/123/' } };
@@ -92,10 +95,91 @@ test('official names, 台/臺 and unseen codes resolve without guessing', () => 
 test('unsupported area and page above 5 never broaden the query', async () => {
   const { result, requests } = await fixture({ ...search, area_names: ['臺北市'] });
   assert.equal(result.status, 'ok'); assert.equal(new URL(requests[0]).searchParams.get('c0'), '100100');
-  for (const input of [{ ...search, area_names: ['不存在的城市'] }, { ...search, area_names: ['台北市', '台南市'] }, { ...search, page: 6 }]) {
+  for (const input of [{ ...search, area_names: ['不存在的城市'] }, { ...search, page: 6 }]) {
     const { result, requests } = await fixture(input); assert.equal(result.status, 'unsupported'); assert.deepEqual(requests, []);
   }
 });
+
+test('multiple regions navigate sequentially in one page and fetch one official catalogue', async () => {
+  const { result, requests, catalogueRequests, pageCount } = await fixture({ ...search, area_names: ['臺北市', '台南市', '測試縣'] });
+  assert.equal(result.status, 'ok');
+  assert.equal(catalogueRequests, 1); assert.equal(pageCount, 1);
+  assert.deepEqual(requests.map(url => new URL(url).searchParams.get('c0')), ['100100', '101600', '654321']);
+  assert.deepEqual(result.areas.map(area => area.area_name), ['臺北市', '台南市', '測試縣']);
+  for (const area of result.areas) {
+    assert.equal(area.status, 'ok'); assert.deepEqual(area.jobs.map(job => job.id), ['501', '502']);
+    assert.deepEqual([area.page, area.page_size, area.total, area.has_next, area.warnings], [3, 2, 7, true, []]);
+  }
+  assert.doesNotMatch(JSON.stringify(result), /只支援單一地區/);
+});
+
+test('blocked region stops same-context navigation and explicitly marks remaining regions unqueried', async () => {
+  const { result, requests, catalogueRequests, pageCount } = await fixture({ ...search, area_names: ['台北市', '台南市', '測試縣'] }, { blockedArea: '101600' });
+  assert.equal(catalogueRequests, 1); assert.equal(pageCount, 1);
+  assert.deepEqual(result.areas.map(area => area.status), ['ok', 'blocked', 'blocked']);
+  assert.deepEqual(requests.map(url => new URL(url).searchParams.get('c0')), ['100100', '101600']);
+  assert.match(result.areas[2].message, /未查/);
+  for (const area of result.areas.slice(1)) assert.equal('jobs' in area, false);
+});
+
+test('unknown and ambiguous region failures do not broaden or erase the valid region', async () => {
+  const { result, requests, catalogueRequests } = await fixture({ ...search, area_names: ['台南市', '台北市', '不存在的城市'] },
+    { catalogue: [...catalogue, { code: 666666, level: 2, name: '臺北市' }] });
+  assert.equal(catalogueRequests, 1);
+  assert.deepEqual(result.areas.map(area => area.status), ['ok', 'unsupported', 'unsupported']);
+  assert.equal(requests.length, 1); assert.equal(new URL(requests[0]).searchParams.get('c0'), '101600');
+  for (const area of result.areas.slice(1)) {
+    assert.match(area.message, /無法唯一對應/); assert.equal('jobs' in area, false);
+  }
+});
+test('budget validation rejects non-positive, fractional and excessive budgets', () => {
+  for (const budget_ms of [0, -1, 1.5, '45000', null, MAX_BUDGET_MS + 1]) {
+    assert.throws(() => validateInput({ ...search, budget_ms }), /invalid budget/);
+  }
+  for (const budget_ms of [1, SINGLE_AREA_MS, MAX_BUDGET_MS]) validateInput({ ...search, budget_ms });
+});
+
+test('budget returns two complete regions and defers every later region without navigation', async () => {
+  let elapsed = 0, currentUrl, closed = false;
+  const requests = [], timeouts = [];
+  const page = {
+    setDefaultTimeout: value => timeouts.push(value), setDefaultNavigationTimeout: value => timeouts.push(value),
+    bringToFront: async () => {}, on: () => {}, off: () => {},
+    goto: async (url, options) => { currentUrl = url; requests.push(url); timeouts.push(options.timeout); elapsed += 20000; },
+    evaluate: async () => {
+      elapsed += 20000;
+      return { url: currentUrl, title: '搜尋職缺', heading: search.keyword, keywordInput: search.keyword,
+        jobs: [{ id: '501', title: '合成職缺', company: '合成公司', url: 'https://www.1111.com.tw/job/501', companyUrl: 'https://www.1111.com.tw/corp/123' }],
+        initialResult: { page: 1, limit: 1, totalCount: 1, ids: ['501'] } };
+    },
+  };
+  const context = { pages: () => [page], close: async () => { closed = true; },
+    request: { get: async (url, options) => { timeouts.push(options.timeout); return { ok: () => true, json: async () => catalogue }; } } };
+  const result = await runSource(context, { ...search, page: 1, budget_ms: 100000,
+    area_names: ['台北市', '台南市', '測試縣', '台南市中正區'] }, 30000, () => elapsed);
+  assert.equal(closed, true); assert.equal(requests.length, 2);
+  assert.deepEqual(result.areas.map(area => area.status), ['ok', 'ok', 'time_limited', 'time_limited']);
+  for (const area of result.areas.slice(0, 2)) {
+    assert.deepEqual(area.jobs.map(job => job.id), ['501']);
+    assert.deepEqual([area.page, area.page_size, area.total, area.has_next], [1, 1, 1, false]);
+  }
+  for (const area of result.areas.slice(2)) {
+    assert.equal(area.message, '時間不足，此地區未查；可按續查補查。'); assert.equal('jobs' in area, false);
+  }
+  assert.ok(timeouts.every(value => value > 0 && value <= 30000));
+});
+
+test('DOM wait uses the remaining area budget after a slow navigation', async () => {
+  let elapsed = 0, reads = 0, closed = false;
+  const page = { setDefaultTimeout: () => {}, setDefaultNavigationTimeout: () => {},
+    bringToFront: async () => {}, on: () => {}, off: () => {},
+    goto: async (url, options) => { assert.equal(options.timeout, 30000); elapsed = SINGLE_AREA_MS - 1; },
+    evaluate: () => { reads++; return new Promise(() => {}); } };
+  const result = await runSource({ pages: () => [page], close: async () => { closed = true; } },
+    { ...search, budget_ms: SINGLE_AREA_MS }, 30000, () => elapsed);
+  assert.equal(result.status, 'failed'); assert.equal(closed, true); assert.equal(reads, 2);
+}, { timeout: 1000 });
+
 test('invalid stdin returns one safe JSON line before launching Chrome', () => {
   for (const raw of ['not-json', JSON.stringify({ action: 'run', code: 'private' }), 'x'.repeat(32769)]) {
     const child = spawnSync(process.execPath, ['source.mjs'], { cwd: new URL('.', import.meta.url), input: raw, encoding: 'utf8' });
@@ -112,3 +196,4 @@ test('final stalled DOM read keeps prior validation failure without extending de
   assert.equal(reads, 2);
   await assert.rejects(waitForValidDom({ evaluate: () => new Promise(() => {}) }, () => {}, () => {}, 10), /dom_read_timeout/);
 });
+

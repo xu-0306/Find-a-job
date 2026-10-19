@@ -21,7 +21,7 @@ class WorkspaceChecks(unittest.TestCase):
         owner = self
 
         class Source:
-            async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None):
+            async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None, deadline=None, finish_reserve=0):
                 owner.search_calls.append((continuation, exclude_ids))
                 owner.company_exclusions.append(exclude_companies)
                 identifiers = ['alpha', 'beta'] if continuation is None else ['beta', 'gamma']
@@ -33,7 +33,7 @@ class WorkspaceChecks(unittest.TestCase):
                 return {'items': jobs, 'source_results': [{'source': '104', 'status': 'success', 'returned_count': len(jobs)}],
                     'filter_warnings': [], 'continuation': {'next_page': 2}, 'can_continue': continuation is None}
 
-            async def detail(self, job):
+            async def detail(self, job, *, deadline=None, finish_reserve=0):
                 return {'status': 'success', 'identity_verified': True,
                     'detail': {'summary': '已核對身份的職缺全文', 'title': job.title}, 'limitations': []}
 

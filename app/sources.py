@@ -13,7 +13,7 @@ from pydantic import Field, StrictInt
 
 from .job_normalize import company_excluded, company_key, normalize_jobs
 from .source518 import parse_search_response, parse_detail_response
-from .source1111 import Browser1111, BrowserError, search_rows, job_url, company_id
+from .source1111 import Browser1111, BrowserError, search_batch, SINGLE_AREA_SECONDS, STARTUP_SECONDS, WORKER_GRACE_SECONDS, MAX_AREAS, job_url, company_id
 from .store import Criteria, Input, Job
 
 
@@ -411,7 +411,7 @@ class Sources:
                     break
             raise
 
-    async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None):
+    async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None, deadline=None, finish_reserve=0):
         result = {
             'items': [], 'source_results': [], 'filter_warnings': [],
             'new_count': 0, 'duplicate_count': 0, 'excluded_count': 0,
@@ -465,6 +465,9 @@ class Sources:
             page_state.setdefault('page_signatures', [])
             page_state.setdefault('has_next', True)
             page_state.setdefault('total_declared', None)
+            page_state.setdefault('active_areas', None)
+            page_state.setdefault('area_totals', {})
+            page_state.setdefault('pending_next_areas', [])
 
             def warning(message):
                 if message and message not in parser_warnings:
@@ -477,6 +480,8 @@ class Sources:
                     if any(code not in table for code in arguments.criteria.area_codes):
                         raise SourceError('unsupported', '地區代碼無法辨識，請重新選擇地區。')
                     names = [table[x] for x in arguments.criteria.area_codes]
+                if source == '1111' and len(names) > MAX_AREAS:
+                    raise SourceError('unsupported', '1111 一次最多查 10 個地區，請縮小範圍。')
                 if source == '518' and names:
                     if self.regions518 is None:
                         response = await self.request('GET', 'https://statics.518.com.tw/dist/js/common/menu/location.js')
@@ -570,6 +575,7 @@ class Sources:
                         page_state['has_next'] = False
                         break
 
+                    deferred = []
                     if source == '104':
                         payload, raw = await self.call104('search_jobs', dict(
                             keyword=keyword, area=names, page=page,
@@ -611,18 +617,50 @@ class Sources:
                         page_state['has_next'] = payload.get('has_next') is True
                     elif source == '1111':
                         try:
-                            payload = await self.browser1111.call(dict(action='search', keyword=keyword, area_names=names, page=page))
-                            page_rows = search_rows(payload, page)
+                            budget = deadline - time.monotonic() - finish_reserve if deadline is not None else None
+                            if budget is not None and budget < SINGLE_AREA_SECONDS + STARTUP_SECONDS + WORKER_GRACE_SECONDS:
+                                reliable = False
+                                diagnostic.update(truncated=True, quota_limited=True,
+                                    message='時間不足，本次未查完 1111；可按續查補查。')
+                                # Preserve the current page and any pending rows for the continuation.
+                                if not rows and not page_state['seen_ids'] and not result['items']:
+                                    raise SourceError('failed', diagnostic['message'])
+                                break
+                            active = page_state['active_areas'] if page_state['active_areas'] is not None else names
+                            call = dict(action='search', keyword=keyword, area_names=[name for name in active if name], page=page)
+                            payload = await self.browser1111.call(call, **({'timeout': budget} if budget is not None else {}))
+                            page_rows, total, next_areas, limitations, totals, deferred = search_batch(payload, page, active, page_state['area_totals'])
                         except BrowserError as exc:
+                            if exc.status == 'time_limited':
+                                reliable = False
+                                diagnostic.update(truncated=True, quota_limited=True,
+                                    message='時間不足，本次未查完 1111；可按續查補查。')
+                                if not rows and not page_state['seen_ids'] and not result['items']:
+                                    raise SourceError('failed', diagnostic['message']) from None
+                                break
                             raise SourceError(exc.status, exc.message) from None
-                        diagnostic['total_declared'] = payload['total']
-                        page_state['total_declared'] = payload['total']
-                        for limitation in payload.get('warnings', []):
+                        diagnostic['total_declared'] = total
+                        page_state['total_declared'] = total
+                        page_state['area_totals'] = totals
+                        if deferred:
+                            reliable = False
+                            diagnostic.update(truncated=True, quota_limited=True, message=
+                                '；'.join(f'1111 {name or "全台"}：時間不足，此地區未查；可按續查補查。' for name in deferred))
+                            page_state['pending_next_areas'] = list(dict.fromkeys(
+                                page_state['pending_next_areas'] + next_areas))
+                            page_state['active_areas'] = deferred
+                        else:
+                            next_areas = list(dict.fromkeys(page_state['pending_next_areas'] + next_areas))
+                            page_state['pending_next_areas'] = []
+                            page_state['active_areas'] = next_areas
+                        for limitation in limitations:
                             warning(limitation)
-                        page_state['next_page'] = page + 1
+                        if limitations:
+                            reliable = False
+                        page_state['next_page'] = page if deferred else page + 1
                         page_state['next_url'] = None
-                        page_state['has_next'] = payload['has_next']
-                        if page >= 5 and page_state['has_next']:
+                        page_state['has_next'] = bool(deferred or next_areas)
+                        if page >= 5 and page_state['has_next'] and not deferred:
                             page_state['has_next'] = False
                             diagnostic['truncated'] = True
                             reliable = False
@@ -654,7 +692,8 @@ class Sources:
                         else:
                             page_state['next_url'] = None
 
-                    page_state['visited'].append(page_cursor)
+                    if not deferred:
+                        page_state['visited'].append(page_cursor)
                     page_state['pages'] += 1
                     pages_fetched += 1
                     diagnostic['pages'] = page_state['pages']
@@ -671,13 +710,15 @@ class Sources:
                     if page_rows and not jobs and any(isinstance(x, dict) and x.get('is_ad') is not True for x in page_rows):
                         raise SourceError()
                     page_signature = '\x1f'.join(job.source_job_id for job in jobs)
-                    if page_signature in page_state['page_signatures']:
+                    if not deferred and page_signature in page_state['page_signatures']:
                         warning('來源回傳重複的頁面內容，已停止續查以避免無限重複。')
                         reliable = False
                         page_state['has_next'] = False
-                    else:
+                    elif not deferred:
                         page_state['page_signatures'].append(page_signature)
                     add_jobs(jobs)
+                    if deferred:
+                        break
                     if len(rows) >= arguments.limit and (remaining or page_state['has_next']):
                         diagnostic['quota_limited'] = True
                         break
@@ -690,7 +731,16 @@ class Sources:
                 diagnostic['status'] = 'partial' if parser_warnings or diagnostic['truncated'] else ('success' if rows else 'empty')
             except SourceError as exc:
                 if exc.status == 'unsupported':
-                    page_state['has_next'] = False
+                    if source == '1111' and page_state['active_areas'] is not None:
+                        for name in page_state['active_areas'] or ['']:
+                            warning(f'1111 {name or "全台"}：{exc.message}（未取得結果）')
+                    if source == '1111' and page_state['pending_next_areas']:
+                        page_state['active_areas'] = page_state['pending_next_areas']
+                        page_state['pending_next_areas'] = []
+                        page_state['next_page'] += 1
+                        page_state['has_next'] = True
+                    else:
+                        page_state['has_next'] = False
                 diagnostic.update(status='partial' if rows else exc.status, message=exc.message)
             except (ValueError, TypeError, KeyError, ImportError):
                 diagnostic.update(status='partial' if rows else 'failed', message='來源格式或依賴異常，請管理者檢查。')
@@ -724,7 +774,7 @@ class Sources:
             result['continuation'] = _cursor_result(arguments, cursor_sources)
         return result
 
-    async def detail(self, job):
+    async def detail(self, job, *, deadline=None, finish_reserve=0):
         url = str(job.url)
         from .job_normalize import _clean_text
 
@@ -809,11 +859,17 @@ class Sources:
         if job.source == '1111':
             if not job_url(url, job.source_job_id) or not job.company_source_id:
                 raise SourceError('unsupported', '1111 職缺缺少可靠的公司識別資料，未請求詳細頁。')
+            budget = deadline - time.monotonic() - finish_reserve if deadline is not None else None
+            if budget is not None and budget < SINGLE_AREA_SECONDS + STARTUP_SECONDS + WORKER_GRACE_SECONDS:
+                raise SourceError('failed', '時間不足，未讀取 1111 詳細內容。')
             try:
                 payload = await self.browser1111.call(dict(action='detail', job=dict(
                     id=job.source_job_id, title=job.title, company=job.company_name, url=url,
-                    companyUrl=f'https://www.1111.com.tw/corp/{job.company_source_id}/')))
+                    companyUrl=f'https://www.1111.com.tw/corp/{job.company_source_id}/')),
+                    **({'timeout': budget} if budget is not None else {}))
             except BrowserError as exc:
+                if exc.status == 'time_limited':
+                    raise SourceError('failed', '時間不足，未讀取 1111 詳細內容。') from None
                 raise SourceError(exc.status, exc.message) from None
             detail = payload.get('detail')
             if not isinstance(detail, dict):

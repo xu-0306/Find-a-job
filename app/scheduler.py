@@ -1,6 +1,7 @@
 """One daily task for scheduled, catchup, manual and preference-baseline work."""
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -9,10 +10,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import daily
 from .sources import DailySearchInput, enabled_sources
+from .source1111 import call_seconds, MAX_SEARCH_PAGES
 from .security import DEFAULT_USER_ID
 from .store import Criteria, encode, now
 
 TAIPEI = ZoneInfo('Asia/Taipei')
+# Shared across lock waits, startup and all pages for one preference/source.
+DAILY_1111_SECONDS = 600
+
+
+def daily_1111_seconds(criteria):
+    return min(DAILY_1111_SECONDS, call_seconds(len(criteria.area_codes)) * MAX_SEARCH_PAGES)
 
 
 def effective_preferences(store, db, user_id=None):
@@ -141,7 +149,10 @@ class DailyRunner:
                 enabled = enabled_sources(self.store.get(db, 'services', {}))
             for pref in preferences:
                 for source in enabled:
-                    result = await self.sources.search(DailySearchInput(criteria=Criteria.model_validate(pref['criteria']), sources=[source]))
+                    criteria = Criteria.model_validate(pref['criteria'])
+                    result = await self.sources.search(
+                        DailySearchInput(criteria=criteria, sources=[source]),
+                        **({'deadline': time.monotonic() + daily_1111_seconds(criteria)} if source == '1111' else {}))
                     diag = result['source_results'][0]
                     batches.append(dict(preference_id=pref['id'], revision=pref['revision'], source=source, user_id=pref['user_id'],
                                         eligible=diag.get('baseline_eligible') is True, items=result['items'], diagnostic=diag))

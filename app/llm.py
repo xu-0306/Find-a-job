@@ -71,7 +71,7 @@ async def sse_data(response):
     # An unterminated frame is not a completed SSE event.
 
 
-async def stream_model(client, settings, key, protocol, messages, tools, force_tool=False, no_tools=False):
+async def stream_model(client, settings, key, protocol, messages, tools, force_tool=False, no_tools=False, had_success=False):
     payload = build_payload(protocol, settings['llm_model'], messages, tools)
     if force_tool:
         payload['tool_choice'] = {'type': 'any'} if protocol == 'anthropic_messages' else 'required'
@@ -97,9 +97,19 @@ async def stream_model(client, settings, key, protocol, messages, tools, force_t
                             break
                     if status == 413 or any(marker in body.decode('utf-8', 'replace').lower() for marker in OVERFLOW_MARKERS):
                         raise LLMError('context_overflow', OVERFLOW_MESSAGE)
-                code = 'authentication_failed' if status in (401, 403) else 'rate_limited' if status == 429 else 'provider_http_error'
-                raise LLMError(code, f'模型服務回傳 HTTP {status}（{protocol}），請在後台檢查設定。', status in (404, 405, 501),
-                               retryable=status == 429 or (500 <= status < 600 and status != 501))
+                code = 'provider_http_error'
+                message = f'模型服務回傳 HTTP {status}（{protocol}），請在後台檢查設定。'
+                retryable = False
+                if status == 401 or (status == 403 and not had_success):
+                    code = 'authentication_failed'
+                elif status == 403:
+                    code = 'provider_refused'
+                    message = '模型服務中途拒絕了這次請求，可能是內容或長度限制；已取得的內容保留，可以稍後重試或開新對話。'
+                elif status == 429:
+                    code, message, retryable = 'rate_limited', '模型服務目前請求過多，請稍後再試', True
+                elif 500 <= status < 600 and status != 501:
+                    code, message, retryable = 'provider_unavailable', f'模型服務暫時無法回應（HTTP {status}），請稍後再試', True
+                raise LLMError(code, message, status in (404, 405, 501), retryable=retryable)
             if response.headers.get('content-type', '').split(';')[0].strip().lower() != 'text/event-stream':
                 raise LLMError('invalid_stream', '模型服務未提供串流回覆。', retryable=True)
             async for raw in sse_data(response):
@@ -144,7 +154,7 @@ async def test_connection(settings, key, transport=None):
                 messages += [{'role': 'assistant', 'content': text, 'tool_calls': calls},
                              {'role': 'tool', 'tool_call_id': calls[0]['id'], 'content': encode({'ok': True, 'nonce': nonce})}]
                 reply = ''
-                async for item in stream_model(client, settings, key, protocol, messages, tools):
+                async for item in stream_model(client, settings, key, protocol, messages, tools, had_success=True):
                     if item['kind'] == 'tool_call':
                         raise LLMError('tool_test_failed', '模型未完成工具往返。')
                     if item['kind'] == 'text_delta':

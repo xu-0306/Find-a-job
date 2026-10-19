@@ -4,7 +4,7 @@ import unittest
 
 import httpx
 
-from app import context_budget
+from app import context_budget, llm
 from app.chat import SUMMARY_PREFIX, SUMMARY_SYSTEM
 from app.llm_wire import decode_event
 from app.store import encode
@@ -12,6 +12,57 @@ import test_m2_chat as chats
 
 SMALL_WINDOW = 32_000
 SUMMARY_TEXT = '使用者要找台南的軟體職缺，已排除工研院。'
+
+
+class HttpErrorChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_probe_reports_busy_and_mid_test_refusal_without_setting_advice(self):
+        for status in [503, 403]:
+            requests = []
+            def provider(request):
+                payload = json.loads(request.content); requests.append(payload)
+                if status == 403 and len(requests) == 1:
+                    nonce = payload['tools'][0]['parameters']['properties']['nonce']['enum'][0]
+                    return chats.response(call=('probe', 'connection_probe', encode({'nonce': nonce})))
+                return httpx.Response(status)
+            with self.assertRaises(llm.LLMError) as caught:
+                await llm.test_connection(chats.SETTINGS, 'test-key', httpx.MockTransport(provider))
+            self.assertEqual(caught.exception.code, 'provider_unavailable' if status == 503 else 'provider_refused')
+            self.assertNotIn('請在後台檢查設定', caught.exception.message)
+            self.assertEqual(len(requests), 1 if status == 503 else 2)
+
+    async def test_status_classification_and_safe_messages(self):
+        cases = [(401, False, 'authentication_failed', False, False, True),
+                 (403, False, 'authentication_failed', False, False, True),
+                 (403, True, 'provider_refused', False, False, False),
+                 (429, False, 'rate_limited', True, False, False),
+                 (500, False, 'provider_unavailable', True, False, False),
+                 (502, False, 'provider_unavailable', True, False, False),
+                 (503, False, 'provider_unavailable', True, False, False),
+                 (504, False, 'provider_unavailable', True, False, False),
+                 (599, False, 'provider_unavailable', True, False, False),
+                 (501, False, 'provider_http_error', False, True, True),
+                 (404, False, 'provider_http_error', False, True, True),
+                 (405, False, 'provider_http_error', False, True, True),
+                 (422, True, 'provider_http_error', False, False, True)]
+        for status, success, code, retryable, unsupported, setting_message in cases:
+            with self.subTest(status=status, success=success):
+                transport = httpx.MockTransport(lambda request: httpx.Response(status,
+                    json={'error': {'type': 'service_unavailable', 'code': 'private-token!', 'message': 'private provider details'}}))
+                async with httpx.AsyncClient(transport=transport) as client:
+                    with self.assertRaises(llm.LLMError) as caught:
+                        async for _ in llm.stream_model(client, chats.SETTINGS, 'test-key', 'responses', [], [], had_success=success):
+                            pass
+                error = caught.exception
+                self.assertEqual((error.code, error.retryable, error.unsupported), (code, retryable, unsupported))
+                self.assertEqual('請在後台檢查設定' in error.message, setting_message)
+                self.assertNotIn('private', error.message)
+                if code == 'provider_unavailable':
+                    self.assertEqual(error.message, f'模型服務暫時無法回應（HTTP {status}），請稍後再試')
+                if code == 'rate_limited':
+                    self.assertEqual(error.message, '模型服務目前請求過多，請稍後再試')
+                if code == 'provider_refused':
+                    self.assertIn('內容或長度限制', error.message)
+                    self.assertIn('已取得的內容保留', error.message)
 
 
 def tool_round(index, ids):
@@ -111,6 +162,34 @@ class CompactionChecks(unittest.TestCase):
     def texts(payload):
         return [item['content'] for item in payload['input'] if isinstance(item.get('content'), str)]
 
+    def test_compact_budget_boundary_including_provider_overflow(self):
+        from unittest.mock import Mock, patch
+        from app import chat
+        for index, (seconds, expected) in enumerate([(74.99, 0), (75, 0), (75.01, 1)]):
+            # Each request gets an independent long conversation, so prior summaries cannot mask the gate.
+            self.configure()
+            self.seed(40)
+            self.provider()
+            clock = Mock(); clock.monotonic.return_value = 100
+            with patch.object(chat, 'CHAT_SECONDS', seconds), patch.object(chat, 'time', clock):
+                result = self.client.post('/api/chat', json={'request_id': f'compact-{index}', 'text': '繼續'})
+                self.assertEqual(result.status_code, 200, result.text)
+                output = chats.events(result)
+            self.assertEqual(output[-1][1]['status'], 'completed', output)
+            self.assertEqual(len(self.summary_calls), expected)
+            # Remove only this test's synthetic conversation rows before the next boundary case.
+            with self.store.connect(write=True) as db:
+                db.execute('DELETE FROM messages')
+        self.configure(256_000)
+        self.seed(20, size=1000)
+        overflow = httpx.Response(413, text='request entity too large')
+        self.provider(lambda payload: overflow if len(self.reply_calls) == 1 else chats.response(text='完成'))
+        with patch.object(chat, 'CHAT_SECONDS', 74.99), patch.object(chat, 'time', clock):
+            output = chats.events(self.client.post('/api/chat', json={'request_id': 'overflow-low-time', 'text': '繼續'}))
+        self.assertEqual(output[-1][1]['status'], 'completed', output)
+        self.assertEqual(len(self.reply_calls), 2)
+        self.assertEqual(self.summary_calls, [])
+
     def test_masking_alone_does_not_request_summary(self):
         from unittest.mock import patch
         self.configure()
@@ -135,7 +214,12 @@ class CompactionChecks(unittest.TestCase):
             context_budget.mask_tool_results(masked, 1)
             trigger = (context_budget.estimate(messages, tools) + context_budget.estimate(masked, tools)) // 2
             return fit(messages, start, end, trigger, 1, tools, 1)
-        with patch('app.context_budget.fit', side_effect=measured_fit):
+        from app import chat
+        from unittest.mock import Mock
+        clock = Mock(); clock.monotonic.return_value = 100
+        # Without F5 compact returns before measured_fit and the provider never sees MASKED_PREFIX.
+        with patch('app.context_budget.fit', side_effect=measured_fit), \
+                patch.object(chat, 'CHAT_SECONDS', 75), patch.object(chat, 'time', clock):
             output = chats.events(self.client.post('/api/chat', json={'request_id': 'mask-only', 'text': '讀網頁'}))
         self.assertEqual(output[-1][1]['status'], 'completed', output)
         self.assertTrue(any(context_budget.MASKED_PREFIX in json.dumps(payload, ensure_ascii=False) for payload in self.reply_calls))

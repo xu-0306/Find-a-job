@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import time
 from urllib.parse import urlsplit
 
 from .job_normalize import _clean_text
@@ -14,6 +15,7 @@ from .job_normalize import _clean_text
 _MESSAGES = {
     'blocked': '1111 要求人機驗證或拒絕請求，這次未取得可靠結果。',
     'unsupported': '1111 實驗來源目前無法支援此查詢或頁面格式，未改查全國。',
+    'time_limited': '時間不足，此地區未查；可按續查補查。',
     'failed': '1111 實驗來源暫時無法查詢，請稍後再試。',
 }
 
@@ -79,6 +81,69 @@ def search_rows(payload, page):
     return rows
 
 
+# Conservative admission estimate; a page can spend 30 seconds navigating plus DOM validation.
+SINGLE_AREA_SECONDS = 45
+# Mirrors source.mjs STARTUP_MS: imports and Node overhead plus the 15s Chrome launch.
+STARTUP_SECONDS = 20
+# Allow worker JSON output and context shutdown before the bridge's hard timeout.
+WORKER_GRACE_SECONDS = 8
+MAX_AREAS = 10
+MAX_SEARCH_PAGES = 5
+
+
+def call_seconds(area_count):
+    """One browser execution, including startup and graceful shutdown (source.mjs constants)."""
+    return STARTUP_SECONDS + SINGLE_AREA_SECONDS * max(1, area_count) + WORKER_GRACE_SECONDS
+
+
+def search_batch(payload, page, names, previous_totals):
+    """Validate each region with the single-page contract; one bad region cannot erase others."""
+    if not isinstance(payload, dict) or payload.get('status') != 'ok':
+        raise BrowserError('unsupported')
+    if 'areas' in payload:
+        results = payload['areas']
+        expected = names or ['']
+        if (not isinstance(results, list) or len(results) != len(expected) or
+                any(not isinstance(item, dict) or item.get('area_name') != name
+                    for item, name in zip(results, expected))):
+            raise BrowserError('unsupported')
+    else:
+        if len(names) > 1:
+            raise BrowserError('unsupported')
+        results = [dict(payload, area_name=names[0] if names else '')]
+    rows, warnings, failures, next_areas = [], [], [], []
+    totals = dict(previous_totals)
+    successes = 0
+    deferred = []
+    for item in results:
+        name = item['area_name']
+        try:
+            if item.get('status') != 'ok':
+                status, message = item.get('status'), item.get('message')
+                if status not in _MESSAGES or not isinstance(message, str) or not message or len(message) > 500:
+                    raise BrowserError('unsupported')
+                if status == 'time_limited':
+                    deferred.append(name)
+                    continue
+                raise BrowserError(status, message)
+            region_rows = search_rows(item, page)
+        except BrowserError as exc:
+            failures.append(exc.status)
+            warnings.append(f'1111 {name or "全台"}：{exc.message}（未取得結果）')
+            continue
+        successes += 1
+        rows.extend(region_rows)
+        totals[name] = item['total']
+        if item['has_next']:
+            next_areas.append(name)
+        warnings.extend(item.get('warnings', []))
+    if not successes and not deferred:
+        status = 'blocked' if 'blocked' in failures else 'failed' if 'failed' in failures else 'unsupported'
+        raise BrowserError(status, '；'.join(warnings))
+    # Sources.add_jobs performs source_job_id de-duplication and accounts for duplicates.
+    return rows, sum(totals.values()), next_areas, warnings, totals, deferred
+
+
 class Browser1111:
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -97,18 +162,44 @@ class Browser1111:
                 pass
         await process.wait()
 
-    async def call(self, arguments):
-        async with self.lock:
-            node = shutil.which('node')
-            if not node or not self.script.is_file():
-                raise BrowserError('unsupported', '1111 實驗來源需 Node 20+、Chrome 及 experiments/1111-playwright 的 npm ci 依賴；不會自動安裝。')
-            process = None
-            try:
-                process = await asyncio.create_subprocess_exec(node, str(self.script), cwd=self.script.parent,
+    async def call(self, arguments, *, timeout=None):
+        seconds = call_seconds(len(arguments.get('area_names', [])))
+        started = time.monotonic()
+        caller_expires = None if timeout is None else started + max(0, timeout)
+        wait_seconds = seconds if caller_expires is None else max(0, caller_expires - started)
+        executing = False
+        try:
+            # Queue until the caller's deadline, or one execution cap without a deadline.
+            async with asyncio.timeout(wait_seconds) as timer, self.lock:
+                acquired = time.monotonic()
+                cap = seconds if caller_expires is None else min(seconds, caller_expires - acquired)
+                expires = acquired + cap
+                timer.reschedule(asyncio.get_running_loop().time() + max(0, cap))
+                if cap - WORKER_GRACE_SECONDS < SINGLE_AREA_SECONDS + STARTUP_SECONDS:
+                    raise BrowserError('time_limited')
+                node = shutil.which('node')
+                if not node or not self.script.is_file():
+                    raise BrowserError('unsupported', '1111 實驗來源需 Node 20+、Chrome 及 experiments/1111-playwright 的 npm ci 依賴；不會自動安裝。')
+                process = None
+                executing = True
+                starting = asyncio.create_task(asyncio.create_subprocess_exec(node, str(self.script), cwd=self.script.parent,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                    **({'start_new_session': True} if os.name != 'nt' else {}))
-                async with asyncio.timeout(60):
-                    process.stdin.write(json.dumps(arguments, ensure_ascii=False).encode('utf-8'))
+                    **({'start_new_session': True} if os.name != 'nt' else {})))
+                cancelled = False
+                try:
+                    # Startup may already own a child when cancellation arrives; obtain its handle before cleanup.
+                    while not starting.done():
+                        try:
+                            await asyncio.shield(starting)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    process = starting.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    # Lock wait and Node startup consume the same budget, never a fresh one.
+                    worker_input = dict(arguments, budget_ms=max(1, int(
+                        (expires - time.monotonic() - WORKER_GRACE_SECONDS) * 1000)))
+                    process.stdin.write(json.dumps(worker_input, ensure_ascii=False).encode('utf-8'))
                     await process.stdin.drain()
                     process.stdin.close()
                     output = bytearray()
@@ -117,31 +208,33 @@ class Browser1111:
                         if len(output) > 2 * 1024 * 1024:
                             raise BrowserError('unsupported')
                     await process.wait()
-                payload = json.loads(output)
-                if not isinstance(payload, dict):
-                    raise BrowserError('unsupported')
-                if payload.get('status') != 'ok':
-                    status = payload.get('status')
-                    message = payload.get('message')
-                    # The worker emits only fixed public diagnostics, never raw page or browser errors.
-                    if status not in _MESSAGES or not isinstance(message, str) or len(message) > 500:
+                    payload = json.loads(output)
+                    if not isinstance(payload, dict):
                         raise BrowserError('unsupported')
-                    raise BrowserError(status, message)
-                if process.returncode:
-                    raise BrowserError()
-                return payload
-            except asyncio.CancelledError:
-                raise
-            except TimeoutError:
-                raise BrowserError('failed', '1111 查詢等候時間已到，已停止本次瀏覽器。') from None
-            except (OSError, ValueError):
-                raise BrowserError('unsupported', '1111 執行環境或回傳格式無法辨識；請檢查 Node、Chrome 及實驗 npm ci 依賴。') from None
-            finally:
-                if process is not None and process.returncode is None:
-                    cleanup = asyncio.create_task(self._stop(process))
-                    while not cleanup.done():
-                        try:
-                            await asyncio.shield(cleanup)
-                        except asyncio.CancelledError:
-                            continue
-                    cleanup.result()
+                    if payload.get('status') != 'ok':
+                        status = payload.get('status')
+                        message = payload.get('message')
+                        # The worker emits only fixed public diagnostics, never raw page or browser errors.
+                        if status not in _MESSAGES or not isinstance(message, str) or len(message) > 500:
+                            raise BrowserError('unsupported')
+                        raise BrowserError(status, message)
+                    if process.returncode:
+                        raise BrowserError()
+                    return payload
+                finally:
+                    if process is not None and process.returncode is None:
+                        cleanup = asyncio.create_task(self._stop(process))
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                continue
+                        cleanup.result()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            if not executing:
+                raise BrowserError('time_limited') from None
+            raise BrowserError('failed', '1111 查詢執行時間已到，已停止本次瀏覽器。') from None
+        except (OSError, ValueError):
+            raise BrowserError('unsupported', '1111 執行環境或回傳格式無法辨識；請檢查 Node、Chrome 及實驗 npm ci 依賴。') from None

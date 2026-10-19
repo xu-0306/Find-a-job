@@ -1287,7 +1287,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             store.put(db, 'search_provider', provider)
             return {'selection': provider, 'scores': scores}
 
-    async def read_job_details(job_id, auth_hash, user_id, url=None):
+    async def read_job_details(job_id, auth_hash, user_id, url=None, *, deadline=None, finish_reserve=0):
         job = stored_job(job_id) if job_id else SimpleNamespace(source='104', source_job_id=None, url=url)
         try:
             with store.connect() as db:
@@ -1295,7 +1295,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 enabled = sources.enabled_sources(store.get(db, 'services', {}))
             if job.source not in enabled:
                 raise sources.SourceError('unsupported', f'{job.source} 已在後台停用，本次未查詢詳細頁。')
-            result = await app.state.sources.detail(job)
+            result = await app.state.sources.detail(job, **(
+                {'deadline': deadline, 'finish_reserve': finish_reserve} if deadline is not None else {}))
         except sources.SourceError as exc:
             result = {'status': exc.status, 'detail': None, 'identity_verified': False, 'limitations': [exc.message]}
         result.update(job_id=job_id, item=None)
@@ -1431,7 +1432,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             pass
         raise llm.LLMError('invalid_tool', '模型提出的工具或參數不符，請調整後重試。')
 
-    async def invoke_tool(name, arguments, auth_hash, conversation_id, request_id, user_id):
+    async def invoke_tool(name, arguments, auth_hash, conversation_id, request_id, user_id, *, deadline=None, finish_reserve=0):
         with store.connect() as db:
             before_seq = store.turn_before_seq(db, request_id)
         if name == 'lookup_job_areas':
@@ -1501,10 +1502,10 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             if previous:
                 excluded = {f'{job.source}:{job.source_job_id}' for job in map(stored_job, previous['dismissed_ids'])}
                 result = await app.state.sources.search(arguments, continuation=previous.get('_continuation'), exclude_ids=excluded,
-                                                        exclude_companies=excluded_companies)
+                                                        exclude_companies=excluded_companies, deadline=deadline, finish_reserve=finish_reserve)
             else:
                 search_id = str(uuid4())
-                result = await app.state.sources.search(arguments, exclude_companies=excluded_companies)
+                result = await app.state.sources.search(arguments, exclude_companies=excluded_companies, deadline=deadline, finish_reserve=finish_reserve)
             if previous:
                 result['filter_warnings'] = list(dict.fromkeys([*previous.get('filter_warnings', []), *result['filter_warnings']]))
             else:
@@ -1551,7 +1552,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             result = await company_reviews(arguments, auth_hash)
             return result, ('review', result)
         if name == 'get_job_details':
-            result = await read_job_details(arguments.job_id, auth_hash, user_id, arguments.url)
+            result = await read_job_details(arguments.job_id, auth_hash, user_id, arguments.url,
+                                            deadline=deadline, finish_reserve=finish_reserve)
             return result, ('job_detail', result)
         if name == 'list_preferences':
             with store.connect() as db:
@@ -1647,7 +1649,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         queue = asyncio.Queue()
         task = asyncio.create_task(chat.produce_reply(app, body.request_id, settings, key, protocol,
                                                     tool_specs, validate_tool,
-                                                    lambda name, arguments: invoke_tool(name, arguments, auth['hash'], body.conversation_id, body.request_id, auth['user_id']),
+                                                    lambda name, arguments, **budget: invoke_tool(name, arguments, auth['hash'], body.conversation_id, body.request_id, auth['user_id'], **budget),
                                                     auth['hash'], queue, resume_context, initial_search))
         app.state.active_chats[auth['user_id']] = {'request_id': body.request_id, 'conversation_id': body.conversation_id, 'task': task, 'auth_hash': auth['hash']}
         # Start the producer before any cancel endpoint can cancel an unstarted task.
