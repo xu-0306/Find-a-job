@@ -65,6 +65,7 @@
 !/tests/test_web.py
 !/tests/test_source1111.py
 !/tests/test_stage3b_regressions.py
+!/tests/test_stage3c_regressions.py
 
 # Optional 1111 experimental source and probe; keep browser output and dependencies local.
 !/experiments/

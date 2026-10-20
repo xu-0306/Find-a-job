@@ -172,13 +172,13 @@ async function testPushPayloadAndClickSanitization() {
 function testStaticArtifacts() {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "app", "static", "manifest.webmanifest"), "utf8"));
   const worker = fs.readFileSync(path.join(root, "app", "static", "sw.js"), "utf8");
-  assert.match(worker, /job-companion-shell-v35/, "per-area UI update uses a fresh service-worker shell cache");
+  assert.match(worker, /job-companion-shell-v36/, "per-area UI update uses a fresh service-worker shell cache");
   const index = fs.readFileSync(path.join(root, "app", "static", "index.html"), "utf8");
-  assert.match(index, /home\.js\?v=35/, "home script query version matches the UI change");
+  assert.match(index, /home\.js\?v=36/, "home script query version matches the UI change");
   const admin = fs.readFileSync(path.join(root, "app", "static", "admin.html"), "utf8");
   for (const [name, html] of [["index", index], ["admin", admin]]) {
-    assert.match(html, /common\.js\?v=35/, `${name} uses the same common script version`);
-    assert.match(html, /style\.css\?v=35/, `${name} uses the same stylesheet version`);
+    assert.match(html, /common\.js\?v=36/, `${name} uses the same common script version`);
+    assert.match(html, /style\.css\?v=36/, `${name} uses the same stylesheet version`);
   }
   assert.equal(manifest.lang, "zh-Hant");
   assert.equal(manifest.start_url, "/");

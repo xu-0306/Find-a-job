@@ -638,7 +638,7 @@ function appendAreaResults(container, results) {
   for (const area of groups.values()) {
     const sources = area.sources.map(result => {
       const count = Number.isInteger(result.returned_count) ? ` ${result.returned_count}筆` : "";
-      const successLabel = result.returned_count > 0 ? `有結果${count}` : `查詢成功${count}`;
+      const successLabel = result.returned_count === 0 ? "已查，無新增職缺" : result.returned_count > 0 ? `有結果${count}` : "查詢成功";
       const label = ({success: successLabel, empty: "零筆", partial: `${result.completed ? "已完成，有限制／警告" : "尚未完成"}${count}`,
         not_queried: "尚未查詢", blocked: "來源受阻", failed: "查詢失敗", unsupported: "不支援"})[result.status] || "狀態未知";
       return `${result.source || "來源"} ${label}`;

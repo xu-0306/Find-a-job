@@ -56,7 +56,8 @@ class SearchInput(Input):
     criteria: Criteria
     sources: list[str] = Field(default_factory=lambda: ['104', '518'], min_length=1, max_length=3,
         description='通常省略：一律查詢後台已啟用的全部來源（104，以及已啟用的 518、1111）。只有這段對話截至當回合的使用者訊息曾明確指定或排除某個人力銀行時才填，且只有那時才會限縮。1111 為實驗來源，可能因人機驗證受阻。')
-    limit: StrictInt = Field(default=20, ge=1, le=20)
+    limit: StrictInt = Field(default=20, ge=1, le=20,
+        description='每來源回傳筆數，最多填20；多地區時程式會自動提高每來源的有效回傳列數。')
     search_id: str | None = Field(default=None, min_length=1, max_length=100)
     exclude_companies: list[str] = Field(default_factory=list, max_length=20,
         description='使用者要求排除的公司。同時列出使用者說法與搜尋結果中出現的公司全名（例如簡稱與全名各一項）；比對忽略全半形、空白及「股份有限公司」等字樣，任一項包含於公司名稱即排除。排除會套用到這段對話之後的所有搜尋與續查。')
@@ -221,6 +222,8 @@ def mcp_once(name, arguments, cancelled):
 
 _CONTINUATION_VERSION = 2
 _MAX_NEW_PAGES = 5
+AREA_ROW_FLOOR = 5
+MULTI_AREA_ROW_CAP = 50
 _HTTP_TIMEOUT_SECONDS = 30
 _AREA_STATUSES = {'success', 'empty', 'blocked', 'failed', 'unsupported', 'not_queried'}
 
@@ -500,6 +503,8 @@ class Sources:
                             query_name=catalog.get(code)) for code in arguments.criteria.area_codes]
                       if arguments.criteria.area_codes else
                       [dict(key='all', area_code=None, area_name='全台', query_name='')])
+        limit = max(arguments.limit, min(AREA_ROW_FLOOR * len(area_specs), MULTI_AREA_ROW_CAP,
+                                        _page_size(arguments) * len(area_specs))) if len(area_specs) > 1 else arguments.limit
         try:
             cursor = _load_continuation(arguments, continuation)
         except ValueError as exc:
@@ -637,11 +642,11 @@ class Sources:
                 def consume_queues():
                     nonlocal source_new, source_excluded
                     progressed = True
-                    while len(rows) < arguments.limit and progressed:
+                    while len(rows) < limit and progressed:
                         progressed = False
                         for area in area_specs:
                             queue = queues[area['key']]
-                            if queue and len(rows) < arguments.limit:
+                            if queue and len(rows) < limit:
                                 job = queue.pop(0)
                                 if is_excluded(job):
                                     source_excluded += 1
@@ -777,7 +782,7 @@ class Sources:
                 consume_queues()
                 if source in ('104', '518') and not budget_limited and not source_blocked:
                     max_pages = max(_MAX_NEW_PAGES, len(area_specs))
-                    while not source_blocked and len(rows) < arguments.limit and pages_fetched < max_pages:
+                    while not source_blocked and len(rows) < limit and pages_fetched < max_pages:
                         active = [area for area in area_specs
                                   if area_states[area['key']]['has_next'] and area['key'] not in failed_this_call]
                         if not active:
@@ -816,13 +821,13 @@ class Sources:
                                 state.update(status='failed', message='來源格式或依賴異常，請管理者檢查。', queried=True, has_next=True)
                                 failed_this_call.add(area['key'])
                         consume_queues()
-                        if source_blocked or deadline_stop or len(rows) >= arguments.limit:
+                        if source_blocked or deadline_stop or len(rows) >= limit:
                             break
                     if pages_fetched >= max_pages and any(area_states[area['key']]['has_next'] for area in area_specs):
                         page_limited = True
                 elif source == '1111':
                     max_pages = max(_MAX_NEW_PAGES, len(area_specs))
-                    while not source_blocked and len(rows) < arguments.limit and pages_fetched < max_pages:
+                    while not source_blocked and len(rows) < limit and pages_fetched < max_pages:
                         pending = [area for area in area_specs
                                    if area_states[area['key']]['has_next'] and area['key'] not in failed_this_call]
                         if not pending:
@@ -907,7 +912,7 @@ class Sources:
                                 state['has_next'] = False
                                 warning('1111 實驗來源最多查五頁，仍可能有更多職缺，請調整條件或至來源網站查看。', state)
                         consume_queues()
-                        if deferred or len(rows) >= arguments.limit:
+                        if deferred or len(rows) >= limit:
                             break
                     if pages_fetched >= max_pages and any(area_states[area['key']]['has_next'] for area in area_specs):
                         page_limited = True
@@ -957,7 +962,7 @@ class Sources:
                                 if area_states[area['key']]['total_declared'] is not None]
                 remaining_any = any(area_states[area['key']]['remaining'] for area in area_specs)
                 incomplete_any = any(not area_rows[(area['key'], source)]['completed'] for area in area_specs)
-                quota_limited = page_limited or budget_limited or len(rows) >= arguments.limit and (remaining_any or incomplete_any)
+                quota_limited = page_limited or budget_limited or len(rows) >= limit and (remaining_any or incomplete_any)
                 declared_total = sum(total_values) if source != '518' and len(total_values) == len(area_specs) else None
                 diagnostic.update(
                     status=source_status,

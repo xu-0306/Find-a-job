@@ -166,7 +166,7 @@ class SourceContractChecks(unittest.IsolatedAsyncioTestCase):
 
 class R4SourceChecks(unittest.IsolatedAsyncioTestCase):
     async def test_queued_areas_finish_without_sticky_partial(self):
-        for count, size, warned, empty in ((3, 4, False, False), (2, 3, False, True), (4, 2, True, False)):
+        for count, size, warned, empty in ((3, 7, False, False), (2, 12, False, True), (4, 8, True, False)):
             with self.subTest(count=count, size=size, warned=warned, empty=empty):
                 areas = area_catalog()[:count]
                 calls = []
@@ -242,11 +242,13 @@ class R4SourceChecks(unittest.IsolatedAsyncioTestCase):
             body = SEARCH_HTML.replace(link, '').replace('A1', ident)
             if ident != 'A1':
                 body = body.replace('</head>', link.replace('3001008', mapping[areas[1]['name']]) + '</head>')
+                card = body.split('<div id="listContent">', 1)[1].rsplit('  </div>', 1)[0]
+                body = body.replace(card, ''.join(card.replace('B1', f'B{i}') for i in range(1, 11)))
             return httpx.Response(200, text=body)
         service = Sources(interval=0)
         service.regions518 = mapping
         service.request = AsyncMock(side_effect=first_request)
-        args = SearchInput(criteria=dict(keyword='採購', area_codes=[a['code'] for a in areas]), sources=['518'], limit=1)
+        args = SearchInput(criteria=dict(keyword='採購', area_codes=[a['code'] for a in areas]), sources=['518'], limit=5)
         first = await service.search(args)
         self.assertEqual([a['completed'] for a in first['area_results']], [True, False])
         for mode in ('failed', 'budget', 'all_done'):

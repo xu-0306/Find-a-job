@@ -666,4 +666,239 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), count)
         self.assertIn('續查位置版本不支援，請從原搜尋重新開始。', rejected['source_results'][0]['message'])
 
+
+class MultiAreaRowChecks(unittest.IsolatedAsyncioTestCase):
+    def fixture(self, count, limit=20, *, daily=False, size=20, blocked=False, pageable=False):
+        from app.sources import DailySearchInput
+        # Synthetic catalog tests cardinality independently of real city groupings.
+        areas = [dict(code=str(910000 + index), name=f'合成區{index}') for index in range(count)]
+        calls = []
+
+        async def provider(name, args):
+            calls.append(dict(args))
+            index = [area['name'] for area in areas].index(args['area'][0]) if args['area'] else 0
+            if blocked and index == count - 1:
+                raise SourceError('blocked', '合成來源受阻')
+            start = (args['page'] - 1) * args['page_size']
+            jobs = [dict(job_no=f'{index:02}{number:04}', job_name='研發替代役軟體工程師',
+                         company=f'合成科技股份有限公司{index}', location='合成市研發園區',
+                         salary='月薪 40,000～60,000 元',
+                         url=f'https://www.104.com.tw/job/a{index:02}{number:04}') for number in range(start, start + min(size, args['page_size']))]
+            return dict(jobs=jobs, total=1000 if pageable else len(jobs), has_next=pageable), None
+
+        arguments = (DailySearchInput if daily else SearchInput)(
+            criteria=dict(keyword='研發替代役', area_codes=[area['code'] for area in areas]),
+            sources=['104'], limit=limit)
+        return areas, arguments, Sources(mcp_call=provider, interval=0), calls
+
+    async def test_effective_row_caps_and_balanced_areas(self):
+        for count, limit, daily, expected in ((0, 20, False, 20), (1, 20, False, 20),
+                (2, 20, False, 20), (7, 20, False, 35), (10, 20, False, 50),
+                (12, 20, False, 50), (3, 10, False, 15), (7, 100, True, 100),
+                (0, 3, False, 3), (1, 3, False, 3), (4, 2, False, 8), (5, 3, False, 15)):
+            with self.subTest(count=count, limit=limit, daily=daily):
+                areas, arguments, service, calls = self.fixture(count, limit, daily=daily, pageable=True)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await service.search(arguments)
+                self.assertEqual(len(result['items']), expected)
+                self.assertEqual(result['source_results'][0]['returned_count'], expected)
+                counts = [area['returned_count'] for area in result['area_results']]
+                self.assertTrue(all(value > 0 for value in counts))
+                self.assertLessEqual(max(counts) - min(counts), 1)
+                self.assertEqual(len(calls), max(1, count))
+                self.assertTrue(all(call['page'] == 1 and call['page_size'] == min(20, limit) for call in calls))
+
+    async def test_first_pages_return_more_without_extra_requests(self):
+        for count, expected in ((7, 35), (9, 45)):
+            with self.subTest(count=count):
+                areas, arguments, service, calls = self.fixture(count)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await service.search(arguments)
+                self.assertEqual([(call['area'], call['page'], call['page_size']) for call in calls],
+                                 [([area['name']], 1, 20) for area in areas])
+                self.assertEqual(len(result['items']), expected)
+                cursor = json.loads(result['continuation'])['sources']['104']
+                self.assertEqual(sum(len(area['remaining']) for area in cursor['areas'].values()), count * 20 - expected)
+
+    async def test_continuations_keep_page_size_and_effective_cap(self):
+        for count, limit, expected, turns in ((7, 20, 35, 4), (3, 10, 15, 2)):
+            with self.subTest(count=count, limit=limit):
+                areas, arguments, service, calls = self.fixture(count, limit)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await service.search(arguments)
+                    identifiers = set()
+                    for turn in range(turns):
+                        self.assertEqual(len(result['items']), expected)
+                        new_ids = {job.source_job_id for job in result['items']}
+                        self.assertFalse(identifiers & new_ids)
+                        identifiers.update(new_ids)
+                        self.assertEqual(len(calls), count, 'queued rows must not fetch more pages')
+                        if turn == turns - 1:
+                            break
+                        cursor = json.loads(result['continuation'])
+                        self.assertEqual(cursor['sources']['104']['page_size'], min(20, limit))
+                        rejected = await service.search(arguments.model_copy(update={'limit': limit - 1}), continuation=cursor)
+                        self.assertEqual(rejected['source_results'][0]['status'], 'unsupported')
+                        result = await service.search(arguments, continuation=cursor)
+                self.assertFalse(result['can_continue'])
+                self.assertTrue(all(area['completed'] for area in result['area_results']))
+                self.assertEqual(len(identifiers), count * min(20, limit))
+
+    async def test_quota_flags_use_effective_cap_and_preserve_exhaustion(self):
+        for count, limit, size, blocked, expected, limited in (
+                (7, 20, 20, False, 35, True), (3, 10, 20, False, 15, True),
+                (7, 20, 5, False, 35, False), (12, 20, 4, False, 48, False),
+                (7, 20, 4, True, 24, False), (3, 10, 6, True, 12, False)):
+            with self.subTest(count=count, limit=limit, size=size, blocked=blocked):
+                areas, arguments, service, calls = self.fixture(count, limit, size=size, blocked=blocked)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await service.search(arguments)
+                self.assertEqual(len(result['items']), expected)
+                diagnostic = result['source_results'][0]
+                self.assertEqual(diagnostic['quota_limited'], limited)
+                self.assertEqual(diagnostic['truncated'], limited)
+                self.assertEqual(result['can_continue'], limited or blocked)
+                self.assertEqual(diagnostic['status'], 'partial' if limited or blocked else 'success')
+
+    async def test_518_and_1111_use_the_same_effective_cap(self):
+        from unittest.mock import AsyncMock
+        from urllib.parse import parse_qs
+        from test_source1111 import page, row
+        for source in ('518', '1111'):
+            for count, limit, expected in ((7, 20, 35), (3, 10, 15)):
+                with self.subTest(source=source, count=count, limit=limit):
+                    areas, arguments, _, _ = self.fixture(count, limit)
+                    arguments.sources = [source]
+                    names = [area['name'] for area in areas]
+                    mapping = {name: str(3001000 + i) for i, name in enumerate(names)}
+                    requests = []
+                    def transport(request):
+                        index = list(mapping.values()).index(parse_qs(request.url.query.decode())['aa'][0])
+                        requests.append(index)
+                        cards = ''.join(f'<div class="job__card" data-id="A{index}b{i}" data-url="/job-A{index}b{i}.html">'
+                            f'<a class="job__title" href="/job-A{index}b{i}.html">研發工程師</a>'
+                            '<span class="job__comp__name">合成公司</span></div>' for i in range(20))
+                        return httpx.Response(200, text=f'<div id="listContent">{cards}</div>')
+                    browser = AsyncMock()
+                    browser.call.return_value = dict(status='ok', areas=[dict(
+                        page([row(str(100000 + index * 100 + i)) for i in range(20)], size=20, total=20),
+                        area_name=name) for index, name in enumerate(names)])
+                    service = Sources(httpx.MockTransport(transport), browser1111=browser, interval=0)
+                    service.regions518 = mapping
+                    with patch('app.sources.area_catalog', return_value=areas):
+                        result = await service.search(arguments)
+                        self.assertEqual(len(result['items']), expected)
+                        self.assertTrue(all(area['returned_count'] > 0 for area in result['area_results']))
+                        self.assertEqual(result['source_results'][0]['returned_count'], expected)
+                        self.assertTrue(result['source_results'][0]['quota_limited'])
+                        cursor = json.loads(result['continuation'])
+                        self.assertEqual(cursor['sources'][source]['page_size'], min(20, limit))
+                        resumed = await service.search(arguments, continuation=cursor)
+                    self.assertEqual(len(resumed['items']), expected)
+                    self.assertEqual(len(requests), count if source == '518' else 0)
+                    self.assertEqual(browser.call.await_count, 1 if source == '1111' else 0)
+
+    async def test_small_limits_cover_each_first_page_without_extra_requests(self):
+        for count, limit, expected in ((4, 2, 8), (5, 3, 15), (3, 1, 3)):
+            with self.subTest(count=count, limit=limit):
+                areas, arguments, service, calls = self.fixture(count, limit, pageable=True)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    # Before automatic row expansion, the full first round was still fetched.
+                    with patch('app.sources.AREA_ROW_FLOOR', 0):
+                        original = await service.search(arguments)
+                    original_calls = list(calls)
+                    calls.clear()
+                    result = await service.search(arguments)
+                self.assertEqual(len(original['items']), limit)
+                self.assertEqual(len(result['items']), expected)
+                self.assertEqual(calls, original_calls)
+                self.assertEqual([(call['area'], call['page'], call['page_size']) for call in calls],
+                                 [([area['name']], 1, limit) for area in areas])
+                self.assertTrue(result['can_continue'])
+
+    async def test_http_second_round_uses_effective_cap_after_exclusions(self):
+        from urllib.parse import parse_qs, urlencode
+        for source in ('104', '518'):
+            for count, retained, expected in ((3, 4, 15), (4, 3, 20)):
+                with self.subTest(source=source, count=count):
+                    areas, arguments, _, _ = self.fixture(count, 10)
+                    arguments.sources = [source]
+                    names = [area['name'] for area in areas]
+                    mapping = {name: str(3001000 + i) for i, name in enumerate(names)}
+                    calls = []
+
+                    def candidates(index, page):
+                        return [dict(job_no=f'{index}{page}{i:03}', job_name='研發工程師',
+                                     company='合成公司' if page > 1 or i < retained else '排除公司',
+                                     url=f'https://www.104.com.tw/job/a{index}{page}{i:03}')
+                                for i in range(10)]
+
+                    async def provider(name, args):
+                        index = names.index(args['area'][0])
+                        page = args['page']
+                        calls.append((index, page))
+                        return dict(jobs=candidates(index, page), total=100, has_next=True), None
+
+                    def transport(request):
+                        index = list(mapping.values()).index(parse_qs(request.url.query.decode())['aa'][0])
+                        page = 2 if '-P-2' in request.url.path else 1
+                        calls.append((index, page))
+                        cards = ''.join(
+                            f'<div class="job__card" data-id="A{job["job_no"]}" data-url="/job-A{job["job_no"]}.html">'
+                            f'<a class="job__title" href="/job-A{job["job_no"]}.html">研發工程師</a>'
+                            f'<span class="job__comp__name">{job["company"]}</span></div>'
+                            for job in candidates(index, page))
+                        query = urlencode(dict(ad=arguments.criteria.keyword, aa=list(mapping.values())[index]))
+                        return httpx.Response(200, text=f'<link rel="next" href="/job-index-P-{page+1}.html?{query}">'
+                                              f'<div id="listContent">{cards}</div>')
+
+                    service = Sources(httpx.MockTransport(transport), mcp_call=provider, interval=0)
+                    service.regions518 = mapping
+                    self.assertGreaterEqual(count * retained, arguments.limit)
+                    self.assertLess(count * retained, expected)
+                    with patch('app.sources.area_catalog', return_value=areas):
+                        result = await service.search(arguments, exclude_companies=['排除公司'])
+                    self.assertEqual(len(result['items']), expected)
+                    self.assertEqual(calls, [(i, 1) for i in range(count)] + [(i, 2) for i in range(5-count)])
+                    self.assertEqual(result['source_results'][0]['pages_fetched'], 5)
+                    self.assertEqual(result['excluded_count'], count * (10-retained))
+                    self.assertTrue(result['can_continue'])
+
+    async def test_1111_second_round_uses_effective_cap_after_exclusions(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        for count, limit, retained, expected in ((7, 20, 3, 35), (3, 10, 4, 15)):
+            with self.subTest(count=count, limit=limit):
+                areas, arguments, _, _ = self.fixture(count, limit)
+                arguments.sources = ['1111']
+                names = [area['name'] for area in areas]
+                calls = []
+
+                async def worker(args):
+                    number = args['page']
+                    calls.append((list(args['area_names']), number))
+                    results = []
+                    for name in args['area_names']:
+                        index = names.index(name)
+                        jobs = [dict(row(str(100000 + index*1000 + number*100 + i)),
+                                     company='合成公司' if number > 1 or i < retained else '排除公司')
+                                for i in range(20)]
+                        results.append(dict(page(jobs, number=number, size=20, total=100), area_name=name))
+                    return dict(status='ok', areas=results)
+
+                browser = AsyncMock()
+                browser.call.side_effect = worker
+                self.assertGreaterEqual(count * retained, limit)
+                self.assertLess(count * retained, expected)
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await Sources(browser1111=browser, interval=0).search(
+                        arguments, exclude_companies=['排除公司'])
+                self.assertEqual(len(result['items']), expected)
+                self.assertEqual(calls, [(names, 1), (names, 2)])
+                self.assertEqual(browser.call.await_count, 2)
+                self.assertEqual(result['source_results'][0]['pages_fetched'], 2)
+                self.assertEqual(result['excluded_count'], count * (20-retained))
+                self.assertTrue(result['can_continue'])
+
+
 if __name__ == '__main__': unittest.main()

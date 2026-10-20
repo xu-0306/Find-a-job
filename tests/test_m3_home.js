@@ -1462,7 +1462,7 @@ async function testSearchResultsPanelAndAutomaticReviews() {
   const panelAreas = all(home.elements.get("search-results-details"), item => item.className === "area-results")[0];
   assert.ok(panelAreas, "search panel shows per-area results when present");
   assert.equal(panelAreas.open, false, "per-area details stay collapsed when many areas are returned");
-  assert.match(panelAreas.textContent, /\u5408\u6210\u5730\u53404.*104 \u67e5\u8a62\u6210\u529f 0\u7b46/);
+  assert.match(panelAreas.textContent, /\u5408\u6210\u5730\u53404.*104 已查，無新增職缺/);
   assert.match(panelAreas.textContent, /10 區/);
   assert.match(panelAreas.textContent, /合成地區1.*104 零筆/);
   assert.match(panelAreas.textContent, /合成地區2.*518 尚未查詢/);
@@ -2359,7 +2359,38 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   assert.equal(home.elements.get("search-results-panel").hidden, true, "URL-only details do not create candidates");
 }
 
+async function testAreaSuccessZeroDoesNotClaimEmpty() {
+  const home = createContext(); await settle();
+  for (const source of ["104", "518", "1111"]) {
+    for (const count of [1, 7]) {
+      const labels = [];
+      for (const [status, returned_count] of [["success", 0], ["success", count], ["empty", 0]]) {
+        const holder = new FakeElement();
+        home.context.appendAreaResults(holder, [{area_name: "合成地區", source, status, returned_count,
+          completed: true, message: "合成公開訊息"}]);
+        const details = holder.children[0];
+        assert.equal(details.open, false);
+        labels.push(details.children.find(child => child.tagName === "P").textContent);
+      }
+      assert.equal(new Set(labels).size, 3, "success with no additions differs from results and declared empty");
+      assert.match(labels[0], /已查，無新增職缺/);
+      assert.doesNotMatch(labels[0], /零筆|0筆/);
+      assert.match(labels[1], new RegExp(`有結果 ${count}筆`));
+      assert.match(labels[2], /零筆/);
+    }
+    for (const optionalCount of [{}, {returned_count: null}]) {
+      const holder = new FakeElement();
+      home.context.appendAreaResults(holder, [{area_name: "合成地區", source, status: "success",
+        completed: true, ...optionalCount}]);
+      const label = holder.children[0].children.find(child => child.tagName === "P").textContent;
+      assert.match(label, /查詢成功/);
+      assert.doesNotMatch(label, /零筆|0筆/);
+    }
+  }
+}
+
 (async () => {
+  await testAreaSuccessZeroDoesNotClaimEmpty();
   await testMarkdownBlocksAndInline();
   await testMarkdownUnsafeInputStaysText();
   await testMarkdownLinksKeepFocusAndSet();
@@ -2404,7 +2435,7 @@ async function testMarkdownStreamingAndHistoryShareRenderer() {
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 43 checks passed");
+  console.log("test_m3_home: 44 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

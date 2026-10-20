@@ -265,21 +265,21 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
     async def test_multi_area_merge_deduplicates_and_only_continues_unfinished_area(self):
         browser = AsyncMock()
         browser.call.side_effect = [dict(status='ok', areas=[
-            dict(page([row('123')], total=1), area_name='台南市'),
+            dict(page([row('123'), *[row(str(800 + i)) for i in range(8)]], size=9, total=9), area_name='台南市'),
             dict(page([row('123'), row('456')], size=2, total=3), area_name='高雄市')]),
             page([row('789')], number=2, size=2, total=3)]
-        args = SearchInput(criteria={'keyword': '品管', 'area_codes': ['6001014000', '6001016000']}, sources=['1111'], limit=2)
+        args = SearchInput(criteria={'keyword': '品管', 'area_codes': ['6001014000', '6001016000']}, sources=['1111'], limit=5)
         source = Sources(browser1111=browser)
         first = await source.search(args)
-        self.assertEqual([job.source_job_id for job in first['items']], ['123', '456'])
+        self.assertEqual([job.source_job_id for job in first['items']], ['123', '456', *[str(800 + i) for i in range(8)]])
         self.assertEqual(first['duplicate_count'], 1)
-        self.assertEqual(first['source_results'][0]['total_declared'], 4)
+        self.assertEqual(first['source_results'][0]['total_declared'], 12)
         self.assertTrue(first['can_continue'])
         second = await source.search(args, continuation=first['continuation'])
         self.assertEqual(browser.call.call_args.args[0]['area_names'], ['高雄市'])
         self.assertEqual(browser.call.call_args.args[0]['page'], 2)
         self.assertEqual([job.source_job_id for job in second['items']], ['789'])
-        self.assertEqual(second['source_results'][0]['total_declared'], 4)
+        self.assertEqual(second['source_results'][0]['total_declared'], 12)
         self.assertFalse(second['can_continue'])
 
     async def test_partial_area_failure_and_invalid_payload_are_never_empty_success(self):
@@ -390,9 +390,9 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         browser.call.side_effect = [dict(status='ok', areas=[
             dict(page(total=2), area_name='台南市'),
             dict(area_name='高雄市', status='time_limited', message='固定公開訊息')]),
-            page([row('456')]), page([row('789')], number=2, total=2)]
+            page([row(str(456 + i)) for i in range(10)], size=10, total=10), page([row('789')], number=2, total=2)]
         source = Sources(browser1111=browser)
-        args = SearchInput(criteria={'keyword': '品管', 'area_codes': ['6001014000', '6001016000']}, sources=['1111'], limit=1)
+        args = SearchInput(criteria={'keyword': '品管', 'area_codes': ['6001014000', '6001016000']}, sources=['1111'], limit=5)
         first = await source.search(args)
         self.assertEqual([job.source_job_id for job in first['items']], ['123'])
         diag = first['source_results'][0]
@@ -404,7 +404,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         second = await source.search(args, continuation=first['continuation'])
         self.assertEqual(browser.call.call_args.args[0]['area_names'], ['高雄市'])
         self.assertEqual(browser.call.call_args.args[0]['page'], 1)
-        self.assertEqual([job.source_job_id for job in second['items']], ['456'])
+        self.assertEqual([job.source_job_id for job in second['items']], [str(456 + i) for i in range(10)])
         self.assertNotIn('時間不足', encode(second | {'items': [job.model_dump(mode='json') for job in second['items']]}))
         third = await source.search(args, continuation=second['continuation'])
         self.assertEqual(browser.call.call_args.args[0]['area_names'], ['台南市'])
