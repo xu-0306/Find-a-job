@@ -109,12 +109,22 @@ def call_seconds(area_count):
 
 
 def search_batch(payload, page, names, previous_totals):
-    """Validate each region with the single-page contract; one bad region cannot erase others."""
-    if not isinstance(payload, dict) or payload.get('status') != 'ok':
+    """Return independently validated rows and state for every requested area."""
+    expected = names or ['']
+    if not isinstance(payload, dict):
         raise BrowserError('unsupported')
+    if payload.get('status') != 'ok':
+        status = payload.get('status')
+        if status not in _MESSAGES:
+            status = 'unsupported'
+        message = payload.get('message')
+        if not isinstance(message, str) or not message or len(message) > 500:
+            message = _MESSAGES[status]
+        return {'areas': [dict(area_name=name, rows=[], status='not_queried' if status == 'time_limited' else status,
+            total_declared=previous_totals.get(name), has_next=status != 'unsupported', message=message, warnings=[])
+            for name in expected]}
     if 'areas' in payload:
         results = payload['areas']
-        expected = names or ['']
         if (not isinstance(results, list) or len(results) != len(expected) or
                 any(not isinstance(item, dict) or item.get('area_name') != name
                     for item, name in zip(results, expected))):
@@ -122,38 +132,30 @@ def search_batch(payload, page, names, previous_totals):
     else:
         if len(names) > 1:
             raise BrowserError('unsupported')
-        results = [dict(payload, area_name=names[0] if names else '')]
-    rows, warnings, failures, next_areas = [], [], [], []
-    totals = dict(previous_totals)
-    successes = 0
-    deferred = []
-    for item in results:
-        name = item['area_name']
-        try:
-            if item.get('status') != 'ok':
-                status, message = item.get('status'), item.get('message')
-                if status not in _MESSAGES or not isinstance(message, str) or not message or len(message) > 500:
-                    raise BrowserError('unsupported')
-                if status == 'time_limited':
-                    deferred.append(name)
-                    continue
-                raise BrowserError(status, message)
-            region_rows = search_rows(item, page)
-        except BrowserError as exc:
-            failures.append(exc.status)
-            warnings.append(f'1111 {name or "全台"}：{exc.message}（未取得結果）')
+        results = [dict(payload, area_name=expected[0])]
+
+    areas = []
+    for item, name in zip(results, expected):
+        status = item.get('status')
+        if status != 'ok':
+            if status not in _MESSAGES or not isinstance(item.get('message'), str) or not item['message'] or len(item['message']) > 500:
+                status, message = 'unsupported', _MESSAGES['unsupported']
+            else:
+                message = item['message']
+            areas.append(dict(area_name=name, rows=[], status='not_queried' if status == 'time_limited' else status,
+                total_declared=previous_totals.get(name), has_next=status != 'unsupported', message=message, warnings=[]))
             continue
-        successes += 1
-        rows.extend(region_rows)
-        totals[name] = item['total']
-        if item['has_next']:
-            next_areas.append(name)
-        warnings.extend(item.get('warnings', []))
-    if not successes and not deferred:
-        status = 'blocked' if 'blocked' in failures else 'failed' if 'failed' in failures else 'unsupported'
-        raise BrowserError(status, '；'.join(warnings))
-    # Sources.add_jobs performs source_job_id de-duplication and accounts for duplicates.
-    return rows, sum(totals.values()), next_areas, warnings, totals, deferred
+        try:
+            rows = search_rows(item, page)
+        except BrowserError as exc:
+            areas.append(dict(area_name=name, rows=[], status=exc.status,
+                total_declared=previous_totals.get(name), has_next=True, message=exc.message, warnings=[]))
+            continue
+        warnings = item.get('warnings', [])
+        areas.append(dict(area_name=name, rows=rows,
+            status='empty' if item['total'] == 0 and not rows else 'success',
+            total_declared=item['total'], has_next=item['has_next'], message=None, warnings=warnings))
+    return {'areas': areas}
 
 
 class Browser1111:

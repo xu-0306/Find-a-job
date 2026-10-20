@@ -342,6 +342,7 @@ class SourceLimits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result['items']), 100)
         self.assertTrue(result['source_results'][0]['truncated'])
         self.assertTrue(result['source_results'][0]['baseline_eligible'])
+        self.assertFalse(result['area_results'][0]['completed'])
         with self.assertRaises(ValueError): SearchInput(criteria=CRITERIA, limit=21)
 
 

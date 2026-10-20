@@ -210,6 +210,7 @@ def _source_fields(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             "company_source_id": _value(raw, "company_source_id", "custNo", "cust_no"),
             "location": _value(raw, "location"),
             "salary_text": _value(raw, "salary_text", "salary"),
+            "remote_type": _value(raw, "remote", "remoteWorkType"),
             "url": _value(raw, "url"),
             "published_at": _value(raw, "published_at", "appear_date", "appearDate"),
             "summary": _value(raw, "summary", "snippet", "description"),
@@ -249,6 +250,8 @@ def normalize_job(source: str, raw: Mapping[str, Any]) -> Job | None:
     location = _clean_text(fields["location"])
     salary_text = _clean_text(fields["salary_text"])
     summary = _clean_text(fields["summary"])
+    remote_type = ({1: "fully_remote", 2: "partially_remote"}.get(fields.get("remote_type"))
+                   if source == "104" and type(fields.get("remote_type")) is int else None)
     published_at = _parse_published(fields["published_at"], warnings)
     payload: dict[str, Any] = {
         "source": source,
@@ -258,6 +261,7 @@ def normalize_job(source: str, raw: Mapping[str, Any]) -> Job | None:
         "company_source_id": company_source_id,
         "location": location,
         "salary_text": salary_text,
+        "remote_type": remote_type,
         "url": _url(fields["url"]),
         "published_at": published_at,
         "summary": summary,

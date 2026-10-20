@@ -35,8 +35,8 @@ const source = fs.readFileSync(path.join(__dirname, "..", "app", "static", "comm
 const prefix = source.slice(0, source.indexOf("\nlet theme ="));
 const context = {document: {createElement: tag => new Element(tag)}};
 vm.createContext(context);
-vm.runInContext(`${prefix}\nglobalThis.testApi = {criteriaFields, readCriteria, formatTaipeiDateTime, setRegions(items) { regionCatalog = items; }};`, context);
-const {criteriaFields, readCriteria, formatTaipeiDateTime, setRegions} = context.testApi;
+vm.runInContext(`${prefix}\nglobalThis.testApi = {criteriaFields, readCriteria, describe, formatTaipeiDateTime, setRegions(items) { regionCatalog = items; }};`, context);
+const {criteriaFields, readCriteria, describe, formatTaipeiDateTime, setRegions} = context.testApi;
 
 function field(root, name) { return root.querySelector(`[name=${name}]`); }
 function optionCodes(select) { return select.options.map(option => option.value); }
@@ -55,6 +55,12 @@ const select = field(searchable, "area_codes");
 search.value = "台南"; search.dispatch("input");
 assert.deepEqual(optionCodes(select), ["TNN"], "name search filters the native select");
 assert.deepEqual(selectedCodes(searchable), [], "search text does not select a region");
+assert.equal(field(searchable, "remote_only").type, "checkbox");
+assert.equal(field(searchable, "remote_only").checked, false);
+field(searchable, "remote_only").checked = true;
+assert.equal(readCriteria(searchable).remote_only, true);
+assert.match(describe({keyword: "工程師", area_codes: [], min_monthly_salary: null, remote_only: true}), /僅遠端/);
+assert.doesNotMatch(describe({keyword: "工程師", area_codes: [], min_monthly_salary: null}), /僅遠端/);
 search.value = "tpe"; search.dispatch("input");
 assert.deepEqual(optionCodes(select), ["TPE"], "code search is case-insensitive");
 search.value = "missing"; search.dispatch("input");

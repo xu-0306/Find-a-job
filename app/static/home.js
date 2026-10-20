@@ -477,7 +477,7 @@ function writeDismissed(searchId, values) {
 function createSearchState(searchId) {
   return {
     id: String(searchId || ""), jobs: new Map(), jobNumbers: new Map(), recommendations: new Map(),
-    sourceResults: [], criteria: null, sources: [], canContinue: false,
+    sourceResults: [], areaResults: [], criteria: null, sources: [], canContinue: false,
     counts: {}, newIds: new Set(), dismissed: readDismissed(searchId), filterWarnings: [],
   };
 }
@@ -500,13 +500,14 @@ function aggregateSearchState() {
   if (states.length === 1) return states[0];
   const aggregate = {
     id: "__all__", isAggregate: true, jobs: new Map(), jobOwners: new Map(), jobNumbers: new Map(), recommendations: new Map(),
-    sourceResults: [], criteria: states.at(-1)?.criteria || null,
+    sourceResults: [], areaResults: [], criteria: states.at(-1)?.criteria || null,
     sources: [...new Set(states.flatMap(state => state.sources || []))],
     canContinue: states.some(state => state.canContinue), counts: {}, newIds: new Set(), dismissed: new Set(), filterWarnings: [],
     states, actionState: (activeSearchState?.canContinue ? activeSearchState : states.find(state => state.canContinue)) || activeSearchState || states.at(-1),
   };
   for (const [index, state] of states.entries()) {
     for (const source of state.sourceResults || []) aggregate.sourceResults.push({...source, search_id: state.id, batch_index: index + 1});
+    for (const area of state.areaResults || []) aggregate.areaResults.push({...area, search_id: state.id, batch_index: index + 1});
     for (const warning of state.filterWarnings || []) if (!aggregate.filterWarnings.includes(warning)) aggregate.filterWarnings.push(warning);
     for (const job of state.jobs.values()) {
       const id = jobIdentifier(job); if (!id) continue;
@@ -547,7 +548,7 @@ function searchLabel(state) {
     return match?.name || "指定地區";
   }))].join("、") : "";
   const source = (state?.sources || []).filter(Boolean).join("＋");
-  return [areas, keyword, source].filter(Boolean).join(" · ");
+  return [areas, keyword, criteria.remote_only ? "僅遠端" : "", source].filter(Boolean).join(" · ");
 }
 function salaryPresent(job) {
   const salary = String(job?.salary_text || "").trim();
@@ -621,7 +622,37 @@ function sourceResultLabel(source) {
     failed: "來源故障",
     blocked: "來源要求驗證或拒絕請求",
     unsupported: "來源不支援",
+    not_queried: "尚未查詢",
   })[status] || status || "狀態未知";
+}
+function appendAreaResults(container, results) {
+  if (!Array.isArray(results) || !results.length) return;
+  const groups = new Map();
+  for (const result of results) {
+    const key = String(result.area_code ?? "all");
+    if (!groups.has(key)) groups.set(key, {name: result.area_name || "全台", sources: []});
+    groups.get(key).sources.push(result);
+  }
+  const details = node("details", undefined, "area-results");
+  details.append(node("summary", `逐地區來源狀態（${groups.size} 區）`));
+  for (const area of groups.values()) {
+    const sources = area.sources.map(result => {
+      const count = Number.isInteger(result.returned_count) ? ` ${result.returned_count}筆` : "";
+      const successLabel = result.returned_count > 0 ? `有結果${count}` : `查詢成功${count}`;
+      const label = ({success: successLabel, empty: "零筆", partial: `${result.completed ? "已完成，有限制／警告" : "尚未完成"}${count}`,
+        not_queried: "尚未查詢", blocked: "來源受阻", failed: "查詢失敗", unsupported: "不支援"})[result.status] || "狀態未知";
+      return `${result.source || "來源"} ${label}`;
+    });
+    details.append(node("p", `${area.name}：${sources.join("；")}`, "hint"));
+    const messages = area.sources.filter(result => result.message);
+    if (messages.length) {
+      const notes = node("details", undefined, "area-result-messages");
+      notes.append(node("summary", `查看來源訊息（${messages.length}）`));
+      for (const result of messages) notes.append(node("p", `${result.source || "來源"}：${result.message}`, "hint"));
+      details.append(notes);
+    }
+  }
+  container.append(details);
 }
 function resultControl(label, pressed, callback) {
   const button = node("button", label); button.type = "button";
@@ -732,6 +763,7 @@ function renderSearchResultsPanel() {
       const countText = (source.quota_limited || source.truncated) ? "" : ` · ${count} 筆`;
       details.append(node("p", `${source.source || "來源"} · ${label}${countText}${source.message ? ` · ${source.message}` : ""}`, "hint"));
     }
+    appendAreaResults(details, state.areaResults);
     for (const warning of state.filterWarnings || []) details.append(node("p", warning, "hint"));
     details.hidden = !details.children.length;
   }
@@ -805,6 +837,7 @@ function updateSearchState(data, message, {historical = false, render = true} = 
   if (data.criteria) state.criteria = data.criteria;
   if (Array.isArray(data.sources)) state.sources = data.sources.map(String);
   if (Array.isArray(data.source_results)) state.sourceResults = data.source_results;
+  if (Array.isArray(data.area_results)) state.areaResults = data.area_results;
   if (Array.isArray(data.filter_warnings)) state.filterWarnings = data.filter_warnings;
   if (data.can_continue !== undefined) state.canContinue = Boolean(data.can_continue);
   if (Array.isArray(data.new_ids)) state.newIds = new Set(data.new_ids.map(String));
@@ -1456,6 +1489,7 @@ function renderChatEvent(message, name, data, historical = false) {
       const countText = (source.quota_limited || source.truncated) ? "" : ` · ${count}筆候選`;
       details.append(node("p", `${source.source || "來源"}：${sourceResultLabel(source)}${countText}${source.truncated ? " · 尚有結果未掃描" : ""}${source.message ? " · " + source.message : ""}`, "notice"));
     }
+    appendAreaResults(details, data.area_results);
     for (const warning of data.filter_warnings || []) details.append(node("p", warning, "hint"));
     const progress = ensureToolProgress(message);
     if (progress?.progressBody) progress.progressBody.append(details); else container.append(details);

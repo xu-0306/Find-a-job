@@ -241,6 +241,27 @@ class M1Checks(unittest.TestCase):
         self.assertEqual(self.preferences()["effective"], [])
         self.assertEqual(self.preferences()["items"], [])
 
+    def test_admin_default_preferences_normalize_legacy_remote_field_before_change_check(self):
+        with self.store.connect(write=True) as db:
+            self.store.put(db, "default_preferences", [dict(CRITERIA)])
+            self.store.put(db, "default_preferences_revision", 7)
+        daily = self.app.state.daily
+        with patch.object(daily, "request_baseline") as request_baseline:
+            response = self.admin.put("/api/admin/default-preferences", json={"preferences": [CRITERIA]})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()["preferences"][0]["remote_only"])
+            with self.store.connect() as db:
+                self.assertEqual(self.store.get(db, "default_preferences_revision"), 7)
+            request_baseline.assert_not_called()
+
+        with patch.object(daily, "request_baseline") as request_baseline:
+            changed = self.admin.put("/api/admin/default-preferences", json={
+                "preferences": [{**CRITERIA, "remote_only": True}]})
+            self.assertEqual(changed.status_code, 200, changed.text)
+            with self.store.connect() as db:
+                self.assertEqual(self.store.get(db, "default_preferences_revision"), 8)
+            request_baseline.assert_called_once_with()
+
     def test_concurrent_confirmation_writes_once(self):
         proposal = self.propose()
         other = self.user_client()

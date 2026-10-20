@@ -139,7 +139,7 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first['can_continue'])
         cursor = first['continuation']
         self.assertIsInstance(cursor, str)
-        self.assertEqual(json.loads(cursor)['sources']['104']['next_page'], 2)
+        self.assertEqual(json.loads(cursor)['sources']['104']['areas']['all']['next_page'], 2)
 
         service = Sources(mcp_call=provider)
         second = await service.search(search(['104']), continuation=cursor)
@@ -169,7 +169,7 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([job.source_job_id for job in first['items']], ['2'])
         self.assertEqual(first['excluded_count'], 1)
         state = json.loads(first['continuation'])
-        self.assertEqual([row['source_job_id'] for row in state['sources']['104']['remaining']], ['3'])
+        self.assertEqual([row['source_job_id'] for row in state['sources']['104']['areas']['all']['remaining']], ['3'])
         self.assertEqual(state['sources']['104']['seen_ids'], ['1', '2', '3'])
         second = await service.search(search(['104'], limit=1), continuation=first['continuation'], exclude_ids={'104:1'})
         self.assertEqual([job.source_job_id for job in second['items']], ['3'])
@@ -262,8 +262,8 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
         service = Sources(httpx.MockTransport(transport), interval=0)
         first = await service.search(search(['518'], limit=1))
         state = json.loads(first['continuation'])
-        self.assertTrue(state['sources']['518']['next_url'])
-        state['sources']['518']['next_url'] = 'https://www.518.com.tw/job-index-P-2.html?ad=other'
+        self.assertTrue(state['sources']['518']['areas']['all']['next_url'])
+        state['sources']['518']['areas']['all']['next_url'] = 'https://www.518.com.tw/job-index-P-2.html?ad=other'
         calls = len(requests518)
         second = await service.search(search(['518'], limit=1), continuation=json.dumps(state, ensure_ascii=False))
         self.assertEqual(second['source_results'][0]['status'], 'blocked')
@@ -359,5 +359,311 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SourceError):
                 await Sources(mcp_call=blocked).detail(SimpleNamespace(source='104', source_job_id=None, url=url))
 
+
+    async def test_remote_only_uses_104_filter_and_keeps_only_numeric_remote_modes(self):
+        calls = []
+        values = [0, 1, 2, 9, "1"]
+        async def provider(name, args):
+            calls.append((name, args))
+            return {"jobs": [
+                {"job_no": f"remote{i}", "job_name": "實習", "company": "公司",
+                 "url": f"https://www.104.com.tw/job/remote{i}", "remote": value}
+                for i, value in enumerate(values)
+            ], "total": len(values), "has_next": False}, None
+        arguments = SearchInput(criteria={"keyword": "實習", "remote_only": True}, sources=["104"])
+        result = await Sources(mcp_call=provider, interval=0).search(arguments)
+        self.assertEqual(calls[0][1]["remote"], True)
+        self.assertEqual([job.remote_type for job in result["items"]], ["fully_remote", "partially_remote"])
+        diagnostic = result["source_results"][0]
+        self.assertEqual(diagnostic["remote_excluded_count"], 3)
+        self.assertEqual(diagnostic["excluded_count"], 3)
+        self.assertEqual(diagnostic["parser_warning_count"], 0)
+        self.assertEqual(diagnostic["parser_warnings"], [])
+        self.assertEqual(diagnostic["status"], "success")
+        self.assertTrue(diagnostic["baseline_eligible"])
+        self.assertIn("依遠端條件排除 3 筆非遠端職缺。", result["filter_warnings"])
+
+    async def test_remote_exclusion_stays_reliable_and_visible(self):
+        async def provider(name, args):
+            return {"jobs": [
+                {"job_no": "remote", "job_name": "實習", "company": "公司",
+                 "url": "https://www.104.com.tw/job/remote", "remote": 1},
+                {"job_no": "local", "job_name": "實習", "company": "公司",
+                 "url": "https://www.104.com.tw/job/local", "remote": 0},
+            ], "total": 2, "has_next": False}, None
+        result = await Sources(mcp_call=provider, interval=0).search(
+            SearchInput(criteria={"keyword": "實習", "remote_only": True}, sources=["104"]))
+        diagnostic = result["source_results"][0]
+        self.assertEqual([job.source_job_id for job in result["items"]], ["remote"])
+        self.assertEqual(diagnostic["remote_excluded_count"], 1)
+        self.assertEqual(diagnostic["status"], "success")
+        self.assertTrue(diagnostic["baseline_eligible"])
+        self.assertEqual(diagnostic["parser_warnings"], [])
+        self.assertIn("依遠端條件排除 1 筆非遠端職缺。", result["filter_warnings"])
+
+    async def test_remote_exclusion_does_not_override_real_parser_warnings(self):
+        async def provider(name, args):
+            return {"jobs": [
+                {"job_no": "local", "job_name": "實習", "company": "公司",
+                 "url": "https://www.104.com.tw/job/local", "remote": 0},
+                {"job_no": "remote", "job_name": "實習", "company": "公司",
+                 "url": "https://www.104.com.tw/job/remote", "remote": 1},
+                None,
+            ], "total": 3, "has_next": False}, None
+        result = await Sources(mcp_call=provider, interval=0).search(
+            SearchInput(criteria={"keyword": "實習", "remote_only": True}, sources=["104"]))
+        diagnostic = result["source_results"][0]
+        self.assertEqual(diagnostic["remote_excluded_count"], 1)
+        self.assertEqual(diagnostic["status"], "partial")
+        self.assertFalse(diagnostic["baseline_eligible"])
+        self.assertEqual(diagnostic["parser_warning_count"], 1)
+        self.assertTrue(any("格式不完整" in warning for warning in diagnostic["parser_warnings"]))
+        self.assertIn("依遠端條件排除 1 筆非遠端職缺。", result["filter_warnings"])
+
+    async def test_remote_excluded_pages_keep_searching_until_qualified_page(self):
+        calls = []
+        async def provider(name, args):
+            page = args["page"]
+            calls.append(page)
+            rows = {
+                1: [("local-1", 0)],
+                2: [("local-2", 0)],
+                3: [("remote3", 1)],
+            }[page]
+            return {"jobs": [{"job_no": job_no, "job_name": "實習", "company": "公司",
+                              "url": f"https://www.104.com.tw/job/{job_no}", "remote": remote}
+                             for job_no, remote in rows],
+                    "total": 3, "has_next": page < 3}, None
+        result = await Sources(mcp_call=provider, interval=0).search(
+            SearchInput(criteria={"keyword": "實習", "remote_only": True}, sources=["104"], limit=2))
+        diagnostic = result["source_results"][0]
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual([job.source_job_id for job in result["items"]], ["remote3"])
+        self.assertEqual(diagnostic["remote_excluded_count"], 2)
+        self.assertEqual(diagnostic["status"], "success")
+        self.assertTrue(diagnostic["baseline_eligible"])
+        self.assertFalse(result["can_continue"])
+
+    async def test_identical_raw_remote_excluded_pages_still_stop_as_duplicate(self):
+        calls = []
+        async def provider(name, args):
+            page = args["page"]
+            calls.append(page)
+            return {"jobs": [{"job_no": "same-local", "job_name": "實習", "company": "公司",
+                              "url": "https://www.104.com.tw/job/same-local", "remote": 0}],
+                    "total": 3, "has_next": page < 3}, None
+        result = await Sources(mcp_call=provider, interval=0).search(
+            SearchInput(criteria={"keyword": "實習", "remote_only": True}, sources=["104"], limit=2))
+        diagnostic = result["source_results"][0]
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(result["items"], [])
+        self.assertFalse(result["can_continue"])
+        self.assertEqual(diagnostic["status"], "partial")
+        self.assertFalse(diagnostic["baseline_eligible"])
+        self.assertTrue(any("重複的頁面內容" in warning for warning in diagnostic["parser_warnings"]))
+
+    async def test_false_and_missing_remote_only_keep_the_existing_104_arguments(self):
+        calls = []
+        async def provider(name, args):
+            calls.append(args)
+            return {"jobs": [{"job_no": str(len(calls)), "job_name": "採購", "company": "公司",
+                              "url": f"https://www.104.com.tw/job/c{len(calls)}"}],
+                    "total": 1, "has_next": False}, None
+        service = Sources(mcp_call=provider, interval=0)
+        await service.search(SearchInput(criteria={"keyword": "採購"}, sources=["104"]))
+        await service.search(SearchInput(criteria={"keyword": "採購", "remote_only": False}, sources=["104"]))
+        expected = {"keyword": "採購", "area": [], "page": 1, "page_size": 20, "salary_min": None}
+        self.assertEqual(calls, [expected, expected])
+        for value in ("true", 1, 0):
+            with self.subTest(remote_only=value), self.assertRaises(ValueError):
+                SearchInput(criteria={"keyword": "採購", "remote_only": value})
+
+    async def test_remote_only_marks_518_and_1111_unsupported_without_calling_them(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:2]
+        for requested_areas in ([], areas):
+            calls = []
+            async def provider(name, args):
+                calls.append((name, args))
+                return {"jobs": [{"job_no": "remote", "job_name": "採購", "company": "公司",
+                                  "url": "https://www.104.com.tw/job/r", "remote": 1}],
+                        "total": 1, "has_next": False}, None
+            class Browser:
+                async def call(self, *args, **kwargs):
+                    raise AssertionError("remote-only must not call 1111")
+            def no_transport(request):
+                raise AssertionError("remote-only must not call 518")
+            result = await Sources(httpx.MockTransport(no_transport), provider, interval=0, browser1111=Browser()).search(
+                SearchInput(criteria={"keyword": "採購", "area_codes": [item["code"] for item in requested_areas], "remote_only": True}, sources=["104", "518", "1111"]))
+            self.assertEqual([name for name, _ in calls], ["search_jobs"] * max(1, len(requested_areas)))
+            self.assertEqual([call[1]["area"] for call in calls], [[item["name"]] for item in requested_areas] or [[]])
+            self.assertTrue(all(call[1]["remote"] is True for call in calls))
+            by_source = {item["source"]: item for item in result["source_results"]}
+            self.assertEqual(by_source["104"]["status"], "success")
+            for source in ("518", "1111"):
+                self.assertEqual(by_source[source]["status"], "unsupported")
+                self.assertIn("尚未支援遠端工作篩選，本次未查", by_source[source]["message"])
+            self.assertEqual([job.remote_type for job in result["items"]], ["fully_remote"])
+            self.assertEqual([row["status"] for row in result["area_results"] if row["source"] == "518"],
+                             ["unsupported"] * max(1, len(requested_areas)))
+            self.assertEqual([row["status"] for row in result["area_results"] if row["source"] == "1111"],
+                             ["unsupported"] * max(1, len(requested_areas)))
+
+    async def test_old_false_cursor_continues_but_remote_search_cannot_reuse_it(self):
+        calls = []
+        async def provider(name, args):
+            calls.append(args)
+            page = args["page"]
+            return {"jobs": [{"job_no": str(page), "job_name": "採購", "company": "公司",
+                              "url": f"https://www.104.com.tw/job/c{page}"}],
+                    "total": 2, "has_next": page == 1}, None
+        service = Sources(mcp_call=provider, interval=0)
+        false_args = SearchInput(criteria={"keyword": "採購"}, sources=["104"], limit=1)
+        first = await service.search(false_args)
+        state = json.loads(first["continuation"])
+        self.assertNotIn("remote_only", state["criteria"])
+        state["criteria"].pop("remote_only", None)
+        continued = await service.search(false_args, continuation=state)
+        self.assertEqual([args["page"] for args in calls], [1, 2])
+        self.assertEqual(continued["items"][0].source_job_id, "2")
+        new_cursor = await service.search(false_args)
+        calls_before = len(calls)
+        remote_args = SearchInput(criteria={"keyword": "採購", "remote_only": True}, sources=["104"], limit=1)
+        rejected = await service.search(remote_args, continuation=new_cursor["continuation"])
+        self.assertEqual(len(calls), calls_before)
+        self.assertEqual(rejected["source_results"][0]["status"], "unsupported")
+        self.assertIn("續查條件已變更", rejected["source_results"][0]["message"])
+    async def test_each_104_area_has_its_own_declared_empty_failure_and_success(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:3]
+        calls = []
+        async def provider(name, args):
+            calls.append(args)
+            area = args['area']
+            self.assertEqual(len(area), 1)
+            if area == [areas[0]['name']]:
+                return {'jobs': [], 'total': 0, 'has_next': False}, None
+            if area == [areas[1]['name']]:
+                raise SourceError('failed', '合成請求失敗')
+            return {'jobs': [{'job_no': 'last1', 'job_name': '採購', 'company': '合成公司',
+                'url': 'https://www.104.com.tw/job/last1'}], 'total': 1, 'has_next': False}, None
+        result = await Sources(mcp_call=provider, interval=0).search(SearchInput(
+            criteria={'keyword': '採購', 'area_codes': [item['code'] for item in areas]}, sources=['104']))
+        rows = result['area_results']
+        self.assertEqual([args['area'] for args in calls], [[item['name']] for item in areas])
+        self.assertEqual([row['status'] for row in rows], ['empty', 'failed', 'success'])
+        self.assertEqual([row['total_declared'] for row in rows], [0, None, 1])
+        self.assertEqual([row['returned_count'] for row in rows], [0, 0, 1])
+        self.assertEqual(result['source_results'][0]['status'], 'partial')
+        self.assertIsNone(result['source_results'][0]['total_declared'], 'a failed region makes the source-wide total unknown')
+
+    async def test_104_area_pages_and_items_are_interleaved_before_limit(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:3]
+        calls = []
+        async def provider(name, args):
+            area_name = args['area'][0]
+            calls.append(area_name)
+            prefix = str(areas.index(next(item for item in areas if item['name'] == area_name)))
+            jobs = [{'job_no': f'{prefix}{i:02}', 'job_name': '採購', 'company': f'公司{prefix}',
+                     'url': f'https://www.104.com.tw/job/{prefix}{i:02}'} for i in range(20)]
+            return {'jobs': jobs, 'total': 20, 'has_next': False}, None
+        result = await Sources(mcp_call=provider, interval=0).search(SearchInput(
+            criteria={'keyword': '採購', 'area_codes': [item['code'] for item in areas]}, sources=['104'], limit=20))
+        by_prefix = {prefix: sum(job.source_job_id.startswith(prefix) for job in result['items']) for prefix in ('0','1','2')}
+        self.assertEqual(calls, [item['name'] for item in areas])
+        self.assertTrue(all(count >= 6 for count in by_prefix.values()), by_prefix)
+        self.assertEqual([row['returned_count'] for row in result['area_results']], [7, 7, 6])
+        cursor = json.loads(result['continuation'])['sources']['104']['areas']
+        self.assertEqual(sum(len(cursor[item['code']]['remaining']) for item in areas), 40)
+        self.assertTrue(result['can_continue'])
+
+    async def test_http_deadline_marks_unqueried_areas_and_continues_only_them(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:3]
+        clock = {'now': 0}
+        calls = []
+        async def provider(name, args):
+            area = args['area'][0]
+            calls.append(area)
+            clock['now'] = 31
+            suffix = str(areas.index(next(item for item in areas if item['name'] == area)))
+            return {'jobs': [{'job_no': f'd{suffix}', 'job_name': '採購', 'company': '合成公司',
+                'url': f'https://www.104.com.tw/job/d{suffix}'}], 'total': 1, 'has_next': False}, None
+        source = Sources(mcp_call=provider, interval=0)
+        args = SearchInput(criteria={'keyword': '採購', 'area_codes': [item['code'] for item in areas]}, sources=['104'])
+        with patch('app.sources.time.monotonic', side_effect=lambda: clock['now']):
+            first = await source.search(args, deadline=60)
+        self.assertEqual(calls, [areas[0]['name']])
+        self.assertEqual([row['status'] for row in first['area_results']], ['success', 'not_queried', 'not_queried'])
+        self.assertTrue(first['can_continue'])
+        resumed = await source.search(args, continuation=first['continuation'])
+        self.assertEqual(calls, [item['name'] for item in areas])
+        self.assertEqual([row['status'] for row in resumed['area_results']], ['success', 'success', 'success'])
+        self.assertEqual([row['returned_count'] for row in resumed['area_results']], [1, 1, 1])
+
+    async def test_518_unmapped_area_is_unsupported_without_skipping_mapped_area(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:2]
+        calls = []
+        def transport(request):
+            calls.append(str(request.url))
+            return httpx.Response(200, text='<div id="listContent">查無符合條件的職缺</div>')
+        source = Sources(httpx.MockTransport(transport), interval=0)
+        source.regions518 = {areas[1]['name']: '3001008'}
+        result = await source.search(SearchInput(
+            criteria={'keyword': '採購', 'area_codes': [item['code'] for item in areas]}, sources=['518']))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('aa=3001008', calls[0])
+        self.assertEqual([row['status'] for row in result['area_results']], ['unsupported', 'empty'])
+        self.assertEqual(result['source_results'][0]['status'], 'partial')
+        self.assertFalse(result['can_continue'])
+
+    async def test_all_taiwan_is_one_area_and_keeps_the_104_parameter_shape(self):
+        calls = []
+        async def provider(name, args):
+            calls.append(args)
+            return {'jobs': [{'job_no': 'all1', 'job_name': '採購', 'company': '合成公司',
+                'url': 'https://www.104.com.tw/job/all1'}], 'total': 1, 'has_next': False}, None
+        result = await Sources(mcp_call=provider, interval=0).search(SearchInput(
+            criteria={'keyword': '採購'}, sources=['104']))
+        self.assertEqual(calls[0]['area'], [])
+        self.assertEqual(result['area_results'], [dict(area_code=None, area_name='全台', source='104', status='success',
+            returned_count=1, total_declared=1, message=None, completed=True)])
+
+    async def test_v1_single_area_cursor_maps_and_multi_area_cursor_is_rejected(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:2]
+        calls = []
+        async def provider(name, args):
+            calls.append((args['area'], args['page']))
+            page_no = args['page']
+            ident = f'old{page_no}'
+            return {'jobs': [{'job_no': ident, 'job_name': '採購', 'company': '合成公司',
+                'url': f'https://www.104.com.tw/job/{ident}'}], 'total': 3, 'has_next': page_no < 3}, None
+        source = Sources(mcp_call=provider, interval=0)
+        one = SearchInput(criteria={'keyword': '採購', 'area_codes': [areas[0]['code']]}, sources=['104'], limit=1)
+        first = await source.search(one)
+        cursor = json.loads(first['continuation'])
+        cursor['version'] = 1
+        source_state = cursor['sources']['104']
+        page_state = source_state['areas'][areas[0]['code']]
+        cursor['sources']['104'] = dict(page_size=source_state['page_size'], next_page=page_state['next_page'],
+            next_url=page_state['next_url'], remaining=page_state['remaining'], seen_ids=source_state['seen_ids'],
+            pages=page_state['pages'], visited=page_state['visited'], page_signatures=page_state['page_signatures'],
+            has_next=page_state['has_next'], total_declared=page_state['total_declared'],
+            parser_warnings=source_state['parser_warnings'])
+        resumed = await source.search(one, continuation=cursor)
+        self.assertEqual(calls[-1], ([areas[0]['name']], 2))
+        self.assertEqual(resumed['items'][0].source_job_id, 'old2')
+        self.assertEqual(json.loads(resumed['continuation'])['version'], 2)
+
+        many = SearchInput(criteria={'keyword': '採購', 'area_codes': [item['code'] for item in areas]}, sources=['104'])
+        old_multi = {'version': 1, 'criteria': {'keyword': '採購', 'area_codes': [item['code'] for item in areas],
+            'min_monthly_salary': None}, 'sources': {'104': {'page_size': 20, 'seen_ids': [], 'parser_warnings': []}}}
+        count = len(calls)
+        rejected = await source.search(many, continuation=old_multi)
+        self.assertEqual(len(calls), count)
+        self.assertIn('續查位置版本不支援，請從原搜尋重新開始。', rejected['source_results'][0]['message'])
 
 if __name__ == '__main__': unittest.main()

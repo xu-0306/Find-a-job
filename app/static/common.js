@@ -45,7 +45,7 @@ function formAction(form, handler) {
     finally { button.disabled = false; }
   });
 }
-function criteriaFields(criteria = {keyword: "", area_codes: [], min_monthly_salary: null}) {
+function criteriaFields(criteria = {keyword: "", area_codes: [], min_monthly_salary: null, remote_only: false}) {
   const fields = node("div", undefined, "grid");
   for (const [name, title, value] of [["keyword", "工作關鍵字", criteria.keyword],
     ["min_monthly_salary", "最低月薪（元；空白不限）", criteria.min_monthly_salary ?? ""]]) {
@@ -58,6 +58,9 @@ function criteriaFields(criteria = {keyword: "", area_codes: [], min_monthly_sal
     if (name === "min_monthly_salary") { input.min = 0; input.max = 10000000; input.step = 1; }
     label.append(input); fields.append(label);
   }
+  const remoteLabel = node("label", "僅遠端");
+  const remoteInput = node("input"); remoteInput.type = "checkbox"; remoteInput.name = "remote_only"; remoteInput.checked = criteria.remote_only === true;
+  remoteLabel.append(remoteInput); fields.append(remoteLabel);
   const regions = node("div", undefined, "stack");
   const searchLabel = node("label", "搜尋地區名稱或代碼");
   const search = node("input"); search.type = "search"; search.placeholder = "輸入地區名稱或代碼";
@@ -106,10 +109,11 @@ function criteriaFields(criteria = {keyword: "", area_codes: [], min_monthly_sal
 function readCriteria(container) {
   return {keyword: $("[name=keyword]", container).value.trim(),
     area_codes: [...$("[name=area_codes]", container).selectedOptions].map(option => option.value),
-    min_monthly_salary: $("[name=min_monthly_salary]", container).value === "" ? null : Number($("[name=min_monthly_salary]", container).value)};
+    min_monthly_salary: $("[name=min_monthly_salary]", container).value === "" ? null : Number($("[name=min_monthly_salary]", container).value),
+    remote_only: $("[name=remote_only]", container).checked};
 }
 function describe(criteria) {
-  return criteria ? `${criteria.keyword} · 地區 ${criteria.area_codes.map(code => regionCatalog.find(item => item.code === code)?.name || code).join("、") || "不限"} · ${criteria.min_monthly_salary === null ? "薪資不限" : `最低月薪 ${criteria.min_monthly_salary} 元`}` : "無條件";
+  return criteria ? `${criteria.keyword} · 地區 ${criteria.area_codes.map(code => regionCatalog.find(item => item.code === code)?.name || code).join("、") || "不限"} · ${criteria.min_monthly_salary === null ? "薪資不限" : `最低月薪 ${criteria.min_monthly_salary} 元`}${criteria.remote_only ? " · 僅遠端" : ""}` : "無條件";
 }
 function formatTaipeiDateTime(value) {
   if (value == null || value === "") return "時間未提供";

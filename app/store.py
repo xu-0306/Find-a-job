@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictBool, field_validator
 from typing import Literal
 
 
@@ -26,6 +26,7 @@ class Criteria(Input):
     keyword: str = Field(min_length=1, max_length=100, description="職務名稱或技能詞（一個精簡片語）；地區放 area_codes，薪資、正職兼職、福利等不放這裡（518 會比對任一詞，泛用詞會帶回不相干職缺）。")
     area_codes: list[str] = Field(default_factory=list, max_length=20)
     min_monthly_salary: int | None = Field(default=None, ge=0, le=10000000)
+    remote_only: StrictBool = Field(default=False, description="使用者要求遠端、遠距或在家工作時設為 true；這些字不要放進 keyword。")
 
     # The region codes belong to the upstream service; do not invent a local city map.
     def model_post_init(self, context):
@@ -42,6 +43,7 @@ class Job(Input):
     company_source_id: str | None = Field(default=None, max_length=200)
     location: str | None = Field(default=None, max_length=500)
     salary_text: str | None = Field(default=None, max_length=500)
+    remote_type: Literal["fully_remote", "partially_remote"] | None = None
     url: HttpUrl
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=now)

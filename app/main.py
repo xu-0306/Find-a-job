@@ -756,7 +756,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         values = [value.model_dump() for value in body.preferences]
         with store.connect(write=True) as db:
             ensure_active(db, auth['hash'])
-            previous = store.get(db, 'default_preferences', [])
+            previous = [Criteria.model_validate(value).model_dump() for value in store.get(db, 'default_preferences', [])]
             changed = values != previous
             if changed:
                 store.put(db, 'default_preferences_revision', store.get(db, 'default_preferences_revision', 1 if previous else 0) + 1)
@@ -1407,7 +1407,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
          'parameters': ProposalInput.model_json_schema()},
         {'name': 'search_jobs', 'description': '只有使用者要找、推薦或比較職缺時才使用 search_jobs；分析、查評價、職涯建議或詢問特定職缺時不搜尋。識別特定職缺先以 get_job_details 讀使用者提供的 104 網址，讀不到就請使用者提供內容，不用搜尋尋找。依使用者條件或履歷中的技能與經驗搜尋職缺；sources 通常省略，以查詢後台已啟用的全部來源。使用者要求排除某公司時填 exclude_companies，之後本對話的搜尋都會套用。只傳求職條件，不傳履歷全文或聯絡資料。來源失敗及薪資篩選限制須如實告知。', 'parameters': sources.SearchInput.model_json_schema()},
         {'name': 'lookup_job_areas', 'description': '由地區名稱查官方地區代碼；搜尋前先查碼，不猜數字。', 'parameters': AreaLookup.model_json_schema()},
-        {'name': 'present_job_recommendations', 'description': '維護這段對話的職缺清單：只是比較、不改精選時直接在回覆文字比較，不呼叫此工具。要改精選時 items 提交完整清單（取代先前精選，依推薦順序）；items 空陣列且沒有 removed 才清空精選，removed 把使用者不要或不適合的已取得職缺移出清單並附原因。只能用本次對話已取得的job_id；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
+        {'name': 'present_job_recommendations', 'description': '維護這段對話的職缺清單：只是比較、不改精選時直接在回覆文字比較，不呼叫此工具。要改精選時 items 提交完整清單（取代先前精選，依推薦順序）；只要回覆列出推薦職缺就必須提交其job_id；items 空陣列且沒有 removed 才清空精選，removed 把使用者不要或不適合的已取得職缺移出清單並附原因。accepted_count 是去重後實際接受數，回覆筆數只能引用此值。只比較、不列推薦且不改精選時不呼叫此工具。只能用本次對話已取得的job_id；reasons/concerns/unknowns只寫有資料支持的適配理由、注意點與未知條件。不查外網或修改每日条件。', 'parameters': Recommendations.model_json_schema()},
         {'name': 'get_job_details', 'description': '以 job_id 讀取已保存職缺，或以 url 直接讀使用者提供的 104 職缺網址（可帶查詢參數）；兩者擇一。網址讀取不新增搜尋候選。未驗證的詳細資料不能聲稱身份已核對。', 'parameters': sources.DetailInput.model_json_schema()},
         {'name': 'get_company_reviews', 'description': '使用者詢問或要求時才查公司評價；同名不明時請使用者選擇。', 'parameters': reviews.ReviewInput.model_json_schema()},
         {'name': 'read_web_page', 'description': '讀取使用者提供或與其要求直接相關的公開網頁，例如 GitHub 個人頁、專案 README、個人網站及作品集。一次一個完整 HTTP／HTTPS 網址；回傳文字及来源網址。不能登入或搜尋，失敗、截斷與未讀連結須如實說明。', 'parameters': web.ReadInput.model_json_schema()},
@@ -1456,7 +1456,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                         citation_number=allowed.index(item.job_id) + 1,
                         is_favorite=bool(db.execute('SELECT 1 FROM favorites WHERE job_id=? AND user_id=?', (item.job_id, user_id)).fetchone()))})
                 removed = list({item.job_id: item.model_dump() for item in arguments.removed if item.job_id in allowed and item.job_id not in seen}.values())
-            result = {'items': items, 'removed': removed, 'replace': arguments.replaces_shortlist}
+            result = {'items': items, 'removed': removed, 'replace': arguments.replaces_shortlist, 'accepted_count': len(items)}
             return result, ('recommendations', result)
         if name == 'read_web_page':
             with store.connect() as db:

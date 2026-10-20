@@ -36,6 +36,9 @@ def _batch(batch: Mapping[str, Any], index: int) -> dict[str, Any]:
     diagnostic = batch.get("diagnostic")
     if not isinstance(diagnostic, Mapping):
         raise ValueError("diagnostic must be an object")
+    area_results = batch.get("area_results", [])
+    if not isinstance(area_results, list):
+        raise ValueError("area_results must be a list")
     for item in items:
         if not isinstance(item, Job):
             raise ValueError("items must contain Job values")
@@ -49,6 +52,7 @@ def _batch(batch: Mapping[str, Any], index: int) -> dict[str, Any]:
         "eligible": eligible,
         "items": items,
         "diagnostic": dict(diagnostic),
+        "area_results": list(area_results),
     }
 
 
@@ -152,6 +156,7 @@ def _commit_account(db, user_id, records, local_date, run_id, timestamp):
     new_count = sum(_insert_daily(db, user_id, local_date, job_id, run_id, False) for job_id in regular_ids)
 
     source_results = []
+    area_results = []
     for record in records:
         batch = record["batch"]
         result = dict(batch["diagnostic"])
@@ -164,7 +169,9 @@ def _commit_account(db, user_id, records, local_date, run_id, timestamp):
             completed=batch["eligible"],
         )
         source_results.append(result)
-    return {"new_count": new_count, "initial_count": initial_count, "source_results": source_results}
+        area_results.extend(batch["area_results"])
+    return {"new_count": new_count, "initial_count": initial_count,
+            "source_results": source_results, "area_results": area_results}
 
 
 def commit_results(store, db, run_id, local_date, batches, timestamp):
@@ -204,9 +211,11 @@ def commit_results(store, db, run_id, local_date, batches, timestamp):
             local_date, run_id, timestamp)
 
     source_results = [item for user_id in users for item in users[user_id]["source_results"]]
+    area_results = [item for user_id in users for item in users[user_id]["area_results"]]
     return {
         "new_count": sum(mine["new_count"] for mine in users.values()),
         "initial_count": sum(mine["initial_count"] for mine in users.values()),
         "source_results": source_results,
+        "area_results": area_results,
         "users": users,
     }

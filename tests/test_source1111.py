@@ -45,6 +45,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
                 result = await Sources(browser1111=browser).search(args, deadline=100 + budget)
             self.assertEqual(browser.call.await_count, int(admitted))
             self.assertEqual(result['source_results'][0]['status'], 'success' if admitted else 'failed')
+            if not admitted: self.assertEqual(result['area_results'][0]['status'], 'not_queried')
             if not admitted:
                 self.assertTrue(result['can_continue'])
         bridge = Browser1111()
@@ -150,7 +151,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(diag['baseline_eligible']); self.assertTrue(result['can_continue'])
         self.assertIn('時間不足', diag['message']); self.assertNotIn('已停止', diag['message'])
         state = json.loads(result['continuation'])['sources']['1111']
-        self.assertEqual(state['next_page'], 1); self.assertEqual(state['parser_warnings'], [])
+        self.assertEqual(state['areas']['all']['next_page'], 1); self.assertEqual(state['parser_warnings'], [])
         browser.call.side_effect = None; browser.call.return_value = page()
         resumed = await source.search(args, continuation=result['continuation'])
         self.assertEqual(browser.call.call_args.args[0]['page'], 1)
@@ -166,15 +167,16 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         args = SearchInput(criteria={'keyword': '品管', 'area_codes': ['6001014000', '6001016000']}, sources=['1111'], limit=1)
         first = await source.search(args)
         second = await source.search(args, continuation=first['continuation'])
-        self.assertTrue(second['can_continue']); self.assertFalse(second['source_results'][0]['baseline_eligible'])
-        self.assertTrue(any('高雄市' in warning for warning in second['source_results'][0]['parser_warnings']))
-        cursor = json.loads(second['continuation'])['sources']['1111']
-        self.assertEqual(cursor['active_areas'], ['台南市']); self.assertEqual(cursor['next_page'], 2)
-        third = await source.search(args, continuation=second['continuation'])
+        self.assertEqual([(call.args[0]['area_names'], call.args[0]['page']) for call in browser.call.call_args_list],
+                         [(['台南市', '高雄市'], 1), (['高雄市'], 1), (['台南市'], 2)])
+        self.assertFalse(second['source_results'][0]['baseline_eligible'])
+        self.assertIn('高雄市', second['source_results'][0]['message'])
+        self.assertEqual([row['status'] for row in second['area_results']], ['success', 'unsupported'], second['area_results'])
+        self.assertEqual(second['area_results'][1]['area_name'], '高雄市')
         self.assertEqual(browser.call.call_args.args[0]['area_names'], ['台南市'])
         self.assertEqual(browser.call.call_args.args[0]['page'], 2)
-        self.assertEqual([job.source_job_id for job in third['items']], ['456'])
-        self.assertFalse(third['can_continue'])
+        self.assertEqual([job.source_job_id for job in second['items']], ['456'])
+        self.assertFalse(second['can_continue'])
 
     async def test_daily_budget_five_pages_and_multi_area_ceiling(self):
         # All five pages must fit even if each consumes the full single-area execution cap.
@@ -291,7 +293,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
                 diagnostic = result['source_results'][0]
                 self.assertEqual(diagnostic['status'], 'partial')
                 self.assertFalse(diagnostic['baseline_eligible'])
-                self.assertEqual(diagnostic['total_declared'], 1)
+                self.assertIsNone(diagnostic['total_declared'])
                 self.assertIn('高雄市', diagnostic['message'])
                 self.assertEqual(len(result['items']), 1)
 
@@ -306,37 +308,75 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
             self.assertIn('台南市', result['source_results'][0]['message'])
             self.assertIn('高雄市', result['source_results'][0]['message'])
 
-    async def test_old_cursor_without_region_fields_still_continues(self):
+    async def test_worker_area_success_failure_and_time_limited_are_preserved_and_resumed(self):
+        from app.sources import area_catalog
+        areas = area_catalog()[:3]
+        names = [item['name'] for item in areas]
         browser = AsyncMock()
-        browser.call.side_effect = [page(total=2), page([row('456')], number=2, total=2)]
-        args = SearchInput(criteria={'keyword': '品管'}, sources=['1111'], limit=1)
+        browser.call.side_effect = [
+            dict(status='ok', areas=[dict(page([row('123')]), area_name=names[0]),
+                dict(area_name=names[1], status='blocked', message='要求驗證'),
+                dict(area_name=names[2], status='time_limited', message='時間不足')]),
+            dict(status='ok', areas=[dict(page([row('456')]), area_name=names[1]),
+                dict(page([row('789')]), area_name=names[2])]),
+        ]
+        args = SearchInput(criteria={'keyword': '品管', 'area_codes': [item['code'] for item in areas]},
+            sources=['1111'], limit=20)
         source = Sources(browser1111=browser)
         first = await source.search(args)
-        cursor = json.loads(first['continuation'])
-        state = cursor['sources']['1111']
-        del state['active_areas']; del state['area_totals']
-        second = await source.search(args, continuation=json.dumps(cursor, ensure_ascii=False))
-        self.assertEqual([job.source_job_id for job in second['items']], ['456'])
-        self.assertEqual(browser.call.call_args.args[0]['page'], 2)
+        self.assertEqual([row['status'] for row in first['area_results']], ['success', 'blocked', 'not_queried'])
+        self.assertEqual([row['completed'] for row in first['area_results']], [True, False, False])
+        self.assertTrue(first['can_continue'])
+        resumed = await source.search(args, continuation=first['continuation'])
+        self.assertEqual(browser.call.call_args.args[0]['area_names'], names[1:])
+        self.assertEqual(browser.call.call_args.args[0]['page'], 1)
+        self.assertEqual([row['status'] for row in resumed['area_results']], ['success', 'success', 'success'])
+        self.assertEqual([row['returned_count'] for row in resumed['area_results']], [1, 1, 1])
+        self.assertFalse(resumed['can_continue'])
+
+    async def test_old_v1_single_area_cursor_maps_to_area_state(self):
+        for region_fields in (False, True):
+            browser = AsyncMock()
+            browser.call.side_effect = [page(total=2), page([row('456')], number=2, total=2)]
+            args = SearchInput(criteria={'keyword': '品管'}, sources=['1111'], limit=1)
+            source = Sources(browser1111=browser)
+            first = await source.search(args)
+            cursor = json.loads(first['continuation'])
+            cursor['version'] = 1
+            state = cursor['sources']['1111']
+            area = state['areas']['all']
+            cursor['sources']['1111'] = dict(page_size=state['page_size'], next_page=area['next_page'],
+                next_url=area['next_url'], remaining=area['remaining'], seen_ids=state['seen_ids'], pages=area['pages'],
+                visited=area['visited'], page_signatures=area['page_signatures'], has_next=area['has_next'],
+                total_declared=area['total_declared'], parser_warnings=state['parser_warnings'],
+                pending_next_areas=[])
+            if region_fields:
+                cursor['sources']['1111'].update(active_areas=[''], area_totals={'': area['total_declared']})
+            second = await source.search(args, continuation=json.dumps(cursor, ensure_ascii=False))
+            self.assertEqual([job.source_job_id for job in second['items']], ['456'])
+            self.assertEqual(browser.call.call_args.args[0]['page'], 2)
 
     async def test_deadline_skips_browser_and_preserves_continuation_without_stale_warning(self):
         browser = AsyncMock()
         result = await Sources(mcp_call=fake104, browser1111=browser).search(
             SearchInput(criteria={'keyword': '設計'}, sources=['104', '1111']), deadline=time.monotonic() + 46, finish_reserve=45)
         browser.call.assert_not_awaited()
-        self.assertEqual([job.source for job in result['items']], ['104'])
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['area_results'][0]['status'], 'not_queried')
         diagnostic = result['source_results'][1]
-        self.assertEqual(diagnostic['status'], 'partial')
+        self.assertEqual(diagnostic['status'], 'failed')
         self.assertIn('時間不足', diagnostic['message'])
         self.assertTrue(diagnostic['truncated'])
         self.assertTrue(diagnostic['quota_limited'])
         self.assertNotIn('時間不足', encode(result['filter_warnings']))
         self.assertFalse(diagnostic['baseline_eligible'])
         self.assertTrue(result['can_continue'])
+        for row in result['source_results'] + result['area_results']:
+            self.assertEqual(row['message'].count('時間不足'), 1)
         serialized = encode(result | {'items': [job.model_dump(mode='json') for job in result['items']]})
-        self.assertEqual(serialized.count('時間不足'), 1)
+        self.assertEqual(serialized.count('時間不足'), 6)  # Two sources, two areas, two cursor copies.
         state = json.loads(result['continuation'])['sources']['1111']
-        self.assertEqual(state['next_page'], 1)
+        self.assertEqual(state['areas']['all']['next_page'], 1)
         self.assertEqual(state['parser_warnings'], [])
         browser.call.return_value = page()
         resumed = await Sources(mcp_call=fake104, browser1111=browser).search(
@@ -391,6 +431,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         result = await Sources(browser1111=browser).search(
             SearchInput(criteria={'keyword': '品管'}, sources=['1111']), deadline=time.monotonic() + 1)
         self.assertEqual(result['source_results'][0]['status'], 'failed')
+        self.assertEqual(result['area_results'][0]['status'], 'not_queried')
         self.assertTrue(result['can_continue'])
         self.assertEqual(result['source_results'][0]['parser_warnings'], [])
         browser.call.assert_not_awaited()
@@ -727,13 +768,17 @@ class RouteChecks(unittest.TestCase):
         return events(self.client.post('/api/chat', json={'request_id': ident, 'text': text}))
 
     def test_chat_deadline_reaches_search_and_skips_1111_with_a_completed_answer(self):
-        from app import chat
+        from app import chat, sources
         self.configure(True)
-        with patch.object(chat, 'CHAT_SECONDS', 2), patch.object(chat, 'FINISH_RESERVE_SECONDS', .1), \
+        self.app.state.sources.mcp_call = AsyncMock(wraps=fake104)
+        search_budget = (sources._HTTP_TIMEOUT_SECONDS + SINGLE_AREA_SECONDS + STARTUP_SECONDS + WORKER_GRACE_SECONDS) / 2
+        with patch.object(chat, 'CHAT_SECONDS', search_budget + .1), patch.object(chat, 'FINISH_RESERVE_SECONDS', .1), \
                 patch.object(chat, 'TOOL_MODEL_ALLOWANCE_SECONDS', 0):
             output = self.send('short-search')
+        self.app.state.sources.mcp_call.assert_awaited_once()
         self.browser.call.assert_not_awaited()
         jobs = next(data for event, data in output if event == 'jobs')
+        self.assertEqual({item['source'] for item in jobs['items']}, {'104'})
         diagnostic = next(item for item in jobs['source_results'] if item['source'] == '1111')
         self.assertEqual(diagnostic['status'], 'partial')
         self.assertIn('時間不足', diagnostic['message'])

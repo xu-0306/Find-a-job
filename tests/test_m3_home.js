@@ -1025,6 +1025,7 @@ async function testLinkedRecommendations() {
   assert.deepEqual(cards.map(card => card.dataset.jobId), ["selected", "other-source"], "follow reply citation order, not search order; deduplicate across searches");
   assert.deepEqual(cards.map(card => card.children[0].textContent), ["職缺 #3", "職缺 #2"]);
   assert.equal(all(history, item => item.tagName === "DETAILS" && item.className === "chat-search-log").every(item => !item.open), true);
+  assert.equal(all(history, item => item.className === "area-results").length, 0, "legacy job events without area_results render normally");
   assert.equal(all(cards[0], item => item.tagName === "DIV" && item.className === "job-description" && item.hidden).length, 1, "details start collapsed behind 更多");
   assert.equal(all(cards[0], item => item.tagName === "BUTTON" && item.textContent === "更多").length, 1, "details use one inline expand control");
   assert.equal(all(cards[0], item => item.tagName === "BUTTON").every(item => !item.disabled), true, "favorite and review remain usable");
@@ -1437,9 +1438,18 @@ async function testSearchResultsPanelAndAutomaticReviews() {
     search_id: "search-1", criteria: {keyword: "Python", area_codes: ["TPE"]}, sources: ["104", "518"],
     can_continue: true, total_count: 4, new_count: 3, duplicate_count: 1, items: jobs,
     source_results: [{source: "104", status: "success", returned_count: 2}, {source: "518", status: "partial", returned_count: 2}],
+    area_results: Array.from({length: 10}, (_, index) => [
+      {area_code: `A${index}`, area_name: `合成地區${index + 1}`, source: "104", status: index === 0 ? "empty" : "success",
+        returned_count: index === 0 || index === 3 ? 0 : 2, total_declared: index === 0 ? 0 : index === 3 ? 4 : 2, message: null, completed: true},
+      {area_code: `A${index}`, area_name: `合成地區${index + 1}`, source: "518", status: index === 1 ? "not_queried" : "success",
+        returned_count: index === 1 ? 0 : 2, total_declared: null, message: index === 1 ? "時間不足" : null, completed: index !== 1},
+      {area_code: `A${index}`, area_name: `合成地區${index + 1}`, source: "1111", status: index === 2 ? "blocked" : "success",
+        returned_count: index === 2 ? 0 : 2, total_declared: null, message: index === 2 ? "要求驗證" : null, completed: index !== 2},
+    ]).flat(),
   });
   const panel = home.elements.get("search-results-panel");
   const list = home.elements.get("search-results-list");
+  const all = (root, predicate) => [root, ...root.children.flatMap(child => all(child, predicate))].filter(predicate);
   assert.equal(panel.hidden, false);
   home.context.renderToolProgress(message, {call_id: "detail", name: "get_job_details", phase: "started"});
   home.context.renderChatEvent(message, "job_detail", {job_id: "s1", identity_verified: false, detail: {summary: "保留在收合進度中的全文"}});
@@ -1449,6 +1459,28 @@ async function testSearchResultsPanelAndAutomaticReviews() {
   assert.equal(home.elements.get("search-results-counts").textContent, "共 4 筆 · 本輪新增 3 · 重複 1 · 還可以繼續找", "the filter dialog keeps the full counts and the can-continue hint");
   assert.equal(all(list, item => item.className === "job-card item").length, 4, "all candidates are browseable in the results panel");
   assert.match(home.elements.get("search-results-details").textContent, /104.*已完成/);
+  const panelAreas = all(home.elements.get("search-results-details"), item => item.className === "area-results")[0];
+  assert.ok(panelAreas, "search panel shows per-area results when present");
+  assert.equal(panelAreas.open, false, "per-area details stay collapsed when many areas are returned");
+  assert.match(panelAreas.textContent, /\u5408\u6210\u5730\u53404.*104 \u67e5\u8a62\u6210\u529f 0\u7b46/);
+  assert.match(panelAreas.textContent, /10 區/);
+  assert.match(panelAreas.textContent, /合成地區1.*104 零筆/);
+  assert.match(panelAreas.textContent, /合成地區2.*518 尚未查詢/);
+  assert.match(panelAreas.textContent, /合成地區3.*1111 來源受阻/);
+  assert.equal(panelAreas.children.filter(item => item.tagName === "P" && item.className === "hint").length, 10,
+    "three source rows group into ten readable areas");
+  for (const completed of [true, false]) {
+    const holder = new FakeElement();
+    home.context.appendAreaResults(holder, [{area_name: "合成警告區", source: "104", status: "partial", completed, returned_count: 2}]);
+    assert.match(holder.textContent, completed ? /已完成，有限制／警告 2筆/ : /尚未完成 2筆/);
+    assert.equal(holder.textContent.includes("尚未完成"), !completed);
+  }
+  const areaMessages = all(panelAreas, item => item.className === "area-result-messages");
+  assert.ok(areaMessages.length > 0, "source messages remain available for inspection");
+  assert.equal(areaMessages.every(item => !item.open), true, "long source messages stay collapsed per area");
+  const chatAreas = all(message, item => item.className === "area-results")[0];
+  assert.ok(chatAreas, "expandable chat search history also shows per-area results");
+  assert.equal(chatAreas.open, false);
   assert.equal(home.state.intersection.observers.length, 1);
   home.state.intersection.observers[0].emit(); await settle();
   const reviewCalls = home.state.apiCalls.filter(call => call.path === "/api/reviews");
@@ -1728,6 +1760,11 @@ function testSearchTitleIsNotRepeatedWhenUnlabelled() {
   labelled.context.renderChatEvent(labelledMessage, "jobs", {search_id: "s-kw", criteria: {keyword: "後端"}, items: [{id: "k1", source: "104", title: "T2", url: "https://jobs.example/k1"}]});
   vm.runInContext("renderSearchResultsPanel()", labelled.context);
   assert.equal(labelled.elements.get("search-results-title").textContent, "本次搜尋 · 後端", "a labelled search keeps the prefix once");
+  const remote = createContext();
+  const remoteMessage = remote.context.chatMessage("assistant", "", "running");
+  remote.context.renderChatEvent(remoteMessage, "jobs", {search_id: "s-remote", criteria: {keyword: "實習", remote_only: true}, items: [{id: "r1", source: "104", title: "T", url: "https://jobs.example/r1"}]});
+  vm.runInContext("renderSearchResultsPanel()", remote.context);
+  assert.equal(remote.elements.get("search-results-title").textContent, "本次搜尋 · 實習 · 僅遠端", "remote query scope is visible in the result list title");
   // Whether a label exists comes from the criteria, not from comparing display text: a keyword that happens to
   // equal the fallback wording is still shown, and an unlabelled batch adds nothing after its number.
   const batches = createContext();

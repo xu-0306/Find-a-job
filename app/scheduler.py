@@ -49,7 +49,7 @@ def user_run_view(row, user_id):
     """One round's result as one account sees it; other accounts' counts and sources stay private."""
     result = run_view(row)
     users = result.pop('users', None)
-    empty = dict(new_count=0, initial_count=0, source_results=[])
+    empty = dict(new_count=0, initial_count=0, source_results=[], area_results=[])
     if users is None:  # recorded before accounts existed: it belongs to the built-in account
         return result if user_id == DEFAULT_USER_ID else result | empty
     result.pop('notifications', None)
@@ -136,7 +136,7 @@ class DailyRunner:
             preferences = effective_preferences(self.store, db)
             db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?)',
                        (ident, instant.astimezone(TAIPEI).date().isoformat(), trigger, 'running',
-                        encode({'new_count': 0, 'initial_count': 0, 'source_results': []}), instant.isoformat(), None))
+                        encode({'new_count': 0, 'initial_count': 0, 'source_results': [], 'area_results': []}), instant.isoformat(), None))
         self.pending_baseline = False
         self.task = asyncio.create_task(self.execute(ident, instant, preferences, auth_hash))
         return ident
@@ -155,7 +155,8 @@ class DailyRunner:
                         **({'deadline': time.monotonic() + daily_1111_seconds(criteria)} if source == '1111' else {}))
                     diag = result['source_results'][0]
                     batches.append(dict(preference_id=pref['id'], revision=pref['revision'], source=source, user_id=pref['user_id'],
-                                        eligible=diag.get('baseline_eligible') is True, items=result['items'], diagnostic=diag))
+                                        eligible=diag.get('baseline_eligible') is True, items=result['items'], diagnostic=diag,
+                                        area_results=result.get('area_results', [])))
             await asyncio.sleep(0)
             with self.store.connect(write=True) as db:
                 if auth_hash and not db.execute("SELECT 1 FROM sessions WHERE id_hash=? AND role='admin' AND expires_at>?",
@@ -197,7 +198,7 @@ class DailyRunner:
             # Never persist raw source/transport exceptions or credentials.
             with self.store.connect(write=True) as db:
                 db.execute("UPDATE runs SET status='failed',finished_at=?,result_json=? WHERE id=?",
-                           (self.clock().isoformat(), encode({'new_count': 0, 'initial_count': 0, 'source_results': [],
+                           (self.clock().isoformat(), encode({'new_count': 0, 'initial_count': 0, 'source_results': [], 'area_results': [],
                              'interrupted': True, 'message': '這輪未完成，已停止；可由後台明確重試。'}), ident))
         finally:
             self.task = None

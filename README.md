@@ -9,6 +9,7 @@ A self-hosted AI job-search companion for finding jobs through chat, managing se
 ### 功能
 
 - 聊天搜尋台灣 104／518 職缺、查看公司評價與收藏工作；可選擇啟用 1111 實驗來源。
+- 可只找遠端工作（目前僅 104 支援；518／1111 會標示未查）；指定多個地區時逐區查詢並回報各區結果，未查或受阻的地區不會當成零筆。
 - 確認求職條件後，每日搜尋並提供新職缺通知。
 - 每位使用者有自己的專屬連結，對話、收藏與條件分開保存。
 - A／B 兩種外觀、像素角色陪伴，以及後台設定與備份還原。
@@ -109,6 +110,7 @@ GitHub Actions 對 `main`、`codex/**` 的 push、以 `main` 為目標的 PR，�
 ### Features
 
 - Search Taiwan's 104 and 518 job boards through chat, check company reviews, and save favorites; optionally enable the experimental 1111 source.
+- Search remote-only jobs (104 only for now; 518/1111 are reported as not queried). Multi-region searches query and report each region separately, and regions that were not reached or were blocked are never reported as having zero results.
 - Confirm your search preferences to receive daily job updates and notifications.
 - Separate conversations, favorites, and preferences for each user, with a personal access link.
 - Two visual themes, a pixel companion, admin settings, and backup/restore.

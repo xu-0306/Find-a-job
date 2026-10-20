@@ -18,6 +18,8 @@ class WorkspaceChecks(unittest.TestCase):
             self.store.put(db, 'services', SETTINGS | {'llm_protocol': protocol})
         self.search_calls = []
         self.company_exclusions = []
+        self.remote_type = None
+        self.search_criteria = {"keyword": "資料工程 Data"}
         owner = self
 
         class Source:
@@ -28,9 +30,12 @@ class WorkspaceChecks(unittest.TestCase):
                 if arguments.criteria.keyword == '另一條件':
                     identifiers = ['gamma', 'delta']
                 jobs = [Job(source='104', source_job_id=key, title='資料工程 ' + key,
-                    company_name='來源公司 ' + key, url='https://www.104.com.tw/job/' + key)
+                    company_name='來源公司 ' + key, url='https://www.104.com.tw/job/' + key, remote_type=owner.remote_type)
                     for key in identifiers if '104:' + key not in (exclude_ids or set())]
                 return {'items': jobs, 'source_results': [{'source': '104', 'status': 'success', 'returned_count': len(jobs)}],
+                    'area_results': [{'area_code': 'TPE', 'area_name': '台北市', 'source': '104',
+                        'status': 'success', 'returned_count': len(jobs), 'total_declared': 2,
+                        'message': '合成來源訊息', 'completed': True}],
                     'filter_warnings': [], 'continuation': {'next_page': 2}, 'can_continue': continuation is None}
 
             async def detail(self, job, *, deadline=None, finish_reserve=0):
@@ -45,7 +50,7 @@ class WorkspaceChecks(unittest.TestCase):
             self.provider_calls.append(payload)
             if len(self.provider_calls) == 1:
                 return response(protocol, call=('search_1', 'search_jobs', encode({
-                    'criteria': {'keyword': '資料工程 Data'}, 'sources': ['104'], 'limit': 2})))
+                    'criteria': owner.search_criteria, 'sources': ['104'], 'limit': 2})))
             return response(protocol, text='已取得候選，請查看清單。')
 
         self.app.state.llm_transport = httpx.MockTransport(provider)
@@ -54,6 +59,72 @@ class WorkspaceChecks(unittest.TestCase):
         output = events(self.client.post('/api/chat', json={'request_id': 'first', 'text': '合成搜尋'}))
         self.assertEqual(output[-1][1]['status'], 'completed', output)
         return next(data for event, data in output if event == 'jobs'), output
+
+    def test_remote_type_is_saved_returned_and_replayed(self):
+        self.configure()
+        self.remote_type = "fully_remote"
+        self.search_criteria = {"keyword": "實習", "remote_only": True}
+        first, _ = self.first()
+        job = first["items"][0]
+        self.assertEqual(first["area_results"][0]["area_name"], "台北市")
+        outputs = [item for item in self.provider_calls[-1]["input"] if item.get("type") == "function_call_output"]
+        self.assertEqual([item["call_id"] for item in outputs], ["search_1"])
+        tool_result = json.loads(outputs[0]["output"])
+        self.assertEqual(tool_result["area_results"], first["area_results"])
+        self.assertEqual(tool_result["area_results"][0]["message"], "合成來源訊息")
+        self.assertEqual(job["remote_type"], "fully_remote")
+        with self.store.connect() as db:
+            stored = json.loads(db.execute("SELECT payload_json FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
+        self.assertEqual(stored["remote_type"], "fully_remote")
+        history = self.client.get("/api/messages", params={"conversation_id": "legacy"}).json()
+        replayed_search = next(search for search in history["conversation_state"]["searches"] if search["items"])
+        replayed = replayed_search["items"][0]
+        self.assertEqual(replayed["remote_type"], "fully_remote")
+        self.assertEqual(replayed_search["area_results"][0]["area_name"], "台北市")
+        recommendation_requests = self.script(("present_job_recommendations", {"items": [{"job_id": job["id"]}]}), "推薦一筆。")
+        output = self.chat("remote-recommendation", text="推薦")
+        recommendation = next(data for event, data in output if event == "recommendations")
+        self.assertEqual(recommendation["items"][0]["job"]["remote_type"], "fully_remote")
+        references = [json.loads(item["content"].split("\n", 1)[1])
+            for item in json.loads(recommendation_requests[-1])["input"] if item.get("role") == "user"
+            and isinstance(item.get("content"), str) and item["content"].startswith("以下是這段對話已保存的職缺引用")]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0][0]["area_results"], [{key: first["area_results"][0][key]
+            for key in ("area_name", "source", "status", "completed")}])
+
+    def test_legacy_saved_job_reads_and_history_default_remote_type_to_null(self):
+        self.configure()
+        first, _ = self.first()
+        job_id = first["items"][0]["id"]
+        with self.store.connect(write=True) as db:
+            row = db.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+            payload = json.loads(row[0]); payload.pop("remote_type", None)
+            db.execute("UPDATE jobs SET payload_json=? WHERE id=?", (encode(payload), job_id))
+            row = db.execute("SELECT content_json FROM messages WHERE request_id='first' AND role='assistant'").fetchone()
+            content = json.loads(row[0])
+            for event in content["events"]:
+                if event["event"] == "jobs":
+                    event["data"].pop("area_results", None)
+                    for item in event["data"]["items"]: item.pop("remote_type", None)
+            db.execute("UPDATE messages SET content_json=? WHERE request_id='first' AND role='assistant'",
+                       (encode(content),))
+        self.client.put("/api/favorites/" + job_id)
+        favorite = self.client.get("/api/favorites").json()["items"][0]
+        self.assertIsNone(favorite.get("remote_type"))
+        history = self.client.get("/api/messages", params={"conversation_id": "legacy"}).json()
+        replayed_search = next(search for search in history["conversation_state"]["searches"] if search["items"])
+        replayed = replayed_search["items"][0]
+        self.assertIsNone(replayed.get("remote_type"))
+        self.assertNotIn("area_results", replayed_search, "legacy job events without area diagnostics still replay")
+
+    def test_remote_search_started_summary_names_remote_filter(self):
+        self.configure()
+        self.search_criteria = {"keyword": "工程師", "remote_only": True}
+        _, output = self.first()
+        summaries = [data["summary"] for event, data in output if event == "tool_status"
+                     and data.get("name") == "search_jobs" and data.get("phase") == "started"]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("搜尋 工程師 · 僅遠端 · ", summaries[0])
 
     def test_continue_dismiss_undo_history_and_private_cursor(self):
         self.configure()
@@ -243,6 +314,19 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(self.company_exclusions[-1], ['來源公司 ALPHA'])
         self.assertNotIn(beta, [item['job_id'] for item in self.state()['removed']])
 
+    def test_duplicate_recommendations_report_accepted_count_and_progress(self):
+        self.configure()
+        first, _ = self.first()
+        job_id = first["items"][0]["id"]
+        self.script(("present_job_recommendations", {"items": [{"job_id": job_id}] * 3}), "推薦一筆。")
+        output = self.chat("duplicate-recommendations", text="推薦")
+        result = next(data for event, data in output if event == "recommendations")
+        self.assertEqual(result["accepted_count"], 1)
+        self.assertEqual(result["accepted_count"], len(result["items"]))
+        progress = [data for event, data in output if event == "tool_status" and data.get("name") == "present_job_recommendations"]
+        self.assertEqual([item["summary"] for item in progress if item["phase"] == "started"], ["更新精選"])
+        self.assertEqual([item["summary"] for item in progress if item["phase"] == "completed"], ["整理 1 筆精選"])
+        self.assertEqual(self.state()["shortlist"], [job_id])
     def test_conversation_exclusions_have_a_total_limit(self):
         self.configure()
         self.first()
@@ -485,9 +569,15 @@ class WorkspaceChecks(unittest.TestCase):
         started = [data['summary'] for event, data in output if event == 'tool_status'
                    and data['name'] == 'present_job_recommendations' and data['phase'] == 'started']
         self.assertEqual(started, ['移出 1 筆'])
+        completed = [data['summary'] for event, data in output if event == 'tool_status'
+                     and data['name'] == 'present_job_recommendations' and data['phase'] == 'completed']
+        self.assertEqual(completed, ['移出 1 筆'])
         self.script(('present_job_recommendations', {'items': []}))
-        self.chat('clear-featured')
+        output = self.chat('clear-featured')
         self.assertEqual(self.state()['shortlist'], [])
+        completed = [data['summary'] for event, data in output if event == 'tool_status'
+                     and data['name'] == 'present_job_recommendations' and data['phase'] == 'completed']
+        self.assertEqual(completed, ['清空精選'])
 
     def test_unknown_removed_is_ignored_without_clearing_shortlist(self):
         self.configure()
@@ -499,12 +589,12 @@ class WorkspaceChecks(unittest.TestCase):
         output = self.chat('unknown-only')
         self.assertEqual(self.state()['shortlist'], [alpha, beta])
         result = next(data for event, data in output if event == 'recommendations')
-        self.assertEqual(result, {'items': [], 'removed': [], 'replace': False})
+        self.assertEqual(result, {'items': [], 'removed': [], 'replace': False, 'accepted_count': 0})
         self.script(('present_job_recommendations', {'items': [], 'removed': [{'job_id': 'unknown-id', 'reason': '不存在'}]}))
         output = self.chat('unknown-with-empty-items')
         self.assertEqual(self.state()['shortlist'], [alpha, beta])
         self.assertEqual(next(data for event, data in output if event == 'recommendations'),
-                         {'items': [], 'removed': [], 'replace': False})
+                         {'items': [], 'removed': [], 'replace': False, 'accepted_count': 0})
         self.script(('present_job_recommendations', {'items': [], 'removed': [
             {'job_id': 'unknown-id', 'reason': '不存在'}, {'job_id': alpha, 'reason': '地點不符'}]}))
         self.chat('mixed-removed')

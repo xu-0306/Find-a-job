@@ -237,10 +237,12 @@
     card.titleElement = title;
     card.reviewSummaryElement = reviewSummary;
     card.reviewState = reviewPayload(item);
+    const remoteLabel = {fully_remote: "完全遠端", partially_remote: "部分遠端"}[item.remote_type];
     card.append(
       top,
       title,
       element("p", `${display(item.company_name, "未提供公司")} · ${display(item.location, "地點未提供")}`, "job-company"),
+      ...(remoteLabel ? [element("p", remoteLabel, "job-remote-type")] : []),
       element("p", display(item.salary_text, "薪資未提供"), "job-salary")
     );
 

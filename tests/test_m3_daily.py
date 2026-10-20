@@ -33,7 +33,7 @@ class DailyCommitTests(unittest.TestCase):
             fetched_at=datetime(2026, 10, 5, tzinfo=timezone.utc),
         )
 
-    def batch(self, preference_id, revision, source="104", items=None, eligible=True, diagnostic=None):
+    def batch(self, preference_id, revision, source="104", items=None, eligible=True, diagnostic=None, area_results=None):
         return {
             "preference_id": preference_id,
             "revision": revision,
@@ -41,6 +41,7 @@ class DailyCommitTests(unittest.TestCase):
             "eligible": eligible,
             "items": list(items or []),
             "diagnostic": diagnostic or {"status": "success", "truncated": False},
+            "area_results": list(area_results or []),
         }
 
     def commit(self, batches, run_id="run-1", local_date="2026-10-05", timestamp=STAMP):
@@ -62,6 +63,12 @@ class DailyCommitTests(unittest.TestCase):
         self.assertEqual(len(self.rows("SELECT job_id FROM seen_jobs")), 25)
         self.assertEqual(len(self.rows("SELECT job_id FROM daily_jobs")), 20)
         self.assertEqual(self.rows("SELECT count(*) FROM preference_baselines")[0][0], 1)
+
+    def test_commit_preserves_area_results(self):
+        area_results = [{"area_code": None, "area_name": "全台", "source": "104", "status": "empty",
+                         "returned_count": 0, "total_declared": 0, "message": None, "completed": True}]
+        result = self.commit([self.batch("p", 1, items=[], area_results=area_results)])
+        self.assertEqual(result["area_results"], area_results)
 
     def test_empty_eligible_batch_establishes_baseline(self):
         result = self.commit([self.batch("p", 1, items=[])])
@@ -188,9 +195,11 @@ class DailyScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
         with self.store.connect(write=True) as db:
             self.store.put(db, "services", services)
         self.requested = []
+        self.mcp_args = []
         async def mcp(name, args):
+            self.mcp_args.append(args)
             return {"jobs": [{"job_no": "12", "job_name": "採購", "company": "合成公司",
-                              "url": "https://www.104.com.tw/job/a12", "appear_date": "20261005"}],
+                              "url": "https://www.104.com.tw/job/a12", "appear_date": "20261005", "remote": 1}],
                     "total": 1, "has_next": False}, None
         def transport(request):
             self.requested.append(str(request.url))
@@ -211,12 +220,52 @@ class DailyScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_manual(runner)
         self.assertEqual([x["source"] for x in result["source_results"]], ["104"])
         self.assertEqual(self.requested, [])
+        self.assertNotIn("remote", self.mcp_args[0], "legacy daily criteria default remote_only to false")
+
+    async def test_remote_daily_search_skips_unsupported_sources(self):
+        runner = self.runner({"source_1111_enabled": True}, datetime(2026, 10, 10, 10, 0, tzinfo=TAIPEI))
+        with self.store.connect(write=True) as db:
+            self.store.put(db, "default_preferences", [{"keyword": "採購", "area_codes": [], "min_monthly_salary": None, "remote_only": True}])
+        result = await self.run_manual(runner)
+        self.assertTrue(self.mcp_args[0]["remote"])
+        self.assertEqual(self.requested, [])
+        by_source = {item["source"]: item for item in result["source_results"]}
+        self.assertEqual(by_source["104"]["status"], "success")
+        for source in ("518", "1111"):
+            self.assertEqual(by_source[source]["status"], "unsupported")
+            self.assertIn("尚未支援遠端工作篩選，本次未查", by_source[source]["message"])
+
+    async def test_remote_exclusion_still_commits_daily_baseline(self):
+        runner = self.runner({"source_518_enabled": False}, datetime(2026, 10, 10, 10, 0, tzinfo=TAIPEI))
+        with self.store.connect(write=True) as db:
+            self.store.put(db, "default_preferences", [{"keyword": "採購", "area_codes": [],
+                "min_monthly_salary": None, "remote_only": True}])
+        async def provider(name, args):
+            self.mcp_args.append(args)
+            return {"jobs": [
+                {"job_no": "remote", "job_name": "採購", "company": "合成公司",
+                 "url": "https://www.104.com.tw/job/remote", "appear_date": "20261005", "remote": 1},
+                {"job_no": "local", "job_name": "採購", "company": "合成公司",
+                 "url": "https://www.104.com.tw/job/local", "appear_date": "20261005", "remote": 0},
+            ], "total": 2, "has_next": False}, None
+        runner.sources.mcp_call = provider
+        result = await self.run_manual(runner)
+        diagnostic = result["source_results"][0]
+        self.assertTrue(self.mcp_args[0]["remote"])
+        self.assertEqual(diagnostic["status"], "success")
+        self.assertEqual(diagnostic["remote_excluded_count"], 1)
+        self.assertTrue(diagnostic["baseline"])
+        self.assertTrue(diagnostic["completed"])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM preference_baselines").fetchone()[0], 1)
 
     async def test_enabled_daily_run_still_queries_both_sources(self):
         runner = self.runner({}, datetime(2026, 10, 10, 10, 0, tzinfo=TAIPEI))
         result = await self.run_manual(runner)
         self.assertEqual([x["source"] for x in result["source_results"]], ["104", "518"])
         self.assertTrue(any(url.startswith("https://www.518.com.tw/") for url in self.requested))
+        self.assertEqual({(item["area_name"], item["source"]) for item in result["area_results"]},
+                         {("全台", "104"), ("全台", "518")})
 
     async def test_disabled_518_does_not_repeat_baseline_every_morning(self):
         # automatic=True only enables baseline requests; the scheduler is never opened here.

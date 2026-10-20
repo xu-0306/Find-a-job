@@ -1,7 +1,10 @@
 from datetime import timezone
+import json
+import tempfile
 import unittest
 
 from app.job_normalize import normalize_job, normalize_jobs
+from app.store import Job, Store
 
 
 def row_104(**overrides):
@@ -52,6 +55,27 @@ class JobNormalizeTests(unittest.TestCase):
         self.assertEqual(job.fetched_at.tzinfo, timezone.utc)
         self.assertTrue(any("只提供日期" in warning for warning in job.filter_warnings))
         self.assertTrue(any("無法判定是否為廣告" in warning for warning in job.filter_warnings))
+
+    def test_remote_type_normalizes_numeric_104_values_and_old_jobs_default_to_null(self):
+        cases = [(1, "fully_remote"), (2, "partially_remote"), (0, None), (3, None), ("1", None)]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(normalize_job("104", row_104(remote=value)).remote_type, expected)
+        self.assertIsNone(normalize_job("518", row_518()).remote_type)
+        old_payload = normalize_job("104", row_104()).model_dump(mode="json")
+        old_payload.pop("remote_type")
+        self.assertIsNone(Job.model_validate(old_payload).remote_type)
+
+    def test_remote_type_is_saved_and_upserted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            fully_remote = normalize_job("104", row_104(remote=1))
+            job_id = store.save_job(fully_remote)
+            partially_remote = normalize_job("104", row_104(remote=2))
+            self.assertEqual(store.save_job(partially_remote), job_id)
+            with store.connect() as db:
+                payload = json.loads(db.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()[0])
+            self.assertEqual(payload["remote_type"], "partially_remote")
 
     def test_ad_flag_is_strict_and_existing_warnings_are_preserved(self):
         self.assertIsNone(normalize_job("104", row_104(is_ad=True)))
