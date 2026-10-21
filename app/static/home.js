@@ -1110,6 +1110,8 @@ function signedOut() {
   activeChat = null; pendingChatAction = null; selectedConversationId = null; conversationCursor = null; messageCursor = null; dailyCursor = null; switchingConversation = false;
   activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetConversationWork(); setResultView("chat");
   clearCompanion();
+  disableCsrfRecovery();
+  csrfHeaderToken = "";
   csrfToken = ""; editing = null; favoriteCursor = null;
   $("#preferences-feedback").textContent = "";
   $("#user-panel").hidden = true; $("#logout").hidden = true; $("#logout").textContent = "登出"; $("#access-needed").hidden = false;
@@ -2311,8 +2313,8 @@ async function postChatWithRetry(operation) {
   for (let retry = 0; retry <= CHAT_RETRY_LIMIT; retry++) {
     let response;
     try {
-      operation.requestSent = true;
-      const headers = {"X-CSRF-Token": operation.csrfToken};
+      operation.requestInFlight = true;
+      const headers = {"X-CSRF-Token": csrfHeaderToken};
       let body;
       if (operation.attachments.length) {
         body = new FormData(); body.append("text", operation.text); body.append("request_id", operation.id); body.append("conversation_id", operation.conversationId);
@@ -2328,6 +2330,8 @@ async function postChatWithRetry(operation) {
       }
       response = await fetch("/api/chat", {method: "POST", credentials: "same-origin", signal: operation.controller.signal, headers, body});
     } catch (error) {
+      operation.requestInFlight = false;
+      operation.requestOutcomes.push("unknown");
       if (error.name === "AbortError" || operation.controller.signal.aborted) throw chatAbortError();
       if (retry === CHAT_RETRY_LIMIT) return {recover: true};
       await waitForChatRetry(operation, retry + 1);
@@ -2335,6 +2339,8 @@ async function postChatWithRetry(operation) {
     }
     if (!response.ok) {
       const result = await response.json().catch(() => null);
+      operation.requestInFlight = false;
+      operation.requestOutcomes.push(response.status === 403 && result?.error?.code === "csrf_rejected" ? "csrf_rejected" : "handled");
       if (response.status === 401) {
         window.dispatchEvent(new Event("session-expired"));
         throw chatResponseError(response, result);
@@ -2343,17 +2349,40 @@ async function postChatWithRetry(operation) {
         operation.accepted = true;
         return {recover: true};
       }
+      if (response.status === 403 && result?.error?.code === "csrf_rejected") {
+        if (operation.csrfRecoveryAttempted) {
+          const error = chatResponseError(response, result);
+          error.loginStateChanged = true;
+          throw error;
+        }
+        operation.csrfRecoveryAttempted = true;
+        const recovered = await recoverCsrfToken(operation.csrfToken, operation.controller.signal);
+        if (recovered === CSRF_RECOVERY_RESULT.aborted || operation.controller.signal.aborted) throw chatAbortError();
+        if (recovered === CSRF_RECOVERY_RESULT.success && chatOperationIsCurrent(operation)) {
+          retry--;
+          continue;
+        }
+        const error = chatResponseError(response, result);
+        error.loginStateChanged = recovered === CSRF_RECOVERY_RESULT.accountChanged;
+        error.csrfRecoveryUnavailable = recovered === CSRF_RECOVERY_RESULT.unavailable;
+        throw error;
+      }
       const error = chatResponseError(response, result);
       if (error.definite) throw error;
       if (retry === CHAT_RETRY_LIMIT) return {recover: true};
       await waitForChatRetry(operation, retry + 1, `伺服器暫時無法處理，${CHAT_RETRY_DELAY_MS / 1000} 秒後以同一識別碼重試（${retry + 1}/${CHAT_RETRY_LIMIT}）。`);
       continue;
     }
+    operation.requestInFlight = false;
+    operation.requestOutcomes.push("handled");
     operation.accepted = true;
     if (response.headers?.get("Content-Type")?.startsWith("text/event-stream") && response.body) return {response};
     return {recover: true};
   }
   return {recover: true};
+}
+function requestMayHaveBeenHandled(operation) {
+  return operation.requestInFlight || operation.requestOutcomes.some(outcome => outcome !== "csrf_rejected");
 }
 function addOptimisticChatMessages(operation) {
   clearAcceptedComposer(operation);
@@ -2379,7 +2408,7 @@ $("#chat-form").addEventListener("submit", async event => {
   }
   const editMessage = editOrigin;
   let operation;
-    try { operation = {id: crypto.randomUUID(), conversationId: String(selectedConversationId), csrfToken, text, attachments, editMessage, action: pendingChatAction, controller: new AbortController(), accepted: false}; pendingChatAction = null; }
+    try { operation = {id: crypto.randomUUID(), conversationId: String(selectedConversationId), csrfToken, text, attachments, editMessage, action: pendingChatAction, controller: new AbortController(), accepted: false, requestOutcomes: [], requestInFlight: false}; pendingChatAction = null; }
   catch (_) { setChatStatus("訊息尚未送出：無法準備訊息，請使用本機或 HTTPS 網址開啟網站。你的文字已保留。", "error"); return; }
   activeChat = operation;
   messageLoadRequest++;
@@ -2484,9 +2513,20 @@ $("#chat-form").addEventListener("submit", async event => {
           setChatStatus("停止要求已送出，但目前無法確認保存狀態；可重新整理歷史或再停止一次。", "error");
         }
       }
-      if (csrfToken && !operation.accepted) setChatStatus("已停止等待；請重新整理歷史確認訊息是否已送達。", "complete");
+      if (csrfToken && !operation.accepted) setChatStatus(requestMayHaveBeenHandled(operation)
+        ? "已停止等待；請重新整理歷史確認訊息是否已送達。"
+        : "已停止，訊息沒有送出。你的文字與附件已保留。", "complete");
     } else if (csrfToken && operation.csrfToken === csrfToken) {
-      const statusText = operation.accepted
+      const requestHandled = requestMayHaveBeenHandled(operation);
+      const statusText = error.loginStateChanged
+        ? requestHandled
+          ? "目前無法確認訊息是否已送達：登入狀態已變更，重新整理會清除尚未送出的文字與附件，請先複製文字。"
+          : "訊息尚未送出：這個分頁的登入狀態已變更。重新整理會清除尚未送出的文字與附件，請先複製文字再重新整理。"
+        : error.csrfRecoveryUnavailable
+          ? requestHandled
+            ? "目前無法確認訊息是否送達，也暫時無法確認登入狀態。你的文字與附件已保留；請先重新整理歷史，避免重複送出。"
+            : "訊息尚未送出：暫時無法確認登入狀態。你的文字與附件已保留，可以再按一次送出。"
+        : operation.accepted
         ? `${error.message} 請重新整理歷史確認已保存內容。`
         : error.definite
           ? `訊息尚未送出：${error.message} 你的文字與附件已保留。`
@@ -2523,7 +2563,7 @@ action($("#cancel-chat"), async () => {
   const wasAwaitingSnapshot = Boolean(operation.awaitingSnapshot);
   operation.cancelled = true;
   if (!wasAwaitingSnapshot) operation.controller.abort();
-  if (operation.requestSent) {
+  if (requestMayHaveBeenHandled(operation)) {
     operation.cancelPromise = api(`/api/chat/${encodeURIComponent(operation.id)}/cancel`, {method: "POST"});
     try { await operation.cancelPromise; operation.cancelAccepted = true; }
     catch (error) { if (error.status !== 404 && csrfToken) setChatStatus(error.message, "error"); }
@@ -2686,6 +2726,8 @@ window.addEventListener("session-expired", signedOut);
 (async () => {
   try {
     const bootstrap = await api("/api/bootstrap"); csrfToken = bootstrap.csrf_token;
+    csrfHeaderToken = csrfToken;
+    enableCsrfRecovery(bootstrap.account?.username);
     setupCompanion(bootstrap);
     maybeShowEncouragement(bootstrap);
     updatePushBootstrap(bootstrap);

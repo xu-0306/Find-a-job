@@ -301,7 +301,7 @@ function keyForTest() {
     }
     return {ok: true, status: 204, headers: {get: () => ""}, json: async () => null};
   };
-  context.api = async (path, options = {}) => {
+  const fixtureApi = async (path, options = {}) => {
     state.apiCalls.push({path, options});
     if (path === "/api/bootstrap") return pollRun ? (state.bootstraps ||= [state.bootstrap, {...state.bootstrap, recent_run: pollRun}]).shift() || state.bootstrap : state.bootstrap;
     if (path === "/api/areas") return {items: []};
@@ -367,6 +367,10 @@ function keyForTest() {
   };
   vm.createContext(context);
   const common = fs.readFileSync(path.join(__dirname, "..", "app", "static", "common.js"), "utf8");
+  vm.runInContext(common.slice(common.indexOf("let csrfHeaderToken"), common.indexOf("const $ =")), context);
+  vm.runInContext(common.slice(common.indexOf("async function api("), common.indexOf("function action(")), context);
+  context.commonApi = context.api;
+  context.api = fixtureApi;
   vm.runInContext(common.match(/^function formatTaipeiDateTime[\s\S]*?^}/m)[0], context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "app", "static", "cards.js"), "utf8"), context, {filename: "cards.js"});
   context.JobCards = window.JobCards;
@@ -2573,7 +2577,323 @@ async function testAreaSuccessZeroDoesNotClaimEmpty() {
   }
 }
 
+function jsonResponse(result, status = 200) {
+  return {ok: status >= 200 && status < 300, status, json: async () => result};
+}
+function csrfRejection(message = "頁面驗證已失效，請重新整理！") {
+  return jsonResponse({error: {code: "csrf_rejected", message}}, 403);
+}
+function useCommonTransport(home, handler) {
+  const fixtureApi = home.context.api;
+  const chatFetch = home.context.fetch;
+  home.context.api = home.context.commonApi;
+  home.context.fetch = async (path, options = {}) => {
+    const response = await handler(path, options);
+    if (response) return response;
+    if (path === "/api/chat") return chatFetch(path, options);
+    return jsonResponse(await fixtureApi(path, options));
+  };
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise(yes => { resolve = yes; });
+  return {promise, resolve};
+}
+async function testCsrfChatRecovery() {
+  const home = createContext(); await settle();
+  const attachment = new File(["synthetic resume"], "resume.pdf", {type: "application/pdf"});
+  home.state.fileInput.files = [attachment];
+  home.state.input.value = "保留草稿";
+  const attempts = []; let bootstraps = 0;
+  useCommonTransport(home, async (path, options) => {
+    if (path === "/api/bootstrap") {
+      bootstraps++;
+      assert.equal(options.method, "GET");
+      return jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"});
+    }
+    if (path === "/api/chat") {
+      attempts.push(options);
+      if (attempts.length === 1) return csrfRejection();
+    }
+  });
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(bootstraps, 1);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(item => item.headers["X-CSRF-Token"]), ["csrf-1", "csrf-new"]);
+  for (const attempt of attempts) {
+    assert.ok(attempt.body instanceof FormData);
+    assert.equal(attempt.body.get("request_id"), "request-1");
+    assert.equal(attempt.body.get("resume"), attachment);
+    assert.equal(attempt.body.get("text"), "保留草稿");
+  }
+  assert.equal(home.state.chatPayloads.length, 1, "only the replay is accepted by the server fixture");
+  assert.equal(home.state.input.value, "");
+  assert.equal(home.state.fileInput.files.length, 0);
+  assert.equal(home.elements.get("chat-status").dataset.state, "complete");
+  assert.equal(home.context.csrfToken, "csrf-1", "recovery preserves the login generation");
+}
+async function testCsrfChatRecoveryFailures() {
+  for (const failure of ["account", "bootstrap-http", "bootstrap-network", "bootstrap-json", "retry-limit"]) {
+    const home = createContext(); await settle();
+    home.state.input.value = "請先複製我";
+    const attachment = new File(["resume"], "resume.pdf"); home.state.fileInput.files = [attachment];
+    let attempts = 0; let bootstraps = 0; let expired = 0;
+    home.window.addEventListener("session-expired", () => { expired++; });
+    useCommonTransport(home, async path => {
+      if (path === "/api/bootstrap") {
+        bootstraps++;
+        if (failure === "bootstrap-http") return jsonResponse({}, 503);
+        if (failure === "bootstrap-network") throw new TypeError("offline");
+        if (failure === "bootstrap-json") return {ok: true, json: async () => { throw new SyntaxError("bad bootstrap"); }};
+        return jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new", account: {username: failure === "account" ? "bob" : "alice"}});
+      }
+      if (path === "/api/chat") { attempts++; return attempts > (failure === "retry-limit" ? 2 : 1) ? jsonResponse({error: {code: "forbidden", message: "fixture limit"}}, 400) : csrfRejection(); }
+    });
+    await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    assert.equal(attempts, failure === "retry-limit" ? 2 : 1, failure + " never sends an extra replay");
+    assert.equal(bootstraps, 1);
+    assert.equal(expired, 0, "recovery failure must not log the page out");
+    assert.equal(home.state.input.value, "請先複製我");
+    assert.equal(home.state.fileInput.files[0], attachment);
+    assert.equal(home.state.input.readOnly, false);
+    assert.equal(home.state.submit.disabled, false);
+    const status = home.elements.get("chat-status").textContent;
+    if (["account", "retry-limit"].includes(failure)) {
+      assert.match(status, /登入狀態已變更/);
+      assert.match(status, /重新整理會清除尚未送出的文字與附件/);
+      assert.doesNotMatch(status, /已保留/);
+    } else {
+      assert.match(status, /暫時無法確認登入狀態/);
+      assert.match(status, /你的文字與附件已保留/);
+      assert.doesNotMatch(status, /登入狀態已變更/);
+    }
+    assert.equal(home.elements.get("user-panel").hidden, false);
+  }
+}
+async function testCsrfPossibleDeliveryMessages() {
+  for (const failure of ["unavailable", "account"]) {
+    const home = createContext(); await settle(); let attempts = 0;
+    home.state.input.value = "可能重複";
+    useCommonTransport(home, async path => {
+      if (path === "/api/chat") { attempts++; return attempts === 1 ? jsonResponse({}, 503) : csrfRejection(); }
+      if (path === "/api/bootstrap") return failure === "unavailable"
+        ? jsonResponse({}, 503)
+        : jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new", account: {username: "bob"}});
+    });
+    const send = home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    await settle();
+    await home.state.clock.advance(5000);
+    await settle();
+    await send;
+    const status = home.elements.get("chat-status").textContent;
+    assert.match(status, /目前無法確認訊息是否(?:已)?送達/);
+    assert.doesNotMatch(status, /訊息尚未送出|可以再按一次送出/);
+    if (failure === "unavailable") assert.doesNotMatch(status, /頁面驗證已失效/);
+    if (failure === "account") assert.match(status, /重新整理會清除尚未送出的文字與附件/);
+  }
+}
+async function testCsrfStopDuringInflightPostCancels() {
+  const home = createContext(); await settle(); let pendingReject;
+  useCommonTransport(home, async (path, options) => {
+    if (path !== "/api/chat") return;
+    return new Promise((_, reject) => {
+      pendingReject = reject;
+      options.signal.addEventListener("abort", () => { const error = new Error("aborted"); error.name = "AbortError"; reject(error); }, {once: true});
+    });
+  });
+  home.state.input.value = "傳送中停止";
+  const send = home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  await settle();
+  await home.elements.get("cancel-chat").click();
+  await send;
+  assert.equal(home.state.chatCancelRequests.length, 1);
+  assert.match(home.elements.get("chat-status").textContent, /已停止等待；請重新整理歷史確認訊息是否已送達/);
+  pendingReject?.(new Error("unused"));
+}
+async function testCsrfStopAndLogoutDuringRecovery() {
+  for (const action of ["stop", "logout", "generation"]) {
+    const home = createContext(); await settle();
+    const bootstrap = deferred(); let attempts = 0; let bootstrapStarted = 0;
+    home.state.input.value = "等待恢復";
+    useCommonTransport(home, async path => {
+      if (path === "/api/chat") { attempts++; return attempts > 1 ? jsonResponse({error: {code: "forbidden", message: "fixture limit"}}, 400) : csrfRejection(); }
+      if (path === "/api/bootstrap") { bootstrapStarted++; return bootstrap.promise; }
+    });
+    const send = home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    await settle();
+    assert.equal(bootstrapStarted, 1, action + " starts the shared bootstrap before cancellation");
+    if (action === "stop") await home.elements.get("cancel-chat").click();
+    else if (action === "logout") home.context.signedOut();
+    else home.context.csrfToken = "different-generation";
+    if (action === "stop") {
+      await Promise.race([send, new Promise((_, reject) => globalThis.setTimeout(() => reject(new Error("stop recovery deadline")), 250))]);
+      bootstrap.resolve(jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"}));
+    } else {
+      bootstrap.resolve(jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"}));
+      await send;
+    }
+    assert.equal(attempts, 1, action + " during recovery prevents replay");
+    if (action === "stop") {
+      assert.equal(home.state.input.value, "等待恢復");
+      assert.equal(home.state.submit.disabled, false);
+      assert.equal(home.state.chatCancelRequests.length, 0);
+      assert.equal(home.elements.get("chat-status").textContent, "已停止，訊息沒有送出。你的文字與附件已保留。");
+    }
+    if (action === "logout") {
+      assert.equal(vm.runInContext("csrfHeaderToken", home.context), "");
+      assert.equal(home.context.csrfToken, "");
+    }
+  }
+}
+async function testCsrfStopAfterUnknownAttemptStillCancels() {
+  const home = createContext(); await settle();
+  const bootstrap = deferred(); let attempts = 0; let bootstraps = 0;
+  useCommonTransport(home, async (path) => {
+    if (path === "/api/chat") {
+      attempts++;
+      if (attempts === 1) return jsonResponse({}, 503);
+      return csrfRejection();
+    }
+    if (path === "/api/bootstrap") { bootstraps++; return bootstrap.promise; }
+  });
+  home.state.input.value = "未知結果後停止";
+  const send = home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  await settle();
+  await home.state.clock.advance(5000);
+  await settle();
+  assert.equal(attempts, 2);
+  assert.equal(bootstraps, 1);
+  await home.elements.get("cancel-chat").click();
+  await Promise.race([send, new Promise((_, reject) => globalThis.setTimeout(() => reject(new Error("unknown stop deadline")), 250))]);
+  bootstrap.resolve(jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"}));
+  assert.equal(home.state.chatCancelRequests.length, 1);
+}
+async function testCsrfConcurrentWritesAndGenerations() {
+  const home = createContext({intersection: true}); await settle();
+  const bootstrap = deferred(), review = deferred(), poll = deferred(), messages = deferred();
+  let bootstraps = 0; const attempts = [];
+  useCommonTransport(home, async (path, options) => {
+    if (path === "/api/bootstrap") {
+      bootstraps++;
+      return bootstraps === 1 ? poll.promise : bootstrap.promise;
+    }
+    if (path === "/api/reviews") return review.promise;
+    if (path.startsWith("/api/messages")) return messages.promise;
+    if (path.startsWith("/api/favorites/")) {
+      attempts.push({path, token: options.headers["X-CSRF-Token"]});
+      return options.headers["X-CSRF-Token"] === "csrf-new" ? jsonResponse({ok: true}) : csrfRejection();
+    }
+  });
+  const pollPromise = home.state.clock.advance(30000); await settle();
+  const message = home.context.chatMessage("assistant", "", "running");
+  home.context.renderChatEvent(message, "jobs", {items: [{id: "generation-job", source: "104", company_name: "世代公司", company_source_id: "generation", url: "https://jobs.example/generation"}]});
+  home.state.intersection.observers.at(-1).emit(); await settle();
+  const pendingMessages = home.context.loadMessages(false);
+  const writes = Promise.all([home.context.api("/api/favorites/a", {method: "POST"}), home.context.api("/api/favorites/b", {method: "DELETE"})]);
+  await settle();
+  assert.equal(bootstraps, 2, "one existing poll plus one shared recovery bootstrap");
+  bootstrap.resolve(jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"}));
+  await writes;
+  assert.deepEqual(attempts.map(item => item.token), ["csrf-1", "csrf-1", "csrf-new", "csrf-new"]);
+  assert.equal(home.context.csrfToken, "csrf-1");
+  review.resolve(jsonResponse({status: "empty"})); await settle();
+  const cards = home.context.document.querySelectorAll(".job-card");
+  assert.ok(cards.length > 0);
+  for (const card of cards) assert.equal(card.reviewSummaryElement.textContent, "尚無公開評分", "in-flight review still updates its card after recovery");
+  const pollsBefore = home.state.clock.scheduled.filter(delay => delay === 30000).length;
+  poll.resolve(jsonResponse(home.state.bootstrap)); await pollPromise;
+  assert.equal(home.state.clock.scheduled.filter(delay => delay === 30000).length, pollsBefore + 1, "in-flight poll reschedules after recovery");
+  messages.resolve(jsonResponse({items: [{id: 901, role: "assistant", content: {text: "恢復前開始載入的訊息", status: "completed", events: []}}], next_cursor: null}));
+  await pendingMessages;
+  assert.match(home.elements.get("chat-list").textContent, /恢復前開始載入的訊息/);
+}
+async function testCsrfOtherChatErrorsUnchanged() {
+  for (const status of [403, 401]) {
+    const home = createContext(); await settle(); let bootstraps = 0; let expired = 0;
+    home.state.input.value = "其他錯誤";
+    home.window.addEventListener("session-expired", () => { expired++; });
+    useCommonTransport(home, async path => {
+      if (path === "/api/bootstrap") { bootstraps++; return jsonResponse(home.state.bootstrap); }
+      if (path === "/api/chat") return jsonResponse({error: {code: "forbidden", message: "原錯誤"}}, status);
+    });
+    await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    assert.equal(bootstraps, 0);
+    assert.equal(expired, status === 401 ? 1 : 0);
+    if (status === 403) assert.equal(home.elements.get("chat-status").textContent, "訊息尚未送出：原錯誤 你的文字與附件已保留。");
+  }
+}
+
+async function testCsrfInflightReviewAndPollGeneration() {
+  const home = createContext({intersection: true}); await settle();
+  const review = deferred(), poll = deferred(); let bootstraps = 0;
+  useCommonTransport(home, async path => {
+    if (path === "/api/reviews") return review.promise;
+    if (path === "/api/bootstrap") {
+      bootstraps++;
+      return bootstraps === 1 ? poll.promise : jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"});
+    }
+  });
+  const pollPromise = home.state.clock.advance(30000); await settle();
+  home.context.renderChatEvent(home.context.chatMessage("assistant", "", "running"), "jobs", {items: [
+    {id: "inflight-review", source: "104", company_name: "世代公司", company_source_id: "inflight", url: "https://jobs.example/inflight"},
+  ]});
+  home.state.intersection.observers.at(-1).emit(); await settle();
+  assert.equal(await home.context.recoverCsrfToken("csrf-1"), "success");
+  review.resolve(jsonResponse({status: "empty"})); await settle();
+  const cards = home.context.document.querySelectorAll(".job-card");
+  assert.ok(cards.length > 0);
+  for (const card of cards) assert.equal(card.reviewSummaryElement.textContent, "尚無公開評分", "generation: an in-flight review card must finish after CSRF recovery");
+  const scheduled = home.state.clock.scheduled.filter(delay => delay === 30000).length;
+  poll.resolve(jsonResponse(home.state.bootstrap)); await pollPromise;
+  assert.equal(home.state.clock.scheduled.filter(delay => delay === 30000).length, scheduled + 1, "generation: in-flight polling must reschedule after CSRF recovery");
+  assert.equal(home.context.csrfToken, "csrf-1");
+}
+
+async function testCsrfChatAndApiShareRecovery() {
+  const home = createContext(); await settle();
+  const bootstrap = deferred(); let bootstraps = 0; const chatHeaders = [], apiHeaders = [];
+  home.state.input.value = "聊天和收藏並行";
+  useCommonTransport(home, async (path, options) => {
+    if (path === "/api/bootstrap") { bootstraps++; return bootstrap.promise; }
+    if (path === "/api/chat") {
+      chatHeaders.push(options.headers["X-CSRF-Token"]);
+      if (chatHeaders.length === 1) return csrfRejection();
+    }
+    if (path === "/api/favorites/shared") {
+      apiHeaders.push(options.headers["X-CSRF-Token"]);
+      return apiHeaders.length === 1 ? csrfRejection() : jsonResponse({ok: true});
+    }
+  });
+  const send = home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  const favorite = home.context.api("/api/favorites/shared", {method: "POST"});
+  await settle();
+  assert.equal(bootstraps, 1, "chat and common API join the same recovery bootstrap");
+  bootstrap.resolve(jsonResponse({...home.state.bootstrap, csrf_token: "csrf-new"}));
+  await Promise.all([send, favorite]);
+  assert.deepEqual(chatHeaders, ["csrf-1", "csrf-new"]);
+  assert.deepEqual(apiHeaders, ["csrf-1", "csrf-new"]);
+  assert.equal(home.elements.get("chat-status").dataset.state, "complete");
+}
+
+let testRunCompleted = false;
+process.on("exit", () => {
+  if (!testRunCompleted && !process.exitCode) {
+    console.error("test_m3_home ended before completion");
+    process.exitCode = 1;
+  }
+});
+
 (async () => {
+  await testCsrfInflightReviewAndPollGeneration();
+  await testCsrfChatRecovery();
+  await testCsrfChatAndApiShareRecovery();
+  await testCsrfChatRecoveryFailures();
+  await testCsrfPossibleDeliveryMessages();
+  await testCsrfStopDuringInflightPostCancels();
+  await testCsrfStopAndLogoutDuringRecovery();
+  await testCsrfStopAfterUnknownAttemptStillCancels();
+  await testCsrfConcurrentWritesAndGenerations();
+  await testCsrfOtherChatErrorsUnchanged();
   await testAreaSuccessZeroDoesNotClaimEmpty();
   await testMarkdownBlocksAndInline();
   await testMarkdownUnsafeInputStaysText();
@@ -2622,7 +2942,8 @@ async function testAreaSuccessZeroDoesNotClaimEmpty() {
   await testChatWidthKeyboardAdjustsAndResetRestoresDefault();
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
-  console.log("test_m3_home: 44 checks passed");
+  testRunCompleted = true;
+  console.log("test_m3_home: 52 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

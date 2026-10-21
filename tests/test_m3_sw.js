@@ -77,7 +77,7 @@ const request = (url, options = {}) => ({
 async function testInstallActivateAndCacheBoundary() {
   const worker = createWorker({cacheNames: ["job-companion-shell-old", "other-app-cache"]});
   await worker.dispatch("install");
-  assert.ok([...worker.opened].some(name => name.startsWith("job-companion-shell-v") && name !== "job-companion-shell-old"),"new icon/CSS markup installs into a fresh shell cache");
+  assert.ok([...worker.opened].some(name => name === "job-companion-shell-v38"),"new icon/CSS markup installs into a fresh shell cache");
   assert.ok(worker.entries.has(`${ORIGIN}/static/offline.html`));
   assert.ok(worker.entries.has(`${ORIGIN}/static/icon.svg`));
   assert.ok(worker.entries.has(`${ORIGIN}/static/style.css`));
@@ -172,14 +172,14 @@ async function testPushPayloadAndClickSanitization() {
 function testStaticArtifacts() {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "app", "static", "manifest.webmanifest"), "utf8"));
   const worker = fs.readFileSync(path.join(root, "app", "static", "sw.js"), "utf8");
-  assert.match(worker, /job-companion-shell-v37/, "per-area UI update uses a fresh service-worker shell cache");
+  assert.match(worker, /const SHELL_CACHE = "job-companion-shell-v38";/, "per-area UI update uses a fresh service-worker shell cache");
   const index = fs.readFileSync(path.join(root, "app", "static", "index.html"), "utf8");
-  assert.match(index, /home\.js\?v=37/, "home script query version matches the UI change");
-  assert.match(index, /cards\.js\?v=37/, "cards script query version matches the review label change");
+  assert.match(index, /home\.js\?v=38"/, "home script query version matches the UI change");
+  assert.match(index, /cards\.js\?v=38"/, "cards script query version matches the review label change");
   const admin = fs.readFileSync(path.join(root, "app", "static", "admin.html"), "utf8");
   for (const [name, html] of [["index", index], ["admin", admin]]) {
-    assert.match(html, /common\.js\?v=37/, `${name} uses the same common script version`);
-    assert.match(html, /style\.css\?v=37/, `${name} uses the same stylesheet version`);
+    assert.match(html, /common\.js\?v=38"/, `${name} uses the same common script version`);
+    assert.match(html, /style\.css\?v=38"/, `${name} uses the same stylesheet version`);
   }
   assert.equal(manifest.lang, "zh-Hant");
   assert.equal(manifest.start_url, "/");
