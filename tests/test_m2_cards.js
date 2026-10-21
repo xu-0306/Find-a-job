@@ -84,7 +84,7 @@ assert.equal(jobButtons[0].type, "button");
 assert.equal(jobButtons[0].getAttribute("aria-pressed"), "false");
 assert.equal(jobButtons[0].textContent, "收藏");
 assert.equal(jobLinks[0].getAttribute("href"), undefined);
-assert.match(jobElement.reviewSummaryElement.textContent, /查詢中/);
+assert.equal(jobElement.reviewSummaryElement.textContent, "評價待查詢");
 jobButtons[0].click();
 jobButtons[2].click();
 assert.deepEqual(favoriteCalls, [[job, jobButtons[0]]]);
@@ -126,10 +126,15 @@ assert.equal(scored.topElement.children[0].textContent, "104");
 const fit = JobCards.fitList({reasons: ["技能符合"], concerns: ["通勤遠", "需輪班"], unknowns: []});
 assert.deepEqual(fit.children.map(row => row.textContent), ["適合技能符合", "注意通勤遠、需輪班"], "fit tags: empty groups are omitted and nothing is truncated");
 assert.equal(JobCards.fitList({reasons: [], concerns: [], unknowns: []}), null);
-for (const [status, text] of [[undefined, "評價查詢中…"], ["ambiguous", "公司待確認"], ["empty", "尚無公開評分"], ["failed", "評價暫時無法取得"]]) {
-  const state = JobCards.jobCard({...job, basic_review: status ? {status, ratings: []} : null}, {});
+for (const [status, text] of [[undefined, "評價待查詢"], [null, "評價待查詢"], ["loading", "評價查詢中…"], ["pending", "評價查詢中…"], ["running", "評價查詢中…"], ["ambiguous", "公司待確認"], ["empty", "尚無公開評分"], ["failed", "評價暫時無法取得"]]) {
+  const state = JobCards.jobCard({...job, basic_review: status == null ? status : {status, ratings: []}}, {});
   assert.equal(state.reviewSummaryElement.textContent, text);
   assert.doesNotMatch(state.reviewSummaryElement.textContent, /★/);
+  if (status == null) {
+    assert.equal(JobCards.reviewMessage(status), "評價待查詢");
+    assert.equal(state.reviewDetailsElement.hidden, true);
+    assert.doesNotMatch(state.reviewDetailsElement.textContent, /查詢中/);
+  }
 }
 // No score from any source: one short merged header state; per-source wording moves into the 更多 review details.
 const sourcesOf = (...statuses) => ({status: "partial", ratings: [], source_results: statuses.map((status, index) => ({source: ["104", "GoodJob", "Qollie"][index], status}))});

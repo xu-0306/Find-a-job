@@ -1610,6 +1610,177 @@ async function testBottomNavStateAndFilterDialog() {
   assert.equal(dialog.open, false, "choosing an action from the dialog closes it");
 }
 
+async function testBasicReviewLabelsFollowRequests() {
+  for (const [source, value, status] of [["GoodJob", 4.2, "success"], ["104", 3.7, "success"], ["Qollie", null, "empty"], ["104", null, "failed"]]) {
+    const home = createContext({intersection: true}); await settle();
+    const jobs = [
+      {id: "label-a", source, company_name: "合成公司", company_source_id: "company-a"},
+      {id: "label-b", source, company_name: "合成公司", company_source_id: "company-a", basic_review: null},
+      {id: "label-offscreen", source, company_name: "合成公司", company_source_id: "company-a"},
+      {id: "label-other", source, company_name: "合成公司", company_source_id: "company-b"},
+    ];
+    const cards = jobs.map(job => home.context.jobCard(job));
+    home.elements.get("favorite-list").append(...cards);
+    const originalReviews = jobs.map(job => job.basic_review);
+    const requests = [];
+    const baseApi = home.context.api;
+    home.context.api = async (path, options = {}) => {
+      if (path !== "/api/reviews") return baseApi(path, options);
+      return new Promise(resolve => requests.push({options, resolve, labels: cards.map(card => card.reviewSummaryElement.textContent)}));
+    };
+    assert.equal(requests.length, 0, "creating cards does not request basic reviews");
+    for (const card of cards) assert.equal(card.reviewSummaryElement.textContent, "評價待查詢");
+    const observer = home.state.intersection.observers.at(-1);
+    observer.emit(cards.slice(0, 2)); await settle();
+    assert.equal(requests.length, 1, "visible cards of one company share one request");
+    assert.deepEqual(requests[0].labels, ["評價查詢中…", "評價查詢中…", "評價查詢中…", "評價待查詢"], "loading is displayed at request dispatch for this company only");
+    for (const card of cards.slice(0, 3)) assert.equal(card.reviewSummaryElement.textContent, "評價查詢中…");
+    assert.equal(cards[3].reviewSummaryElement.textContent, "評價待查詢", "same name with another company id stays unqueried");
+    for (const [index, card] of cards.entries()) assert.equal(card.reviewJob.basic_review, originalReviews[index], "display-only loading never changes job data");
+    assert.equal(vm.runInContext("basicReviewCache.size", home.context), 0, "loading never enters the cache");
+    for (const job of jobs) assert.equal(home.context.jobRating(job), null, "loading never affects rating sort inputs");
+    const result = {status, ratings: value === null ? [] : [{source, value, scale_max: 5}]};
+    requests[0].resolve(result); await settle();
+    for (const card of cards.slice(0, 3)) {
+      assert.equal(card.reviewState, result);
+      assert.equal(card.reviewJob.basic_review, result, "only completed results are persisted on jobs");
+      if (value !== null) assert.ok(card.reviewSummaryElement.textContent.includes("★" + value), "successful responses show their actual score");
+      else assert.equal(card.reviewSummaryElement.textContent, status === "failed" ? "評價暫時無法取得" : "尚無公開評分");
+    }
+    assert.equal(cards[3].reviewSummaryElement.textContent, "評價待查詢");
+    assert.equal(requests.length, 1, "a response does not trigger another company's request");
+  }
+}
+
+async function testBasicReviewLateCardsFollowPendingRequests() {
+  for (const outcome of ["success", "empty", "reject", "abort"]) {
+    const home = createContext({intersection: true}); await settle();
+    const job = {id: "in-flight", source: "104", company_name: "Synthetic pending company", company_source_id: "in-flight-company"};
+    const first = home.context.jobCard(job);
+    const list = home.elements.get("favorite-list"); list.append(first);
+    const requests = [];
+    const baseApi = home.context.api;
+    home.context.api = async (path, options = {}) => {
+      if (path === "/api/reviews") return new Promise((resolve, reject) => requests.push({options, resolve, reject}));
+      return baseApi(path, options);
+    };
+    const observer = home.state.intersection.observers.at(-1);
+    observer.emit([first]); await settle();
+    assert.equal(requests.length, 1);
+    assert.equal(first.reviewSummaryElement.textContent, "評價查詢中…");
+
+    const late = [
+      home.context.jobCard({...job, id: "late-undefined"}),
+      home.context.jobCard({...job, id: "late-null", basic_review: null}),
+    ];
+    const original = {status: "success", ratings: [{source: "GoodJob", value: 4.6, scale_max: 5}]};
+    const known = home.context.jobCard({...job, id: "late-known", basic_review: original});
+    const other = home.context.jobCard({...job, id: "late-other", company_source_id: "another-company"});
+    list.append(...late, known, other);
+    const originalLabel = known.reviewSummaryElement.textContent;
+    for (const card of late) assert.equal(card.reviewSummaryElement.textContent, "評價待查詢", "new cards have no display state before entering the viewport");
+    observer.emit([...late, known]); await settle();
+    for (const card of [first, ...late]) {
+      assert.equal(card.reviewSummaryElement.textContent, "評價查詢中…", "cards entering during a same-company request join its loading display");
+      assert.equal(card.reviewState.status, "loading");
+    }
+    assert.equal(first.reviewJob.basic_review, undefined);
+    assert.equal(late[0].reviewJob.basic_review, undefined);
+    assert.equal(late[1].reviewJob.basic_review, null);
+    assert.equal(vm.runInContext("basicReviewCache.size", home.context), 0, "late loading cards never populate the cache");
+    assert.equal(known.reviewState, original, "joining a pending request preserves an existing result");
+    assert.equal(known.reviewJob.basic_review, original);
+    assert.equal(known.reviewSummaryElement.textContent, originalLabel);
+    assert.equal(other.reviewSummaryElement.textContent, "評價待查詢", "a new offscreen card with another company id stays unqueried");
+    assert.equal(other.reviewState, null);
+    assert.equal(requests.length, 1, "late same-company cards reuse the pending request");
+
+    const result = {status: outcome === "empty" ? "empty" : "success", ratings: outcome === "empty" ? [] : [{source: "104", value: 3.8, scale_max: 5}]};
+    if (outcome === "abort") {
+      home.context.resetBasicReviews();
+      assert.equal(requests[0].options.signal.aborted, true);
+      for (const card of [first, ...late]) {
+        assert.equal(list.contains(card), true);
+        assert.equal(card.reviewSummaryElement.textContent, "評價待查詢", "reset restores late cards retained in the DOM");
+        assert.equal(card.reviewState, null);
+      }
+      assert.equal(known.reviewState, original);
+      requests[0].resolve(result); await settle();
+      for (const card of [first, ...late]) assert.equal(card.reviewState, null, "late aborted responses cannot restore a result");
+      assert.equal(first.reviewJob.basic_review, undefined);
+      assert.equal(late[0].reviewJob.basic_review, undefined);
+      assert.equal(late[1].reviewJob.basic_review, null);
+      assert.equal(vm.runInContext("basicReviewCache.size", home.context), 0);
+    } else {
+      if (outcome === "reject") requests[0].reject(new Error("synthetic review request rejection"));
+      else requests[0].resolve(result);
+      await settle();
+      for (const card of [first, ...late, known]) {
+        assert.equal(card.reviewState.status, outcome === "reject" ? "failed" : result.status);
+        assert.equal(card.reviewJob.basic_review, card.reviewState, "only the final result is persisted, including promise rejection");
+        if (outcome === "success") assert.match(card.reviewSummaryElement.textContent, /★3\.8/);
+        else assert.equal(card.reviewSummaryElement.textContent, outcome === "reject" ? "評價暫時無法取得" : "尚無公開評分");
+      }
+      assert.equal(vm.runInContext("basicReviewCache.size", home.context), outcome === "reject" ? 0 : 1);
+    }
+    assert.equal(other.reviewSummaryElement.textContent, "評價待查詢");
+    assert.equal(other.reviewJob.basic_review, undefined);
+    assert.equal(requests.length, 1);
+  }
+}
+
+async function testBasicReviewPreservesResultsAndRestoresAbortedLabels() {
+  for (const status of ["success", "empty", "failed", "ambiguous"]) {
+    const home = createContext({intersection: true}); await settle();
+    const original = {status, ratings: status === "success" ? [{source: "GoodJob", value: 4.6, scale_max: 5}] : []};
+    const known = home.context.jobCard({id: "known", source: "104", company_name: "保留公司", company_source_id: "keep", basic_review: original});
+    const fresh = home.context.jobCard({id: "fresh", source: "104", company_name: "保留公司", company_source_id: "keep"});
+    home.elements.get("favorite-list").append(known, fresh);
+    const originalLabel = known.reviewSummaryElement.textContent;
+    const requests = [];
+    const baseApi = home.context.api;
+    home.context.api = async (path, options = {}) => {
+      if (path === "/api/reviews") return new Promise(resolve => requests.push({options, resolve}));
+      return baseApi(path, options);
+    };
+    const observer = home.state.intersection.observers.at(-1);
+    observer.emit([known, fresh]); await settle();
+    assert.equal(requests.length, 1);
+    assert.equal(known.reviewState, original, "existing structured results survive a same-company request");
+    assert.equal(known.reviewSummaryElement.textContent, originalLabel);
+    assert.equal(known.reviewJob.basic_review, original);
+    assert.equal(fresh.reviewSummaryElement.textContent, "評價查詢中…");
+    assert.equal(fresh.reviewJob.basic_review, undefined);
+    requests[0].resolve({status: "failed"}); await settle();
+    assert.equal(fresh.reviewSummaryElement.textContent, "評價暫時無法取得");
+    const failedResult = known.reviewState;
+    const retryCard = home.context.jobCard({id: "retry", source: "104", company_name: "保留公司", company_source_id: "keep"});
+    home.elements.get("favorite-list").append(retryCard);
+    await home.state.clock.advance(60000); await settle();
+    assert.equal(requests.length, 2, "the existing failure timer retries the company");
+    assert.equal(known.reviewState, failedResult, "retry keeps the previous failure result");
+    assert.equal(known.reviewJob.basic_review, failedResult);
+    assert.equal(fresh.reviewState, failedResult);
+    assert.equal(retryCard.reviewSummaryElement.textContent, "評價查詢中…", "retry loads only cards with no result");
+    assert.equal(retryCard.reviewJob.basic_review, undefined);
+    assert.equal(vm.runInContext("basicReviewCache.size", home.context), 0);
+    home.context.api = async (path, options) => {
+      if (path.startsWith("/api/messages?")) throw new Error("synthetic history failure");
+      return baseApi(path, options);
+    };
+    assert.equal(await home.context.openConversation({id: "cannot-load", title: "載入失敗"}), false);
+    assert.equal(requests[1].options.signal.aborted, true);
+    assert.equal(home.elements.get("favorite-list").contains(retryCard), true, "retained cards survive a failed conversation switch");
+    assert.equal(retryCard.reviewSummaryElement.textContent, "評價待查詢", "aborted display-only loading returns to unqueried");
+    assert.equal(retryCard.reviewState, null);
+    assert.equal(retryCard.reviewJob.basic_review, undefined);
+    assert.equal(known.reviewState, failedResult, "reset preserves completed results");
+    requests[1].resolve({status: "empty"}); await settle();
+    assert.equal(retryCard.reviewSummaryElement.textContent, "評價待查詢", "late aborted results cannot overwrite restored labels");
+    assert.equal(known.reviewState, failedResult);
+  }
+}
+
 async function testBasicReviewIdentityAndReset() {
   const home = createContext({intersection: true}); await settle();
   const baseApi = home.context.api;
@@ -1692,13 +1863,26 @@ async function testScrolledAwayQueuedReviewIsSkipped() {
   const observer = home.state.intersection.observers.at(-1);
   observer.emit(); await settle();
   assert.equal(requests.length, 2, "third company waits in the queue");
+  const attachedCards = home.context.document.querySelectorAll(".job-card");
+  assert.ok(attachedCards.length > 0, "queue assertions inspect attached cards");
+  for (const card of attachedCards) {
+    assert.equal(card.reviewSummaryElement.textContent, card.dataset.jobId === "skip-c" ? "評價待查詢" : "評價查詢中…", "queued companies stay unqueried until a slot is available");
+    assert.equal(card.reviewJob.basic_review, undefined);
+  }
   const away = observer.targets.filter(target => target.dataset.jobId === "skip-c");
+  const attachedAway = away.filter(card => attachedCards.includes(card));
+  assert.ok(attachedAway.length > 0, "the queued company has an attached card");
   observer.callback(away.map(target => ({target, isIntersecting: false})));
   requests[0].resolve({status: "empty"}); requests[1].resolve({status: "empty"}); await settle();
   assert.equal(requests.length, 2, "a company scrolled away while queued is not reviewed");
+  for (const card of attachedAway) assert.equal(card.reviewSummaryElement.textContent, "評價待查詢");
   observer.callback(away.map(target => ({target, isIntersecting: true}))); await settle();
   assert.equal(requests.length, 3, "re-entering the viewport queues it again");
   assert.equal(JSON.parse(requests[2].options.body).job_id, "skip-c");
+  for (const card of attachedAway) {
+    assert.equal(card.reviewSummaryElement.textContent, "評價查詢中…");
+    assert.equal(card.reviewJob.basic_review, undefined);
+  }
   requests[2].resolve({status: "empty"}); await settle();
 }
 
@@ -2405,6 +2589,9 @@ async function testAreaSuccessZeroDoesNotClaimEmpty() {
   await testChatScroll();
   await testFavoriteKeepsHistoryAndPaging();
   await testReviewLoadingRetryAndLateResults();
+  await testBasicReviewLabelsFollowRequests();
+  await testBasicReviewLateCardsFollowPendingRequests();
+  await testBasicReviewPreservesResultsAndRestoresAbortedLabels();
   await testScrolledAwayQueuedReviewIsSkipped();
   await testProposalFocusAndConfirmationBoundary();
   await testConversationLifecycleAndGuards();

@@ -991,6 +991,11 @@ function resetBasicReviews({clearCache = false} = {}) {
   basicReviewGeneration++;
   basicReviewQueue.length = 0;
   for (const controller of basicReviewControllers.values()) controller.abort();
+  for (const card of [...(document.querySelectorAll?.(".job-card") || [])]) {
+    if (basicReviewControllers.has(card.dataset.reviewCompany) && card.reviewState?.status === "loading") {
+      JobCards.updateReview(card, card.reviewJob?.basic_review || null);
+    }
+  }
   basicReviewControllers.clear();
   basicReviewPending.clear();
   basicReviewActive = 0;
@@ -1006,7 +1011,10 @@ function queueBasicReview(job, card) {
   if (failed && Date.now() - failed < 60000) return;
   const cached = basicReviewCache.get(key);
   if (cached) { JobCards.updateReview(card, cached); return; }
-  if (basicReviewPending.has(key)) return;
+  if (basicReviewPending.has(key)) {
+    if (!card.reviewState) JobCards.updateReview(card, {status: "loading"});
+    return;
+  }
   if (!basicReviewQueue.some(task => task.key === key)) basicReviewQueue.push({key, job, card, generation: basicReviewGeneration});
   drainBasicReviews();
 }
@@ -1042,6 +1050,9 @@ async function drainBasicReviews() {
     basicReviewActive++;
     const token = csrfToken;
     const controller = new AbortController();
+    for (const card of [...(document.querySelectorAll?.(".job-card") || [])]) {
+      if (card.dataset.reviewCompany === key && !card.reviewState) JobCards.updateReview(card, {status: "loading"});
+    }
     const promise = api("/api/reviews", {method: "POST", body: JSON.stringify({company_name: job.company_name, job_id: jobIdentifier(job), scope: "basic"}), signal: controller.signal});
     basicReviewPending.set(key, promise);
     basicReviewControllers.set(key, controller);

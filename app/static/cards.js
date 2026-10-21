@@ -97,7 +97,7 @@
   // 公司待確認 > 評價查詢中… > 評價暫時無法取得 > 尚無公開評分 (everything else: empty/success/partial/unsupported).
   // Per-source wording stays in the 更多 review details (reviewSourceStatus).
   function reviewMessage(review) {
-    if (!review) return "評價查詢中…";
+    if (!review) return "評價待查詢";
     const sources = (Array.isArray(review.source_results) ? review.source_results : []).filter(Boolean);
     const states = new Set((sources.length ? sources.map(source => source.status) : [review.status]).map(status => String(status || "").toLowerCase()));
     if (states.has("ambiguous")) return "公司待確認";
