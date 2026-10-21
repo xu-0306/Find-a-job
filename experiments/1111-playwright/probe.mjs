@@ -26,7 +26,7 @@ export function readSearch() {
     ...(optionalField(location) ? { location: optionalField(location) } : {}),
     ...(optionalField(salary) ? { salary: optionalField(salary) } : {}),
   });
-  for (const a of document.querySelectorAll('.job-card__content a[href*="/job/"][href*="mid=searchlist"]')) {
+  for (const a of document.querySelectorAll('.job-card a[href*="/job/"][href*="mid=searchlist"]')) {
     const url = new URL(a.getAttribute('href'), location.href);
     const id = url.pathname.match(/^\/job\/(\d+)\/?$/)?.[1];
     if (url.origin !== location.origin || !id || !a.checkVisibility({ visibilityProperty: true, opacityProperty: true }) || seen.has(id)) continue;
@@ -89,8 +89,9 @@ export function validateSearch(page, expected, pageNumber, source = page.initial
     throw new Error('incomplete_page: valid current-page metadata is required');
   }
   const expectedCount = Math.min(source.limit, Math.max(0, source.totalCount - (pageNumber - 1) * source.limit));
-  const expectedIds = new Set(source.ids);
-  if (expectedCount !== source.ids.length || expectedIds.size !== source.ids.length
+  const expectedIds = new Set(source.ids.slice(0, expectedCount));
+  const hasPreview = pageNumber * source.limit < source.totalCount && source.ids.length === expectedCount + 1;
+  if ((source.ids.length !== expectedCount && !hasPreview) || new Set(source.ids).size !== source.ids.length
       || page.jobs.length !== expectedCount || page.jobs.some(job => !expectedIds.has(job.id))) {
     throw new Error('incomplete_page: rendered job IDs do not match the complete source page');
   }
@@ -240,7 +241,7 @@ export async function runProbe(context, { keyword, area = '', outputDir, timeout
       const result = await recordStep('validate', () => waitForValidDom(page, readSearch, result => {
         const source = responseResult?.page === number ? responseResult : result.initialResult;
         validateSearch(result, expected, number, source);
-        result.completeness = { ...source, expectedCount: source.ids.length, matched: true };
+        result.completeness = { ...source, expectedCount: result.jobs.length, matched: true };
         delete result.initialResult;
         if (number === 2) {
           const previousIds = new Set(report.pages[0].jobs.map(job => job.id));

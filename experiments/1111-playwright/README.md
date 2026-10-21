@@ -4,6 +4,13 @@
 
 正式 Python app 在管理者啟用並保存後，才以 source.mjs 啟動隔離的 Patchright／Chrome，供聊天搜尋、續查、每日搜尋及職缺詳細使用。518 仍預設開啟，兩者均以開關按鈕呈現。現有 Docker 映像不包含此選用環境。
 
+## 2026-10-21 網站改版與解析修正
+
+- 搜尋卡片的 `.job-card__content` 外層已移除，`readSearch` 改以 `.job-card` 根元素為範圍；側欄廣告等不在卡片內的 `mid=searchlist` 連結仍排除。
+- 第 1 頁 SSR metadata 會多帶一筆下一頁第一筆（不顯示）。`validateSearch` 只在還有下一頁時容許恰好多一筆，當頁仍須與前段 ID 完全一致；其他長度一律 `incomplete_page`。
+- 首次載入會先經 ALTCHA 關卡（約 4～5 秒自動通過）；來源不點擊、不重試、不繞過。詳細頁未改版。
+- 診斷與驗收：本機 `output/live-fix/1111-diagnosis-20261021.md`、`1111-parse-report.md`、`1111-parse-mutations.log`。
+
 ## 選用來源環境與界線
 
 - 在欲部署的 checkout 安裝 Node.js 20+、Google Chrome，於本目錄執行 npm.cmd ci --ignore-scripts --no-audit --no-fund。來源使用有視窗的 Chrome，需要可開啟瀏覽器的桌面環境，不會自動安裝依賴。

@@ -3,6 +3,7 @@ import './source.budget.test.mjs';
 import { after, test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
+import { searchUrl, validateSearch } from './probe.mjs';
 import { runSource, resolveArea, validateInput, SINGLE_AREA_MS, MAX_BUDGET_MS } from './source.mjs';
 let browser;
 async function prepareBrowser() {
@@ -48,7 +49,7 @@ async function fixture(input, options = {}) {
     const ids = options.empty ? [] : number === 4 ? ['701'] : ['501', '502'];
     const keyword = url.searchParams.get('ks');
     const search = `<title>搜尋職缺</title><h1>${keyword}</h1><input placeholder="工作職稱、公司名、技能專長..." value="${keyword}">
-      ${(options.partial ? ids.slice(0, 1) : ids).map(id => `<div class="job-card__content"><a href="/job/${id}?mid=searchlist"><h2>測試職缺 ${id}</h2></a><a href="/corp/123"><h2>測試公司</h2></a></div>`).join('')}
+      ${(options.partial ? ids.slice(0, 1) : ids).map(id => `<div class="job-card"><div><div><a href="/job/${id}?mid=searchlist"><h2>測試職缺 ${id}</h2></a><a href="/corp/123"><h2>測試公司</h2></a></div></div></div>`).join('')}
       <script id="__NUXT_DATA__" type="application/json">${nuxt(number, ids, options.empty ? 0 : 7)}</script>`;
     const detail = `<h1>${options.wrongTitle ? '另一職缺' : '測試職缺 501'}</h1><a href="/corp/123">測試公司</a><h2>工作內容</h2><h3>職缺描述</h3><p>合成職缺說明，負責資料整理。</p><h3>工作待遇</h3><p>測試薪資</p>`;
     return route.fulfill({ contentType: 'text/html; charset=utf-8', body: options.blocked || options.blockedArea === url.searchParams.get('c0') ? '<title>Loading...</title><body></body>' : url.pathname === '/search/job' ? search : detail });
@@ -200,11 +201,12 @@ test('final stalled DOM read keeps prior validation failure without extending de
 });
 
 
-async function mockSearchMetadata(fields, apiHits) {
+async function mockSearchMetadata(fields, apiHits, { preview = false } = {}) {
   const ids = fields.map(field => field.id);
-  const jobs = [...ids].reverse().map(id => ({ id, title: 'Synthetic job', company: 'Synthetic company',
+  const limit = ids.length - (preview ? 1 : 0);
+  const jobs = ids.slice(0, limit).reverse().map(id => ({ id, title: 'Synthetic job', company: 'Synthetic company',
     url: 'https://www.1111.com.tw/job/' + id, companyUrl: 'https://www.1111.com.tw/corp/123' }));
-  const pagination = { page: 1, limit: ids.length, totalCount: ids.length, totalPage: 1 };
+  const pagination = { page: 1, limit, totalCount: ids.length, totalPage: Math.ceil(ids.length / limit) };
   let currentUrl, onResponse, closed = false;
   const page = {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, bringToFront: async () => {},
@@ -289,5 +291,54 @@ test('runSource keeps complete pages ok after invalid optional fields are omitte
       assert.equal(Object.hasOwn(job, salary === undefined ? 'salary' : 'location'), false);
       return { id, ...(salary === undefined ? {} : { salary }), ...(location === undefined ? {} : { location }) };
     }), [...fields].reverse());
+  }
+});
+
+function previewState({ page = 1, limit = 3, totalCount = 8, ids = ['601', '602', '603', '604'],
+  renderedIds = ids.slice(0, Math.min(limit, Math.max(0, totalCount - (page - 1) * limit))) } = {}) {
+  const url = new URL(searchUrl('合成工作'));
+  url.searchParams.set('page', String(page));
+  return { url: url.href, heading: '合成工作', keywordInput: '合成工作',
+    jobs: renderedIds.map(id => ({ id, title: '合成職缺', company: '合成公司', companyUrl: 'https://www.1111.com.tw/corp/1' })),
+    initialResult: { page, limit, totalCount, ids } };
+}
+
+test('validateSearch accepts one next-page preview, full page 2 and short last page', () => {
+  for (const state of [previewState(), previewState({ page: 2, ids: ['604', '605', '606'] }),
+    previewState({ page: 3, ids: ['607', '608'] })]) {
+    assert.doesNotThrow(() => validateSearch(state, searchUrl('合成工作'), state.initialResult.page));
+    assert.doesNotThrow(() => validateSearch({ ...state, initialResult: null }, searchUrl('合成工作'),
+      state.initialResult.page, state.initialResult));
+  }
+});
+
+for (const [name, options] of [
+  ['two extra IDs', { ids: ['601', '602', '603', '604', '605'] }],
+  ['extra ID without a next page', { totalCount: 3 }],
+  ['extra ID on a short last page', { page: 3, ids: ['607', '608', '609'] }],
+  ['preview duplicating a current-page ID', { ids: ['601', '602', '603', '601'] }],
+  ['preview replacing a current-page ID', { renderedIds: ['601', '602', '604'] }],
+  ['preview rendered in addition to the full current page', { renderedIds: ['601', '602', '603', '604'] }],
+]) {
+  test('validateSearch rejects ' + name, () => {
+    const state = previewState(options);
+    assert.throws(() => validateSearch(state, searchUrl('合成工作'), state.initialResult.page), /incomplete_page/);
+    assert.throws(() => validateSearch({ ...state, initialResult: null }, searchUrl('合成工作'),
+      state.initialResult.page, state.initialResult), /incomplete_page/);
+  });
+}
+
+test('runSource excludes next-page preview jobs and fields for both SSR and API metadata', async () => {
+  const apiHits = searchFields.map(field => ({ jobId: field.id, salary: 'API ' + field.salary,
+    workCity: { name: 'API ' + field.location } }));
+  for (const hits of [undefined, apiHits]) {
+    const result = await mockSearchMetadata(searchFields, hits, { preview: true });
+    assert.equal(result.status, 'ok');
+    assert.deepEqual([result.page, result.page_size, result.total, result.has_next], [1, 4, 5, true]);
+    assert.equal(result.jobs.length, 4);
+    assert.deepEqual(result.jobs.map(({ id, salary, location }) => ({ id, salary, location })),
+      searchFields.slice(0, -1).reverse().map(field => hits
+        ? { id: field.id, salary: 'API ' + field.salary, location: 'API ' + field.location } : field));
+    assert.equal(result.jobs.some(job => job.id === searchFields.at(-1).id), false);
   }
 });

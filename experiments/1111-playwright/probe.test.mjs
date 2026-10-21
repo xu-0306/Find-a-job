@@ -74,20 +74,21 @@ function nuxtFixture({ pagination, hits }) {
 }
 
 function searchFixture(number, { repeat = false, wrongQuery = false, delayed = false, missingCompany = false, fullPage = false,
-  neverComplete = false, responseMetadata = false } = {}) {
+  neverComplete = false, responseMetadata = false, preview = false } = {}) {
   const source = sourceFixture(number, { repeat, fullPage });
   const cardIds = source.hits.map(({ jobId }) => jobId);
   const id = cardIds[0] || (number === 1 || repeat ? '101' : '202');
-  const extraCards = cardIds.slice(1).map(jobId => '<div class="job-card__content"><a href="/job/' + jobId + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789" title="測試公司"><h2>測試公司</h2></a></div>').join('');
+  if (preview && number === 1) source.hits.push(...sourceFixture(2, { fullPage }).hits.slice(0, 1));
+  const extraCards = cardIds.slice(1).map(jobId => '<div class="job-card"><div><div><a href="/job/' + jobId + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789" title="測試公司"><h2>測試公司</h2></a></div></div></div>').join('');
   return `<title>測試搜尋</title><h1>${wrongQuery ? '別的工作' : '採購'} 全部工作職缺</h1>
     <input placeholder="工作職稱、公司名、技能專長..." value="採購">
-    <div class="job-card__content"><a href="/job/${id}?mid=searchlist"><h2>採購 ${id}</h2></a>
-      ${missingCompany ? '<div>公司載入中</div>' : '<div><a href="/corp/789" title="測試公司"><h2>測試公司</h2><h3>測試產業</h3></a></div>'}</div>
-    <div class="job-card__content"><a href="/job/${id}?mid=searchlist"><h2>採購 ${id}</h2></a></div>
+    <div class="job-card"><div><div><a href="/job/${id}?mid=searchlist"><h2>採購 ${id}</h2></a>
+      ${missingCompany ? '<div>公司載入中</div>' : '<div><a href="/corp/789" title="測試公司"><h2>測試公司</h2><h3>測試產業</h3></a></div>'}</div></div></div>
+    <div class="job-card"><div><div><a href="/job/${id}?mid=searchlist"><h2>採購 ${id}</h2></a></div></div></div>
     <a href="/job/999">首頁推薦，不是搜尋結果</a>
     <aside><a href="/job/998?mid=searchlist"><span>優先推薦</span><h2>側欄廣告</h2><p>廣告公司</p></a></aside>
-    <div class="job-card__content"><a href="https://other.invalid/job/888?mid=searchlist"><h2>不同網站</h2></a></div>
-    <div class="job-card__content" hidden><a href="/job/777?mid=searchlist"><h2>隱藏結果</h2></a></div>
+    <div class="job-card"><div><div><a href="https://other.invalid/job/888?mid=searchlist"><h2>不同網站</h2></a></div></div></div>
+    <div class="job-card" hidden><div><div><a href="/job/777?mid=searchlist"><h2>隱藏結果</h2></a></div></div></div>
     <button class="pagination-button" title="前往2頁" onclick="location.href='/search/job?page=2&ks=%E6%8E%A1%E8%B3%BC'">2</button>
     <script id="__NUXT_DATA__" type="application/json">${nuxtFixture(responseMetadata && number === 2 ? sourceFixture(1, { repeat, fullPage }) : source)}</script>
     <script>
@@ -234,14 +235,14 @@ test('waits for every source ID, including a shorter last page and an API update
   assert.ok(requests.includes('/api/v1/search/jobs/'));
 });
 
-async function readSearchFixture(source, { reverseCards = false, metadata = nuxtFixture(source) } = {}) {
+async function readSearchFixture(source, { reverseCards = false, cardHits = source.hits, metadata = nuxtFixture(source) } = {}) {
   const context = await browser.newContext();
   try {
-    const hits = reverseCards ? [...source.hits].reverse() : source.hits;
+    const hits = reverseCards ? [...cardHits].reverse() : cardHits;
     const html = '<title>Synthetic search</title><h1>採購</h1>'
       + '<input placeholder="工作職稱、公司名、技能專長..." value="採購">'
-      + hits.map(({ jobId }) => '<div class="job-card__content"><a href="/job/' + jobId
-        + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789"><h2>測試公司</h2></a></div>').join('')
+      + hits.map(({ jobId }) => '<div class="job-card"><div><div><a href="/job/' + jobId
+        + '?mid=searchlist"><h2>採購 ' + jobId + '</h2></a><a href="/corp/789"><h2>測試公司</h2></a></div></div></div>').join('')
       + '<script id="__NUXT_DATA__" type="application/json">' + metadata + '</script>';
     await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: html }));
     const page = await context.newPage();
@@ -439,4 +440,29 @@ test('failure records the step and safe code without raw browser errors or chall
     await rm(join(outputDir, 'report.json'), { force: true });
     await rmdir(outputDir);
   }
+});
+
+test('new search DOM accepts a hidden next-page preview, full page 2 and short last page', async () => {
+  const limit = 3, totalCount = 8;
+  const hits = Array.from({ length: totalCount }, (_, index) => ({ jobId: String(601 + index) }));
+  for (const number of [1, 2, 3]) {
+    const start = (number - 1) * limit;
+    const cardHits = hits.slice(start, start + limit);
+    const source = { pagination: { page: number, limit, totalCount, totalPage: 3 },
+      hits: hits.slice(start, start + limit + (number === 1 ? 1 : 0)) };
+    if (number === 1) assert.equal(source.hits.at(-1).jobId, hits[limit].jobId);
+    const state = await readSearchFixture(source, { cardHits });
+    assert.deepEqual(state.initialResult.ids, source.hits.map(hit => hit.jobId));
+    assert.deepEqual(state.jobs.map(job => job.id), cardHits.map(hit => hit.jobId));
+    assert.equal(state.jobs.length, Math.min(limit, totalCount - start));
+    assert.doesNotThrow(() => validateSearch(state, searchUrl('採購'), number));
+  }
+});
+
+test('probe completeness counts rendered jobs rather than next-page preview metadata', async () => {
+  const { report } = await fixtureRun({ preview: true });
+  assert.equal(report.status, 'passed', JSON.stringify(report.error));
+  assert.deepEqual(report.pages.map(page => page.jobs.map(job => job.id)), [['101'], ['202']]);
+  assert.deepEqual(report.pages.map(page => page.completeness.expectedCount), [1, 1]);
+  assert.deepEqual(report.pages[0].completeness.ids, ['101', '202']);
 });
