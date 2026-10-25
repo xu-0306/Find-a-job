@@ -44,7 +44,7 @@ async def prepare(upload):
         context['filename'] = upload['filename']
         return context, {key:context[key] for key in ('kind','filename','width','height')}
     try:
-        text = data.decode('utf-8-sig')
+        text = unicodedata.normalize('NFKC', data.decode('utf-8-sig'))
     except UnicodeError:
         raise resume_pdf.ResumeError('Markdown／文字檔須使用 UTF-8 編碼，請重新另存後附上。') from None
     if any(unicodedata.category(c) == 'Cc' and c not in '\n\r\t' for c in text):

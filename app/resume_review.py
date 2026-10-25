@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 ANGLES = {
     'screening': '人資初篩',
-    'jd_match': 'JD 關鍵條件對照',
+    'jd_match': '職缺條件對照',
     'manager': '用人主管',
     'interviewer': '專業面試官',
     'differentiation': '差異化表達',
@@ -66,14 +66,16 @@ class ResumeReview(ReviewModel):
     rewrites: list[Rewrite] = Field(max_length=5)
 
 
+CLOSING = ('卡片已顯示全部內容，收尾只寫 1～3 句（目標、分組或「無判決」、下一步），'
+           '不重述卡片內容：不重述角度、修改項或任何改寫；使用者要求列出改寫時，指引看卡片。')
 RULES = ('不新增履歷沒有的經歷、技能、成果、職稱或數字；需要缺少的數字時用〔待補：…〕佔位，'
          '並在對應修改項 need_from_user 說明。不得引用市場統計或錄取率，扣分點前不寫正面評語。'
          'original 必須直接逐字抄錄附件解析文字，不先修正錯字或斷行；只改寫工作內容，不引用或改寫姓名、電話、email 等聯絡資料。'
-         '分組只能引用工具回傳值，無分組時不得自行下判決。每個角度獨立依履歷、JD 與檢辯內容判斷，不參照其他角度。')
+         '分組只能引用工具回傳值，無分組時不得自行下判決。每個角度獨立依履歷、職缺說明與檢辯內容判斷，不參照其他角度。' + CLOSING)
 DESCRIPTION = ('使用者附履歷並要求檢查、評估或優化時，確定一個目標後提交；成功只限一次，失敗可修正一次，stopped=true 時以文字說明未完成並停止呼叫。'
                'resume_attachment 從 1 起算，單一附件填 1（標籤為「本次附件」）；多附件依本次第幾個附件選擇履歷。'
-               'case.target_type=job：job_id 或 url 恰給一個，先在本回合 get_job_details 取得 success 且 summary 非空的 JD；讀不到請使用者貼 JD，取得同意才改方向。'
-               'jd_text：使用者在訊息或附件提供 JD；direction：使用者指定或同意的職務方向，不出分組。後兩者不得提供 job_id 或 url。'
+               'case.target_type=job：job_id 或 url 恰給一個，先在本回合 get_job_details 取得 success 且 summary 非空的職缺說明；讀不到請使用者貼職缺說明，取得同意才改方向。'
+               'jd_text：使用者在訊息或附件提供職缺說明；direction：使用者指定或同意的職務方向，不出分組。後兩者不得提供 job_id 或 url。'
                '沒有附件請先要求附上；沒有目標或方向先問，不提交。不得送判決、分組或計數欄位。六角度各一：'
                + '、'.join(f'{code}（{name}）' for code, name in ANGLES.items()) + '。' + RULES)
 
@@ -167,5 +169,6 @@ def submit_review(arguments, contexts, job_reads, allowed_job_ids):
             'fixes': [item.model_dump() for item in review.fixes], 'rewrites': rewrites,
             'removed_rewrites': removed, 'quote_check': quote_check}
     result = {'accepted': True, 'has_jd': has_jd, 'group': group, 'removed_rewrites': removed,
-              'quote_check': quote_check, 'needs': [code for code in ANGLES if by_angle[code].status == 'needs']}
+              'quote_check': quote_check, 'needs': [code for code in ANGLES if by_angle[code].status == 'needs'],
+              'reminder': CLOSING}
     return result, card

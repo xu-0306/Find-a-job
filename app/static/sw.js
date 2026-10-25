@@ -1,6 +1,6 @@
 "use strict";
 
-const SHELL_CACHE = "job-companion-shell-v39";
+const SHELL_CACHE = "job-companion-shell-v40";
 const OFFLINE_URL = "/static/offline.html";
 const ICON_URL = "/static/icon.svg";
 const STYLE_URL = "/static/style.css";

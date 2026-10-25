@@ -239,6 +239,24 @@ class ReviewContractChecks(unittest.TestCase):
         self.assertEqual(result['quote_check'], 'unchecked_image'); self.assertEqual(result['removed_rewrites'], 0)
         self.assertEqual(card['rewrites'], data['rewrites'])
 
+    def test_closing_contract_in_system_tool_description_and_success_result(self):
+        result, _ = submit(arguments())
+        for text in (chat.SYSTEM, review.DESCRIPTION, result['reminder']):
+            for requirement in ('卡片已顯示全部內容', '只寫 1～3 句', '目標、分組或「無判決」、下一步',
+                                '不重述卡片內容', '不重述角度、修改項或任何改寫', '使用者要求列出改寫時，指引看卡片'):
+                self.assertIn(requirement, text)
+        self.assertEqual(result['reminder'], review.CLOSING)
+        self.assertNotIn('reminder', submit({})[0])
+
+    def test_chinese_job_description_labels_keep_identifiers(self):
+        result, card = submit(arguments())
+        self.assertEqual(review.ANGLES['jd_match'], '職缺條件對照')
+        for text in (chat.SYSTEM, review.DESCRIPTION, encode(card['angles']), result['reminder']):
+            self.assertNotIn('JD', text)
+        self.assertIn('jd_text', review.DESCRIPTION)
+        self.assertIn('jd_match', review.DESCRIPTION)
+        self.assertIn('has_jd', result)
+
     def test_max_tokens_protocol_defaults_and_override(self):
         for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
             for limit in (None, 8192):
@@ -289,6 +307,37 @@ class ReviewChatChecks(unittest.TestCase):
             self.assertEqual(next(event['data'] for event in saved if event['event'] == 'resume_review'), card)
             self.assertNotIn('text', history[-2]['content']['attachments'][0])
             if protocol == 'anthropic_messages': self.assertTrue(all(req['max_tokens'] == 8192 for req in requests))
+
+    def test_normalized_attachments_reach_prompt_and_quote_source(self):
+        from test_resume_chat import pdf
+        source = '提升勝率⾄ ７５％，維護ＡＰＩ。'
+        expected = '提升勝率至 75%,維護API。'
+        data = arguments('direction')
+        data['rewrites'] = [{'original': expected, 'suggested': expected, 'reason': '核對合成字元'}]
+        for extension in ('pdf', 'md', 'markdown', 'txt'):
+            for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
+                with self.subTest(extension=extension, protocol=protocol):
+                    with self.store.connect(write=True) as db:
+                        self.store.put(db, 'services', chats.SETTINGS | {'llm_protocol': protocol})
+                    calls = []
+                    def provider(request):
+                        payload = json.loads(request.content); calls.append(payload)
+                        if len(calls) == 1:
+                            self.assertIn(expected, encode(payload))
+                            self.assertNotIn('⾄', encode(payload))
+                            return chats.response(protocol, call=('normalize', 'submit_resume_review', encode(data)))
+                        self.assertIn(review.CLOSING, encode(payload))
+                        return chats.response(protocol, text='請看卡片並補充成果。')
+                    self.app.state.llm_transport = httpx.MockTransport(provider)
+                    raw = pdf(source) if extension == 'pdf' else source.encode()
+                    with patch('app.resume_review.submit_review', wraps=review.submit_review) as submitter:
+                        response = self.client.post('/api/chat', data={'text': '檢查履歷，方向後端', 'request_id': f'nfkc-{extension}-{protocol}'},
+                                                    files={'resume': (f'synthetic.{extension}', raw, 'application/octet-stream')})
+                        output = chats.events(response)
+                        self.assertEqual(submitter.call_args.args[1][0]['text'], expected)
+                    card = next(value for name, value in output if name == 'resume_review')
+                    self.assertEqual(card['rewrites'], data['rewrites'])
+                    self.assertEqual(card['removed_rewrites'], 0)
 
     def test_full_length_chinese_payload_and_safe_error_result(self):
         data = arguments()

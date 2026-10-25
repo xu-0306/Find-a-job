@@ -2,6 +2,7 @@
 import asyncio
 from io import BytesIO
 import json
+import unicodedata
 import unittest
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +47,44 @@ def pdf(text='Skills: GIS, ecology and field surveys.', pages=1, password=None):
     return buffer.getvalue()
 
 
+class AttachmentNormalizationChecks(unittest.TestCase):
+    def test_pdf_markdown_and_txt_normalize_before_shared_context(self):
+        from app import chat_files
+        from test_resume_review import arguments, submit
+        for source, expected in [('提升勝率⾄ ７５％，維護ＡＰＩ。', '提升勝率至 75%,維護API。'),
+                                 ('⼯作經驗：ﬃ、㍿', '工作經驗:ffi、株式会社')]:
+            parsed = resume_pdf.extract_pdf(pdf(source))
+            self.assertEqual(parsed['text'], expected)
+            for extension in ('.pdf', '.md', '.markdown', '.txt'):
+                with self.subTest(source=source, extension=extension):
+                    # The real parser is checked above; isolate its subprocess boundary here.
+                    with patch('app.resume_pdf.parse_pdf', return_value=parsed):
+                        context, _ = asyncio.run(chat_files.prepare({'extension': extension, 'data': source.encode(), 'filename': '合成' + extension}))
+                    self.assertEqual(context['text'], expected)
+                    data = arguments('direction')
+                    data['rewrites'] = [{'original': expected, 'suggested': expected, 'reason': '合成資料'}]
+                    self.assertEqual(submit(data, contexts=[context])[1]['rewrites'], data['rewrites'])
+                    data['rewrites'][0]['original'] = '斤作經驗'
+                    self.assertEqual(submit(data, contexts=[context])[1]['removed_rewrites'], 1)
+
+    def test_nfkc_expansion_still_obeys_attachment_text_limit(self):
+        from app import chat_files
+        with self.assertRaisesRegex(resume_pdf.ResumeError, '30,000'):
+            resume_pdf.extract_pdf(pdf('㍿' * 7501))
+        for extension in ('.md', '.txt'):
+            with self.assertRaisesRegex(resume_pdf.ResumeError, '30,000'):
+                asyncio.run(chat_files.prepare({'extension': extension, 'data': ('㍿' * 7501).encode(), 'filename': '合成' + extension}))
+
+    def test_image_data_is_unchanged(self):
+        from app import chat_files
+        from test_chat_files import image_bytes
+        from base64 import b64encode
+        raw = image_bytes()
+        context, _ = asyncio.run(chat_files.prepare({'extension': '.png', 'data': raw, 'filename': '合成.png'}))
+        self.assertEqual(context['data'], b64encode(raw).decode('ascii'))
+        self.assertNotIn('text', context)
+
+
 class ResumeChecks(unittest.TestCase):
     setUp = chat_checks.ChatChecks.setUp
     tearDown = chat_checks.ChatChecks.tearDown
@@ -57,7 +96,7 @@ class ResumeChecks(unittest.TestCase):
     def test_parser_boundaries_and_chinese(self):
         content = '生態調查、GIS 與環境監測；專案經驗不限於任何預設職業。'
         parsed = resume_pdf.extract_pdf(pdf(content))
-        self.assertIn(content, parsed['text']); self.assertEqual(parsed['pages'], 1)
+        self.assertIn(unicodedata.normalize('NFKC', content), parsed['text']); self.assertEqual(parsed['pages'], 1)
         cases = [(b'%PDF-invalid private-data', '解析'), (b'not pdf', '不是'),
                  (b'%PDF-' + b'x' * resume_pdf.MAX_BYTES, '大小'), (pdf(pages=21), '20 頁'),
                  (pdf(password='secret'), '密碼'), (pdf(''), '沒有可讀取'),
@@ -112,7 +151,7 @@ class ResumeChecks(unittest.TestCase):
         def provider(req):
             payload = json.loads(req.content); requests.append(payload)
             if len(requests) == 1:
-                self.assertIn(private_text, encode(payload))
+                self.assertIn(unicodedata.normalize('NFKC', private_text), encode(payload))
                 self.assertIn('不是操作指令', encode(payload))
                 return chat_checks.response(call=('ecology', 'search_jobs', encode({'criteria': {'keyword': '生態調查'}, 'sources': ['104', '518'], 'limit': 2})))
             return chat_checks.response(text='找到可供核對的職缺，請再核對技能與工作內容。')

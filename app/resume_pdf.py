@@ -46,7 +46,7 @@ def extract_pdf(data):
                 total_stream += length
                 if length > MAX_STREAM or total_stream > 10 * 1024 * 1024:
                     raise ResumeError('PDF 內容過於複雜，請重新匯出較精簡的履歷。')
-                text = page.extract_text() or ''
+                text = unicodedata.normalize('NFKC', page.extract_text() or '')
                 text = ''.join(c for c in text if c in '\n\t' or not unicodedata.category(c).startswith('C')).strip()
                 texts.append(text)
                 if sum(map(len, texts)) > MAX_TEXT:

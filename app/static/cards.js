@@ -343,6 +343,51 @@
     return card;
   }
 
+  function resumeAngleName(angle) {
+    // Saved events can still carry the old display name.
+    return angle.angle === "jd_match" ? "職缺條件對照" : angle.name;
+  }
+
+  function resumeReviewChecklist(data, extension = "txt", date = new Date()) {
+    const markdown = extension === "md";
+    const target = data.target || {};
+    const day = [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")];
+    const targetName = Array.from(String(target.label || "").replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, "").trim()).slice(0, 40).join("").replace(/[. ]+$/, "") || "未命名";
+    const types = {job: "職缺", jd_text: "使用者提供的職缺內容", direction: "方向檢查"};
+    const lines = [];
+    const heading = (text, level = 2) => lines.push(`${markdown ? "#".repeat(level) + " " : "【"}${text}${markdown ? "" : "】"}`);
+    const items = entries => {
+      if (!entries.length) lines.push("無");
+      for (const [index, entry] of entries.entries()) lines.push(`${index + 1}. ${entry.map(value => value.replace(/\s*\n\s*/g, " ")).join("\n   ")}`);
+      lines.push("");
+    };
+    heading("履歷修改清單", 1);
+    lines.push(`目標：${target.label || ""}`, `類型：${types[target.type] || ""}`, `產生日期：${day.join("/")}`, "");
+    lines.push(data.has_jd && target.type !== "direction" && data.group ? `分組：${data.group}` : "方向檢查，未給分組",
+      "同一模型的六種檢查角度，分組只用來排修改優先順序", "");
+    heading("優先修改項");
+    items((data.fixes || []).map(fix => [`改什麼：${fix.what}`, `怎麼改：${fix.how}`, ...(fix.need_from_user ? [`需要你提供：${fix.need_from_user}`] : [])]));
+    heading("逐句改寫");
+    items((data.rewrites || []).map(rewrite => [`原句：${rewrite.original}`, `建議句：${rewrite.suggested}`, `原因：${rewrite.reason}`]));
+    const pending = new Set();
+    const fields = [...(data.fixes || []).flatMap(fix => [fix.what, fix.how, fix.need_from_user]),
+      ...(data.rewrites || []).flatMap(rewrite => [rewrite.original, rewrite.suggested, rewrite.reason]),
+      ...(data.angles || []).map(angle => angle.reason)];
+    for (const fix of data.fixes || []) if (fix.need_from_user?.trim()) pending.add(fix.need_from_user.trim());
+    for (const field of fields) for (const match of String(field || "").matchAll(/〔待補[:：]([^〕]*)〕/g)) {
+      if (match[1].trim()) pending.add(match[1].trim());
+    }
+    heading("待補清單"); items([...pending].map(text => [text]));
+    heading("六個角度");
+    items((data.angles || []).map(angle => [`${resumeAngleName(angle)}：${angle.status === "meets" ? "已具備" : "需補強"}`, `理由：${angle.reason}`]));
+    heading("註記");
+    items([[`已移除 ${data.removed_rewrites || 0} 組無法核對的建議`],
+      ...(data.quote_check === "unchecked_image" ? [["原句未逐字核對"]] : []), ["數字與經歷請以實際為準"]]);
+    return {filename: `履歷修改清單-${targetName}-${day.join("")}.${markdown ? "md" : "txt"}`,
+      content: markdown ? lines.join("\n").split("\n").map(line => line && !line.startsWith("#") ? line + "  " : line).join("\n") : "\ufeff" + lines.join("\n"),
+      type: `${markdown ? "text/markdown" : "text/plain"};charset=utf-8`};
+  }
+
   function resumeReviewCard(data, status = "completed") {
     const card = element("article", undefined, "resume-review-card item");
     const target = data.target || {};
@@ -375,7 +420,7 @@
     const grid = element("div", undefined, "resume-review-angles");
     for (const angle of data.angles || []) {
       const row = element("div", undefined, "resume-review-angle");
-      row.append(element("strong", angle.name),
+      row.append(element("strong", resumeAngleName(angle)),
         element("span", angle.status === "meets" ? "已具備" : "需補強", `resume-review-mark ${angle.status === "meets" ? "meets" : "needs"}`),
         element("p", angle.reason));
       grid.append(row);
@@ -399,13 +444,36 @@
       for (const part of String(rewrite.suggested).split(/(〔待補[:：][^〕]*〕)/g)) {
         suggested.append(element(part.startsWith("〔待補") ? "mark" : "span", part));
       }
-      row.append(suggested, element("small", rewrite.reason)); rewrites.append(row);
+      const copy = element("button", "複製建議句"); copy.type = "button";
+      const feedback = element("span", "", "hint"); feedback.setAttribute("role", "status");
+      copy.addEventListener("click", async () => {
+        copy.disabled = true;
+        try { await root.navigator.clipboard.writeText(rewrite.suggested); feedback.textContent = "已複製"; }
+        catch (_) { feedback.textContent = "無法複製，請選取建議句手動複製。"; }
+        finally { copy.disabled = false; }
+      });
+      row.append(suggested, element("small", rewrite.reason), copy, feedback); rewrites.append(row);
     }
     card.append(rewrites, element("small", "片段隨對話保存；刪除對話會移除，已產生的備份不會。"));
+    const downloads = element("div", undefined, "row");
+    const format = element("select"); format.setAttribute("aria-label", "修改清單下載格式");
+    for (const extension of ["txt", "md"]) {
+      const option = element("option", `.${extension}`); option.value = extension; format.append(option);
+    }
+    format.value = "txt"; format.style.width = "auto";
+    const download = element("button", "下載修改清單"); download.type = "button";
+    download.addEventListener("click", () => {
+      const file = resumeReviewChecklist(data, format.value);
+      const url = URL.createObjectURL(new Blob([file.content], {type: file.type}));
+      const link = element("a"); link.href = url; link.download = file.filename;
+      document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    downloads.append(format, download); card.append(downloads);
     return card;
   }
 
-  const JobCards = {resumeReviewCard, jobCard, reviewCard, safeHref, externalLink, updateReview, reviewMessage, fitList};
+  const JobCards = {resumeReviewChecklist, resumeReviewCard, jobCard, reviewCard, safeHref, externalLink, updateReview, reviewMessage, fitList};
   root.JobCards = JobCards;
   if (typeof module !== "undefined" && module.exports) module.exports = JobCards;
 })(typeof window === "object" ? window : globalThis);

@@ -101,7 +101,9 @@ dialog{max-width:min(480px,calc(100% - 32px));border:1px solid var(--line);borde
 .chat-progress-done{color:var(--muted)}.chat-progress-active{color:var(--primary)}
 .job-detail-event{margin-top:8px;border-top:1px solid var(--line)}
 @media(min-width:1001px){
- .home:has(#chat:not([hidden])) #user-panel{--chat-col:clamp(440px,37vw,640px);grid-template-columns:var(--chat-col) minmax(0,1fr);align-items:stretch}
+ .home:has(#chat:not([hidden])) #user-panel{--chat-col:clamp(440px,37vw,640px);grid-template-columns:minmax(0,1fr);align-items:stretch}
+ .home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel[hidden]) #chat{grid-column:1/-1}
+ .home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel[hidden]) #chat-transcript,.home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel[hidden]) .chat-composer{width:100%;max-width:960px;margin-inline:auto}
  .home:has(#chat:not([hidden])) .top-tabs,.home:has(#chat:not([hidden])) .companion-banner{grid-column:1/-1}
  .home:has(#chat:not([hidden])) #chat{grid-column:1;grid-row:3}
  .home:has(#chat:not([hidden])) #search-results-panel{grid-column:2;grid-row:3}
@@ -110,7 +112,7 @@ dialog{max-width:min(480px,calc(100% - 32px));border:1px solid var(--line);borde
  /* Wide screens: card lists become a grid; headings and hints span the row. Chat-bubble cards stay single column. */
  .search-results-list,#daily-list,#favorite-list{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
  .search-results-list>:not(.job-card),#daily-list>:not(.job-card),#favorite-list>:not(.job-card){grid-column:1/-1}
- /* Splitter track replaces the 14px column gap only while the results column is shown; hidden results keep the plain two-column layout. */
+ /* Splitter and saved chat width apply only while results are shown. */
  .home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel:not([hidden])){grid-template-columns:var(--chat-w,var(--chat-col)) 14px minmax(0,1fr);column-gap:0}
  .home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel:not([hidden])) #panel-resizer{display:block;grid-column:2;grid-row:3}
  .home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel:not([hidden])) #search-results-panel{grid-column:3}

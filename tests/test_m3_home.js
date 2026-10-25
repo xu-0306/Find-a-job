@@ -182,6 +182,7 @@ function keyForTest() {
 
   const documentListeners = Object.create(null);
   const document = {
+    body: new FakeElement("body"),
     documentElement: {dataset: {}},
     addEventListener(type, listener) { (documentListeners[type] ||= []).push(listener); },
     createElement: tag => new FakeElement(tag),
@@ -2926,6 +2927,65 @@ async function testResumeReviewCardStreamingHistoryAndIncomplete() {
   assert.ok(!direction.textContent.includes("優先修改重點"));
   const pasted = home.context.JobCards.resumeReviewCard({...data, target: {type: "jd_text", label: "後端"}});
   assert.ok(pasted.textContent.includes("使用者提供的職缺內容"));
+
+  const oldAngle = {angle: "jd_match", name: "JD 關鍵條件對照", status: "needs", reason: "缺少依據"};
+  const legacy = home.context.JobCards.resumeReviewCard({...data, angles: [oldAngle]});
+  assert.ok(legacy.textContent.includes("職缺條件對照")); assert.ok(!legacy.textContent.includes("JD"));
+  // Exercise actual click handlers on both the streamed and restored card, without fetch or storage.
+  const downloads = [], revoked = [], copied = [];
+  home.context.Blob = Blob;
+  home.context.URL = class extends URL {
+    static createObjectURL(blob) { const url = `blob:synthetic-${downloads.length}`; downloads.push({blob, url}); return url; }
+    static revokeObjectURL(url) { revoked.push(url); }
+  };
+  const createElement = home.context.document.createElement;
+  home.context.document.createElement = tag => {
+    const element = createElement(tag);
+    if (tag === "a") element.addEventListener("click", () => Object.assign(downloads.at(-1), {filename: element.download, href: element.href}));
+    return element;
+  };
+  home.context.navigator.clipboard = {async writeText(text) { copied.push(text); }};
+  const networkBefore = [home.state.fetchCalls.length, home.state.apiCalls.length];
+  const storageBefore = [...home.storage.values];
+  for (const card of [live, restored]) {
+    const format = all(card, item => item.tagName === "SELECT")[0];
+    assert.equal(format.getAttribute("aria-label"), "修改清單下載格式");
+    assert.deepEqual(format.children.map(option => option.value), ["txt", "md"]);
+    for (const extension of ["txt", "md"]) {
+      format.value = extension;
+      await all(card, item => item.tagName === "BUTTON" && item.textContent === "下載修改清單")[0].click();
+      const result = downloads.at(-1);
+      assert.equal(result.href, result.url);
+      assert.match(result.filename, new RegExp(`^履歷修改清單-script後端script-\\d{8}\\.${extension}$`));
+      const bytes = Buffer.from(await result.blob.arrayBuffer());
+      if (extension === "txt") assert.deepEqual([...bytes.subarray(0, 3)], [239, 187, 191]);
+      const content = bytes.toString("utf8");
+      assert.ok(content.includes("建議句：維護 API〔待補：成效〕"));
+      assert.ok(content.includes(extension === "txt" ? "【待補清單】" : "## 待補清單"));
+      assert.ok(!content.includes("不易核對"));
+    }
+    const copy = all(card, item => item.tagName === "BUTTON" && item.textContent === "複製建議句")[0];
+    await copy.click(); assert.equal(copied.at(-1), data.rewrites[0].suggested); assert.ok(card.textContent.includes("已複製"));
+    home.context.navigator.clipboard.writeText = async () => { throw new Error("denied"); };
+    await copy.click(); assert.ok(card.textContent.includes("無法複製，請選取建議句手動複製。")); assert.equal(copy.disabled, false);
+    home.context.navigator.clipboard.writeText = async text => { copied.push(text); };
+  }
+  assert.equal(downloads.length, 4); assert.equal(copied.length, 2);
+  assert.equal(home.context.document.body.children.length, 0, "temporary download links are removed");
+  await home.state.clock.advance(1000); assert.deepEqual(revoked, downloads.map(item => item.url));
+  assert.deepEqual([home.state.fetchCalls.length, home.state.apiCalls.length], networkBefore);
+  assert.deepEqual([...home.storage.values], storageBefore, "copy and download save no new browser data");
+}
+
+function testFullWidthChatDesktopScope() {
+  const css = fs.readFileSync(path.join(__dirname, "..", "app", "static", "style.css"), "utf8");
+  const desktop = css.split("@media(min-width:1001px){")[1].split("@media(max-width:1000px){")[0];
+  assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel\{[^}]*grid-template-columns:minmax\(0,1fr\)/);
+  assert.match(desktop, /#user-panel:has\(#search-results-panel\[hidden\]\) #chat\{grid-column:1\/-1\}/);
+  assert.match(desktop, /#user-panel:has\(#search-results-panel\[hidden\]\) #chat-transcript,[^{]+\.chat-composer\{width:100%;max-width:960px;margin-inline:auto\}/);
+  assert.match(desktop, /#user-panel:has\(#search-results-panel:not\(\[hidden\]\)\)\{grid-template-columns:var\(--chat-w,var\(--chat-col\)\) 14px minmax\(0,1fr\);column-gap:0\}/);
+  assert.match(desktop, /#panel-resizer\{display:block;grid-column:2;grid-row:3\}/);
+  assert.match(desktop, /#search-results-panel\{grid-column:3\}/);
 }
 
 async function testReuseAttachmentsMemoryOnlyAndRelease() {
@@ -2982,6 +3042,7 @@ process.on("exit", () => {
 
 (async () => {
   await testResumeReviewCardStreamingHistoryAndIncomplete();
+  testFullWidthChatDesktopScope();
   await testReuseAttachmentsMemoryOnlyAndRelease();
   await testCsrfInflightReviewAndPollGeneration();
   await testCsrfChatRecovery();
@@ -3042,7 +3103,7 @@ process.on("exit", () => {
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
   testRunCompleted = true;
-  console.log("test_m3_home: 54 checks passed");
+  console.log("test_m3_home: 55 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
