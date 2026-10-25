@@ -141,7 +141,7 @@ function keyForTest() {
     "daily-date", "daily-status", "chat-form", "chat-status", "cancel-chat", "refresh-messages", "more-messages", "preferences-feedback", "daily-sources",
     "review-result", "more-favorites", "more-daily", "refresh-daily", "criteria-form", "message", "enable-push",
     "disable-push", "push-status", "push-summary", "companion", "encourage-dialog", "encourage-companion", "encourage-text", "theme", "daily",
-    "header-companion", "status-companion", "quick-options", "toggle-quick-options", "chat-count", "resume-file", "resume-selection", "resume-name", "remove-resume", "chat-transcript", "latest-message", "chat", "chat-drop-overlay",
+    "header-companion", "status-companion", "quick-options", "toggle-quick-options", "chat-count", "resume-file", "resume-selection", "resume-name", "remove-resume", "reuse-attachments", "clear-reusable-attachments", "chat-transcript", "latest-message", "chat", "chat-drop-overlay",
     "new-conversation", "open-conversation-history", "active-conversation-title", "conversation-history-dialog", "conversation-search-form", "conversation-query",
     "conversation-history-status", "conversation-list", "more-conversations", "close-conversation-history",
     "rename-conversation-dialog", "rename-conversation-form", "rename-conversation-input", "rename-conversation-status", "cancel-rename-conversation", "save-conversation-name",
@@ -2875,6 +2875,103 @@ async function testCsrfChatAndApiShareRecovery() {
   assert.equal(home.elements.get("chat-status").dataset.state, "complete");
 }
 
+async function testResumeReviewCardStreamingHistoryAndIncomplete() {
+  const home = createContext(); await settle();
+  const data = {target: {type: "job", label: "<script>後端</script>", url: "javascript:alert(1)", company_name: "合成公司", identity_verified: false},
+    has_jd: true, group: "優先修改重點", positioning: "開發者", fixes: [{what: "補充成果", how: "驗證方式", need_from_user: "成效"}],
+    angles: [{angle: "screening", name: "人資初篩", status: "meets", reason: "有職稱"}, {angle: "manager", name: "用人主管", status: "needs", reason: "缺少成果"}],
+    prosecution: [{issue: "缺少成果", impact: "不易核對"}], defense: {responses: ["有工作內容"], strengths: ["有技能"]},
+    rewrites: [{original: "維護 API", suggested: "維護 API〔待補：成效〕", reason: "更具體"}], removed_rewrites: 2, quote_check: "unchecked_image"};
+  const assertUnfinishedHidden = (card, hidden) => {
+    const notices = all(card, item => item.textContent === "收尾未完成");
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0].hidden, hidden);
+  };
+  let live;
+  for (const status of ["completed", "interrupted"]) {
+    home.state.input.value = "檢查履歷";
+    home.context.ChatSSE.read = async (_response, onEvent) => {
+      await onEvent("resume_review", data);
+      const reply = all(home.elements.get("chat-list"), item => item.dataset.role === "assistant").at(-1);
+      live = reply.resumeReviewCards[0];
+      assert.ok(live, "SSE whitelist accepts the review event");
+      assert.equal(reply.replyStatus, "running");
+      assertUnfinishedHidden(live, true);
+      await onEvent("text_delta", {text: "優先補充成果。"});
+      assertUnfinishedHidden(live, true);
+      await onEvent("done", {request_id: home.state.chatRequestId, status});
+      assertUnfinishedHidden(live, status === "completed");
+    };
+    await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  }
+  const historical = home.context.chatMessage("assistant", "", "completed", [{event: "resume_review", data}], [], null, "old", "old", true);
+  const restored = historical.resumeReviewCards[0];
+  assertUnfinishedHidden(restored, true);
+  assert.equal(restored.textContent, live.textContent, "history and SSE use one renderer");
+  assert.ok(restored.textContent.includes("已具備")); assert.ok(restored.textContent.includes("需補強"));
+  assert.ok(restored.textContent.includes("職缺身分未核對"));
+  assert.ok(restored.textContent.includes("原句未逐字核對，數字無法核實"));
+  assert.ok(restored.textContent.includes("已移除 2 組無法核對的建議"));
+  assert.ok(restored.textContent.includes("片段隨對話保存；刪除對話會移除，已產生的備份不會。"));
+  assert.equal(all(restored, item => item.tagName === "MARK")[0].textContent, "〔待補：成效〕");
+  assert.equal(all(restored, item => ["SCRIPT", "IMG"].includes(item.tagName)).length, 0);
+  assert.equal(all(restored, item => item.tagName === "A")[0].href, undefined);
+  assert.ok(all(restored, item => item.tagName === "DETAILS").every(item => !item.open), "debate and rewrites default to collapsed");
+  for (const status of ["running", "interrupted", "failed"]) {
+    const unfinished = home.context.chatMessage("assistant", "", status, [{event: "resume_review", data}], [], null, "old", "old", true);
+    assertUnfinishedHidden(unfinished.resumeReviewCards[0], status === "running");
+  }
+  const direction = home.context.JobCards.resumeReviewCard({...data, has_jd: false, group: null, target: {type: "direction", label: "後端"}});
+  assert.ok(direction.textContent.includes("方向檢查，未對準特定職缺"));
+  assert.ok(!direction.textContent.includes("優先修改重點"));
+  const pasted = home.context.JobCards.resumeReviewCard({...data, target: {type: "jd_text", label: "後端"}});
+  assert.ok(pasted.textContent.includes("使用者提供的職缺內容"));
+}
+
+async function testReuseAttachmentsMemoryOnlyAndRelease() {
+  const home = createContext(); await settle();
+  const file = new File(["synthetic resume"], "合成履歷.txt", {type: "text/plain"});
+  const before = [...home.storage.values];
+  home.state.fileInput.files = [file]; await home.state.fileInput.dispatch("change");
+  home.state.input.value = "檢查履歷";
+  let sent = 0;
+  home.context.ChatSSE.read = async (_response, onEvent) => { sent++; await onEvent("done", {request_id: home.state.chatRequestId, status: "completed"}); };
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(home.state.fileInput.files.length, 0, "accepted composer is cleared");
+  const reuse = home.elements.get("reuse-attachments");
+  assert.equal(reuse.hidden, false); assert.equal(reuse.disabled, false);
+  home.state.input.value = "對準後端工程師";
+  await reuse.click();
+  assert.equal(home.state.fileInput.files[0], file);
+  assert.equal(home.state.input.value, "對準後端工程師", "reuse preserves the user's answer");
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(sent, 2); assert.equal(home.state.chatPayloads[1].resumes[0], file, "next request reuploads the same File");
+  assert.deepEqual([...home.storage.values], before, "no browser storage writes for attachment reuse");
+  const next = {id: "other-conversation", title: "下一段"}; home.state.conversations.push(next);
+  await home.context.openConversation(next);
+  assert.equal(reuse.hidden, true); assert.equal(vm.runInContext("reusableAttachments.length", home.context), 0);
+  for (const release of ["clear", "logout", "pagehide"]) {
+    const test = createContext(); await settle();
+    test.state.fileInput.files = [file]; await test.state.fileInput.dispatch("change");
+    test.context.clearAcceptedComposer({attachments: [file], text: test.state.input.value});
+    assert.equal(test.elements.get("reuse-attachments").hidden, false);
+    if (release === "clear") await test.elements.get("clear-reusable-attachments").click();
+    else if (release === "logout") test.context.signedOut();
+    else test.window.dispatchEvent(new Event(release));
+    assert.equal(test.elements.get("reuse-attachments").hidden, true, release);
+    assert.equal(vm.runInContext("reusableAttachments.length", test.context), 0, release);
+  }
+  const fresh = createContext({storage: home.storage}); await settle();
+  assert.equal(fresh.elements.get("reuse-attachments").hidden, true, "reload cannot recover File objects");
+  // A real account change detected by shared CSRF recovery also releases the cached files.
+  const changed = createContext(); await settle();
+  changed.context.clearAcceptedComposer({attachments: [file], text: ""});
+  changed.context.fetch = async () => jsonResponse({...changed.state.bootstrap, account: {username: "bob"}});
+  const result = await changed.context.recoverCsrfToken("csrf-1");
+  assert.equal(result, "account_changed");
+  assert.equal(changed.elements.get("reuse-attachments").hidden, true);
+}
+
 let testRunCompleted = false;
 process.on("exit", () => {
   if (!testRunCompleted && !process.exitCode) {
@@ -2884,6 +2981,8 @@ process.on("exit", () => {
 });
 
 (async () => {
+  await testResumeReviewCardStreamingHistoryAndIncomplete();
+  await testReuseAttachmentsMemoryOnlyAndRelease();
   await testCsrfInflightReviewAndPollGeneration();
   await testCsrfChatRecovery();
   await testCsrfChatAndApiShareRecovery();
@@ -2943,7 +3042,7 @@ process.on("exit", () => {
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
   testRunCompleted = true;
-  console.log("test_m3_home: 52 checks passed");
+  console.log("test_m3_home: 54 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

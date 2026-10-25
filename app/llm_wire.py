@@ -247,7 +247,7 @@ def _anthropic_messages(messages: list[dict]) -> tuple[str | None, list[dict]]:
     return ("\n\n".join(system) if system else None), result
 
 
-def build_payload(protocol: str, model: str, messages: list[dict], tools: list[dict]) -> dict:
+def build_payload(protocol: str, model: str, messages: list[dict], tools: list[dict], max_tokens=None) -> dict:
     """Build a streaming request body without mutating caller-owned values."""
 
     protocol = _protocol(protocol)
@@ -298,7 +298,7 @@ def build_payload(protocol: str, model: str, messages: list[dict], tools: list[d
         "model": model,
         "messages": anthropic_messages,
         "tools": _anthropic_tools(normalized_tools),
-        "max_tokens": 4096,
+        "max_tokens": 4096 if max_tokens is None else max_tokens,
         "stream": True,
     }
     if system is not None:

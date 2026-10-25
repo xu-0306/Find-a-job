@@ -25,7 +25,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from . import security
 from .store import Criteria, Input, Job, Store, encode, now
-from . import chat, llm, sources, reviews, backups, notifications, push, resume_pdf, chat_files, web, job_normalize
+from . import chat, llm, sources, reviews, backups, notifications, push, resume_pdf, chat_files, web, job_normalize, resume_review
 from .scheduler import DailyRunner, TAIPEI, effective_preferences, run_view, user_run_view
 from .sprite_validation import STATES, MAX_FILE_BYTES, TEMPLATE_COLUMNS, validate_png, split_template
 from .sharing import Sharing
@@ -1300,8 +1300,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         except sources.SourceError as exc:
             result = {'status': exc.status, 'detail': None, 'identity_verified': False, 'limitations': [exc.message]}
         result.update(job_id=job_id, item=None)
-        if url is not None:
-            result['url'] = url
+        result['url'] = url if url is not None else str(job.url)
         with store.connect(write=True) as db:
             ensure_active(db, auth_hash)
             if job_id and result.get('identity_verified') and result.get('detail'):
@@ -1401,6 +1400,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         return {'ok': True}
 
     tool_specs = [
+        {'name': 'submit_resume_review', 'description': resume_review.DESCRIPTION, 'parameters': resume_review.ResumeReview.model_json_schema()},
         {'name': 'list_preferences', 'description': '查看已確認的條件與等待確認的提案。',
          'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         {'name': 'propose_preference_change', 'description': '提出條件變更，須由使用者檢視確認後才生效。',
@@ -1416,6 +1416,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
     def validate_tool(call):
         try:
             arguments = json.loads(call['arguments'])
+            if call['name'] == 'submit_resume_review' and isinstance(arguments, dict): return arguments
             if call['name'] == 'list_preferences':
                 if arguments != {}:
                     raise ValueError()

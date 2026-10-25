@@ -87,7 +87,7 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(recommendation["items"][0]["job"]["remote_type"], "fully_remote")
         references = [json.loads(item["content"].split("\n", 1)[1])
             for item in json.loads(recommendation_requests[-1])["input"] if item.get("role") == "user"
-            and isinstance(item.get("content"), str) and item["content"].startswith("以下是這段對話已保存的職缺引用")]
+            and isinstance(item.get("content"), str) and item["content"].startswith("以下是這段對話已保存的參考資料")]
         self.assertEqual(len(references), 1)
         self.assertEqual(references[0][0]["area_results"], [{key: first["area_results"][0][key]
             for key in ("area_name", "source", "status", "completed")}])

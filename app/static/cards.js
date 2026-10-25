@@ -343,7 +343,69 @@
     return card;
   }
 
-  const JobCards = {jobCard, reviewCard, safeHref, externalLink, updateReview, reviewMessage, fitList};
+  function resumeReviewCard(data, status = "completed") {
+    const card = element("article", undefined, "resume-review-card item");
+    const target = data.target || {};
+    const heading = element("h3", "履歷檢查 · ");
+    heading.append(target.type === "job" ? externalLink(target.label, target.url, "resume-review-target") : element("span", target.label));
+    card.append(heading);
+    if (target.company_name) card.append(element("p", target.company_name, "hint"));
+    if (target.type === "direction") card.append(element("p", "方向檢查，未對準特定職缺", "hint"));
+    else if (target.type === "jd_text") card.append(element("p", "使用者提供的職缺內容", "hint"));
+    else if (!target.identity_verified) card.append(element("p", "職缺身分未核對", "hint"));
+    if (data.has_jd && data.group) card.append(element("p", data.group, "notice"));
+    card.append(element("small", "同一模型的六種檢查角度"), element("p", data.positioning));
+    const unfinished = element("p", "收尾未完成", "notice");
+    unfinished.setAttribute("role", "status");
+    card.setReplyStatus = value => { unfinished.hidden = !["interrupted", "failed"].includes(value); };
+    card.setReplyStatus(status); card.append(unfinished);
+
+    const fixes = element("section");
+    fixes.append(element("h4", "優先修改項"));
+    const fixList = element("ol");
+    for (const fix of data.fixes || []) {
+      const row = element("li");
+      row.append(element("strong", fix.what), element("p", fix.how));
+      if (fix.need_from_user) row.append(element("p", `需要你提供：${fix.need_from_user}`, "hint"));
+      fixList.append(row);
+    }
+    fixes.append(fixList.children.length ? fixList : element("p", "目前沒有優先修改項。", "hint"));
+    card.append(fixes);
+    const angles = element("section"); angles.append(element("h4", "六個檢查角度"));
+    const grid = element("div", undefined, "resume-review-angles");
+    for (const angle of data.angles || []) {
+      const row = element("div", undefined, "resume-review-angle");
+      row.append(element("strong", angle.name),
+        element("span", angle.status === "meets" ? "已具備" : "需補強", `resume-review-mark ${angle.status === "meets" ? "meets" : "needs"}`),
+        element("p", angle.reason));
+      grid.append(row);
+    }
+    angles.append(grid); card.append(angles);
+    const debate = element("details"); debate.append(element("summary", "扣分點與辯護"));
+    const issues = element("ol");
+    for (const [index, issue] of (data.prosecution || []).entries()) {
+      const row = element("li"); row.append(element("strong", issue.issue), element("p", issue.impact), element("p", `辯護：${data.defense?.responses?.[index] || ""}`));
+      issues.append(row);
+    }
+    debate.append(issues); addValues(debate, "補充優勢", data.defense?.strengths);
+    card.append(debate);
+    const rewrites = element("details"); rewrites.append(element("summary", "改寫建議"));
+    if (data.quote_check === "unchecked_image") rewrites.append(element("p", "原句未逐字核對，數字無法核實", "notice"));
+    if (data.removed_rewrites) rewrites.append(element("p", `已移除 ${data.removed_rewrites} 組無法核對的建議`, "hint"));
+    for (const rewrite of data.rewrites || []) {
+      const row = element("div", undefined, "resume-review-rewrite");
+      row.append(element("p", `原句：${rewrite.original}`));
+      const suggested = element("p"); suggested.append(element("span", "建議："));
+      for (const part of String(rewrite.suggested).split(/(〔待補[:：][^〕]*〕)/g)) {
+        suggested.append(element(part.startsWith("〔待補") ? "mark" : "span", part));
+      }
+      row.append(suggested, element("small", rewrite.reason)); rewrites.append(row);
+    }
+    card.append(rewrites, element("small", "片段隨對話保存；刪除對話會移除，已產生的備份不會。"));
+    return card;
+  }
+
+  const JobCards = {resumeReviewCard, jobCard, reviewCard, safeHref, externalLink, updateReview, reviewMessage, fitList};
   root.JobCards = JobCards;
   if (typeof module !== "undefined" && module.exports) module.exports = JobCards;
 })(typeof window === "object" ? window : globalThis);

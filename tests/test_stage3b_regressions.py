@@ -379,7 +379,7 @@ class R4ReferenceChecks(unittest.IsolatedAsyncioTestCase):
                 invoke = AsyncMock(return_value=(data, ('jobs', data)))
                 with patch('app.chat.stream_model', side_effect=model):
                     await produce_reply(app, 'current', {}, 'synthetic', 'responses', [], lambda call: SearchInput(criteria=dict(keyword='planner'), sources=['104']), invoke, 'auth', queue, initial_search=dict(search_id='search'))
-                references = [json.loads(message['content'].split('\n', 1)[1]) for message in captured if message['role'] == 'user' and isinstance(message['content'], str) and message['content'].startswith('以下是這段對話已保存的職缺引用')]
+                references = [json.loads(message['content'].split('\n', 1)[1]) for message in captured if message['role'] == 'user' and isinstance(message['content'], str) and message['content'].startswith('以下是這段對話已保存的參考資料')]
                 self.assertEqual(len(references), 1)
                 self.assertEqual(references[0][0]['area_results'], [{key: area[key] for key in ('area_name', 'source', 'status', 'completed')}])
                 tool_results = [json.loads(message['content']) for message in captured if message['role'] == 'tool']

@@ -71,8 +71,8 @@ async def sse_data(response):
     # An unterminated frame is not a completed SSE event.
 
 
-async def stream_model(client, settings, key, protocol, messages, tools, force_tool=False, no_tools=False, had_success=False):
-    payload = build_payload(protocol, settings['llm_model'], messages, tools)
+async def stream_model(client, settings, key, protocol, messages, tools, force_tool=False, no_tools=False, had_success=False, max_tokens=None):
+    payload = build_payload(protocol, settings['llm_model'], messages, tools, max_tokens=max_tokens)
     if force_tool:
         payload['tool_choice'] = {'type': 'any'} if protocol == 'anthropic_messages' else 'required'
     elif no_tools:

@@ -11,6 +11,7 @@ let activeChat = null;
 let pendingChatAction = null;
 let editOrigin = null;
 let previousValidAttachments = [];
+let reusableAttachments = [];
 const CHAT_RETRY_LIMIT = 5;
 const CHAT_RETRY_DELAY_MS = 5000;
 const chatSearchResults = new WeakMap();
@@ -1123,7 +1124,7 @@ function signedOut() {
   $("#conversation-history-status").setAttribute("aria-busy", "false"); $("#more-conversations").disabled = false;
   $("#chat-form").reset(); $("#chat-status").textContent = ""; $("#cancel-chat").hidden = true;
   editOrigin = null; $("#message-edit-banner").hidden = true; $("#message-edit-status").textContent = "";
-  previousValidAttachments = []; clearChatFileDrag();
+  previousValidAttachments = []; releaseReusableAttachments(); clearChatFileDrag();
   updateResumeSelection(); updateChatCount();
   $("#review-dialog").close(); $("#review-result").replaceChildren();
   $("#conversation-history-dialog").close(); $("#rename-conversation-dialog").close(); $("#delete-conversation-dialog").close();
@@ -1480,6 +1481,8 @@ function renderToolProgress(message, data) {
   details.children[0].textContent = currentLabel || (current?.summary || "工作進度");
 }
 function finishToolProgress(message, status = "completed") {
+  if (message) message.replyStatus = status;
+  for (const card of message?.resumeReviewCards || []) card.setReplyStatus(status);
   const details = message?.toolProgressElement;
   if (!details) return;
   details.children[0].textContent = status === "completed" ? "工作進度（已完成）" : "工作進度（已中斷）";
@@ -1487,7 +1490,10 @@ function finishToolProgress(message, status = "completed") {
 }
 function renderChatEvent(message, name, data, historical = false) {
   const container = $(".chat-bubble", message);
-  if (name === "preference_proposal") {
+  if (name === "resume_review") {
+    const card = JobCards.resumeReviewCard(data, message.replyStatus);
+    (message.resumeReviewCards ||= []).push(card); container.append(card);
+  } else if (name === "preference_proposal") {
     const card = node("article", undefined, "item");
     card.append(node("h3", "條件變更提案"), node("p", `原條件：${describe(data.before)}`), node("p", `提案：${describe(data.after)}`), node("small", "請到我的條件查看目前狀態；確認後才會生效。"));
     const button = node("button", "檢視並決定"); button.type = "button";
@@ -1552,6 +1558,7 @@ function updateConversationControls() {
   $("#refresh-messages").disabled = Boolean(activeChat && !activeChat.awaitingSnapshot) || switchingConversation || !selectedConversationId;
   $("#more-messages").disabled = blocked;
   syncContinueButton();
+  updateReusableAttachments();
   for (const chip of $("#search-results-list")?.querySelectorAll?.(".excluded-company-chips button") || []) {
     chip.disabled = blocked || !csrfToken;
   }
@@ -1618,7 +1625,7 @@ function showNoConversations() {
   if (!csrfToken) return;
   const hadEdit = Boolean(editOrigin);
   cancelMessageEdit(false);
-  selectedConversationId = null; messageCursor = null;
+  selectedConversationId = null; messageCursor = null; releaseReusableAttachments();
   $("#active-conversation-title").textContent = "尚未選取對話";
   $("#chat-list").replaceChildren(node("p", "目前沒有對話，按「新對話」開始。", "hint"));
   $("#more-messages").hidden = true; $("#chat-transcript").scrollTop = 0; $("#latest-message").hidden = true;
@@ -1728,6 +1735,7 @@ function chatMessage(role, text, status = "completed", events = [], attachments 
   const card = node("article", undefined, `chat-message ${role === "user" ? "chat-user" : ""}`);
   if (requestId) card.dataset.requestId = String(requestId);
   card.dataset.role = role;
+  card.replyStatus = status;
   if (messageId !== null && messageId !== undefined) card.dataset.messageId = String(messageId);
   if (role !== "user") {
     const avatar = node("div", undefined, "chat-avatar");
@@ -1798,6 +1806,7 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   }
   if (more) $("#chat-list").prepend(fragment);
   else $("#chat-list").replaceChildren(fragment);
+  if (changed) releaseReusableAttachments();
   selectedConversationId = id;
   applyConversationWork(result.conversation_state);
   renderSearchResultsPanel();
@@ -1853,6 +1862,8 @@ function chatOperationIsCurrent(operation) {
 }
 function clearAcceptedComposer(operation) {
   if (operation.composerCleared) return;
+  reusableAttachments = [...operation.attachments];
+  updateReusableAttachments();
   const input = $("#chat-form [name=text]");
   if (input.value.trim() === operation.text.trim()) input.value = "";
   const selected = [...($("#resume-file").files || [])];
@@ -2183,8 +2194,18 @@ function setAttachmentInput(files) {
     input.value = ""; return false;
   }
 }
+function updateReusableAttachments() {
+  const control = $("#reuse-attachments");
+  if (control) { control.hidden = !reusableAttachments.length; control.disabled = Boolean(activeChat || switchingConversation); }
+  const clear = $("#clear-reusable-attachments");
+  if (clear) { clear.hidden = !reusableAttachments.length; clear.disabled = Boolean(activeChat); }
+}
+function releaseReusableAttachments() {
+  reusableAttachments = []; updateReusableAttachments();
+}
 function removeAttachment(file) {
   if (activeChat) return;
+  releaseReusableAttachments();
   previousValidAttachments = [...($("#resume-file").files || [])].filter(item => item !== file);
   if (!setAttachmentInput(previousValidAttachments)) previousValidAttachments = [];
   updateResumeSelection(); updateChatCount();
@@ -2261,8 +2282,11 @@ $("#resume-file").addEventListener("change", () => {
 });
 $("#remove-resume").addEventListener("click", () => {
   if (activeChat) return;
+  releaseReusableAttachments();
   previousValidAttachments = []; $("#resume-file").value = ""; updateResumeSelection(); updateChatCount();
 });
+$("#reuse-attachments")?.addEventListener("click", () => { acceptAttachmentSelection(reusableAttachments); });
+$("#clear-reusable-attachments")?.addEventListener("click", () => { if (!activeChat) releaseReusableAttachments(); });
 $("#chat").addEventListener("dragenter", event => {
   if (!transferHasFiles(event)) return;
   event.preventDefault(); showChatFileDrag();
@@ -2458,11 +2482,11 @@ $("#chat-form").addEventListener("submit", async event => {
             const detail = typeof data?.message === "string" && data.message.trim() ? data.message.trim() : "回覆暫時中斷，正在重試。";
             setChatStatus(`${detail}${Number.isFinite(attempt) && Number.isFinite(max) ? `（${attempt}/${max}）` : ""}`);
           } else if (name === "tool_status") {
-            const titles = {reply: "正在回覆", list_preferences: "正在查看條件", propose_preference_change: "正在整理條件提案", search_jobs: "正在搜尋職缺", get_job_details: "正在讀取職缺詳細內容", get_company_reviews: "正在查詢公司評價", read_web_page: "正在讀取公開網頁"};
+            const titles = {submit_resume_review: "正在整理履歷檢查", reply: "正在回覆", list_preferences: "正在查看條件", propose_preference_change: "正在整理條件提案", search_jobs: "正在搜尋職缺", get_job_details: "正在讀取職缺詳細內容", get_company_reviews: "正在查詢公司評價", read_web_page: "正在讀取公開網頁"};
             setChatStatus(data?.summary || titles[data?.name] || "正在處理請求…");
             updateToolThinking(data);
             renderToolProgress(operation.replyElement, data);
-          } else if (["preference_proposal", "jobs", "review", "job_detail", "recommendations", "error"].includes(name)) {
+          } else if (["preference_proposal", "jobs", "review", "job_detail", "recommendations", "resume_review", "error"].includes(name)) {
             renderChatEvent(operation.replyElement, name, data);
           } else if (name === "done") {
             if (data?.request_id !== operation.id || !["completed", "interrupted"].includes(data.status)) throw new Error("回覆完成狀態不符。");
@@ -2727,7 +2751,7 @@ window.addEventListener("session-expired", signedOut);
   try {
     const bootstrap = await api("/api/bootstrap"); csrfToken = bootstrap.csrf_token;
     csrfHeaderToken = csrfToken;
-    enableCsrfRecovery(bootstrap.account?.username);
+    enableCsrfRecovery(bootstrap.account?.username, releaseReusableAttachments);
     setupCompanion(bootstrap);
     maybeShowEncouragement(bootstrap);
     updatePushBootstrap(bootstrap);

@@ -58,6 +58,7 @@
 !/tests/test_m3_sw.js
 !/tests/test_m4_deployment.py
 !/tests/test_ports.py
+!/tests/test_resume_review.py
 !/tests/test_resume_chat.py
 !/tests/test_search_workspace.py
 !/tests/test_sharing.py

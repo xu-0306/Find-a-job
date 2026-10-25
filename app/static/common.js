@@ -3,18 +3,21 @@ let csrfToken = "";
 let csrfHeaderToken = "";
 let csrfRecoveryEnabled = false;
 let csrfRecoveryAccount = "";
+let csrfRecoveryAccountChanged = null;
 let csrfRecoveryPromise = null;
 let regionCatalog = [];
 const LOGIN_CHANGED_MESSAGE = "登入狀態已變更，請重新整理。";
 const CSRF_RECOVERY_UNAVAILABLE_MESSAGE = "暫時無法確認登入狀態，請稍後再試。";
 const CSRF_RECOVERY_TIMEOUT_MS = 10000;
 const CSRF_RECOVERY_RESULT = Object.freeze({success: "success", accountChanged: "account_changed", unavailable: "unavailable", aborted: "aborted"});
-function enableCsrfRecovery(username) {
+function enableCsrfRecovery(username, onAccountChanged = null) {
+  csrfRecoveryAccountChanged = onAccountChanged;
   csrfRecoveryEnabled = true;
   csrfRecoveryAccount = typeof username === "string" ? username : "";
 }
 function disableCsrfRecovery() {
   csrfRecoveryEnabled = false;
+  csrfRecoveryAccountChanged = null;
   csrfRecoveryAccount = "";
   csrfRecoveryPromise = null;
 }
@@ -47,7 +50,10 @@ function recoverCsrfToken(requestToken, signal) {
         const account = typeof bootstrap?.account?.username === "string" ? bootstrap.account.username : "";
         const token = typeof bootstrap?.csrf_token === "string" ? bootstrap.csrf_token : "";
         if (!csrfRecoveryAccount || !account || !token) return CSRF_RECOVERY_RESULT.unavailable;
-        if (account !== csrfRecoveryAccount) return CSRF_RECOVERY_RESULT.accountChanged;
+        if (account !== csrfRecoveryAccount) {
+          csrfRecoveryAccountChanged?.();
+          return CSRF_RECOVERY_RESULT.accountChanged;
+        }
         csrfHeaderToken = token;
         return CSRF_RECOVERY_RESULT.success;
       } catch (_) {

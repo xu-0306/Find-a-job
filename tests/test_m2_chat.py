@@ -122,7 +122,7 @@ class ChatChecks(unittest.TestCase):
                     requests.append(payload)
                     if len(requests) == 1:
                         names = [tool.get('name') or tool['function']['name'] for tool in payload['tools']]
-                        self.assertEqual(set(names), {'list_preferences','propose_preference_change','search_jobs','get_job_details','get_company_reviews','read_web_page','lookup_job_areas','present_job_recommendations'})
+                        self.assertEqual(set(names), {'list_preferences','propose_preference_change','search_jobs','get_job_details','get_company_reviews','read_web_page','lookup_job_areas','present_job_recommendations','submit_resume_review'})
                         return response(protocol, text='先提出，等待你決定。', call=('c1', 'propose_preference_change', encode({'operation': 'create', 'after': CRITERIA})))
                     self.assertIn('pending', encode(payload))
                     return response(protocol, text='提案完成，尚未生效。')

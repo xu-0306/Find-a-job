@@ -187,3 +187,13 @@ dialog{max-width:min(480px,calc(100% - 32px));border:1px solid var(--line);borde
 
 .excluded-company-chips { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .excluded-company-chips button { min-height: 44px; min-width: 44px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+
+.resume-review-card{min-width:0;max-width:100%;display:grid;gap:10px;background:var(--surface);white-space:normal}
+.resume-review-card h4,.resume-review-card p{margin:4px 0}.resume-review-card section,.resume-review-card details{min-width:0}
+.resume-review-card ol{padding-left:22px;margin:6px 0}.resume-review-target{color:var(--primary);overflow-wrap:anywhere}
+.resume-review-angles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.resume-review-angle{min-width:0;border:1px solid var(--line);border-radius:12px;padding:10px;background:var(--bg)}
+.resume-review-mark{display:inline-block;margin:4px 6px;padding:1px 8px;border-radius:8px;font-size:14px;font-weight:700}
+.resume-review-mark.meets{background:var(--ok-bg);color:var(--ok-fg)}.resume-review-mark.needs,.resume-review-card mark{background:var(--warn-bg);color:var(--warn-fg)}
+.resume-review-rewrite{border-top:1px solid var(--line);padding:8px 0;white-space:pre-wrap}.resume-review-card mark{font-weight:700;border-radius:4px;padding:0 2px}
+@media(max-width:600px){.resume-review-angles{grid-template-columns:minmax(0,1fr)}.resume-review-card{padding:12px}}
