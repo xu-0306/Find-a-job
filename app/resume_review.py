@@ -1,9 +1,10 @@
 """Validate a single-turn resume review and prepare its public card without I/O."""
 import re
-import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from .attachment_text import normalize_attachment_text
 
 ANGLES = {
     'screening': '人資初篩',
@@ -25,16 +26,16 @@ class ReviewCase(ReviewModel):
     job_id: str | None = None
     url: str | None = None
     target_label: str = Field(default='', max_length=40)
-    positioning: str = Field(max_length=40)
+    positioning: str = Field(default='', max_length=40)
 
 
 class Issue(ReviewModel):
     issue: str = Field(max_length=30)
     impact: str = Field(max_length=30)
+    response: str = Field(max_length=50)
 
 
 class Defense(ReviewModel):
-    responses: list[Annotated[str, Field(max_length=50)]] = Field(max_length=3)
     strengths: list[Annotated[str, Field(max_length=40)]] = Field(max_length=2)
 
 
@@ -84,7 +85,43 @@ def limits_description():
             return f'{path or "每筆"}≤{node["maxLength"]}字'
         return ''
 
-    return '上限（中文一字算 1 字元）：' + describe(schema) + '。任何一項超過，整份提交都會驗證失敗。'
+    return ('上限（中文一字算 1 字元）：' + describe(schema)
+            + '。請寫在上限內；一般文字超過會被截斷，改寫的 original／suggested 超過會整組被移除。')
+
+
+def trim_text(arguments, schema):
+    removed = 0
+
+    def resolve(node):
+        return schema['$defs'][node['$ref'].rsplit('/', 1)[-1]] if '$ref' in node else node
+
+    def visit(value, node, path=()):
+        nonlocal removed
+        node = resolve(node)
+        if isinstance(value, dict):
+            fields = node.get('properties', {})
+            return {key: visit(item, fields.get(key, {}), (*path, key)) for key, item in value.items()}
+        if isinstance(value, list):
+            item_schema = resolve(node.get('items', {}))
+            fields = item_schema.get('properties', {})
+            kept = []
+            for index, item in enumerate(value):
+                # Do not let removing a rewrite hide an invalid shape or an exceeded item limit.
+                if (path == ('rewrites',) and len(value) <= node.get('maxItems', len(value))
+                        and isinstance(item, dict) and item.keys() <= fields.keys()
+                        and all(isinstance(item.get(key), str) for key in item_schema.get('required', []))
+                        and any(isinstance(item.get(key), str) and 'maxLength' in fields.get(key, {})
+                                and len(item[key]) > fields[key]['maxLength']
+                                for key in ('original', 'suggested'))):
+                    removed += 1
+                    continue
+                kept.append(visit(item, item_schema, (*path, index)))
+            return kept
+        if isinstance(value, str) and 'maxLength' in node and len(value) > node['maxLength']:
+            return value[:node['maxLength'] - 1] + '…'
+        return value
+
+    return visit(arguments, schema), removed
 
 
 CLOSING = ('卡片已顯示全部內容，收尾只寫 1～3 句（目標、分組或「無判決」、下一步），'
@@ -100,7 +137,7 @@ DESCRIPTION = ('使用者附履歷並要求檢查、評估或優化時，確定�
                'jd_text：使用者在訊息或附件提供職缺說明；direction：使用者指定或同意的職務方向，不出分組。後兩者不得提供 job_id 或 url。'
                '沒有附件請先要求附上；沒有目標或方向先問，不提交。不得送判決、分組或計數欄位。六角度各一：'
                + '、'.join(f'{code}（{name}）' for code, name in ANGLES.items()) + '。'
-               '\n\ndefense.responses 筆數必須等於 prosecution 的筆數，依序一一對應；prosecution 為空時 responses 也是空陣列。'
+               '\n\n每個扣分點都要附 response（承認，或反駁並附依據）。'
                + '\n\n' + limits_description() + '\n\n' + RULES)
 
 
@@ -116,7 +153,7 @@ def field_path(loc):
 
 
 def normalize(text):
-    return re.sub(r'\s+', '', unicodedata.normalize('NFKC', text))
+    return re.sub(r'\s+', '', normalize_attachment_text(text))
 
 
 def english_words(text):
@@ -132,13 +169,13 @@ def has_contact(text):
 def checked_rewrites(rewrites, attachment):
     if attachment.get('kind') == 'image':
         return [item.model_dump() for item in rewrites], 0, 'unchecked_image'
-    full_text = unicodedata.normalize('NFKC', attachment.get('text', ''))
+    full_text = normalize_attachment_text(attachment.get('text', ''))
     source = normalize(full_text)
     source_words = english_words(full_text)
     kept = []
     for item in rewrites:
-        original_text = unicodedata.normalize('NFKC', item.original)
-        suggested_text = unicodedata.normalize('NFKC', item.suggested)
+        original_text = normalize_attachment_text(item.original)
+        suggested_text = normalize_attachment_text(item.suggested)
         original = normalize(original_text)
         before = set(re.findall(r'\d+', original_text))
         suggested = re.sub(r'〔待補[:：][^〕]*〕', '', suggested_text)
@@ -151,18 +188,17 @@ def checked_rewrites(rewrites, attachment):
 
 
 def submit_review(arguments, contexts, job_reads, allowed_job_ids):
+    trimmed, removed_long = trim_text(arguments, ResumeReview.model_json_schema())
     try:
-        review = ResumeReview.model_validate(arguments)
+        review = ResumeReview.model_validate(trimmed)
     except ValidationError as exc:
         # Never echo pydantic's input/msg/ctx: they can contain resume text.
-        codes = {'string_too_long': 'too_long', 'extra_forbidden': 'extra_field'}
+        codes = {'extra_forbidden': 'extra_field'}
         # Extra-field names are arbitrary model input; only schema-known paths are returned.
         details = [{'path': field_path(error['loc'][:-1] if error['type'] == 'extra_forbidden' else error['loc']),
                     'code': codes.get(error['type'], error['type'])} for error in exc.errors()]
         return failure('invalid_structure', details), None
     problems = []
-    if len(review.defense.responses) != len(review.prosecution):
-        problems.append({'path': 'defense.responses', 'code': 'count_mismatch'})
     if {item.angle for item in review.angles} != set(ANGLES):
         problems.append({'path': 'angles', 'code': 'duplicate_angle'})
     case = review.case
@@ -170,7 +206,7 @@ def submit_review(arguments, contexts, job_reads, allowed_job_ids):
     if (case.target_type == 'job' and (len(given) != 1 or not given[0].strip())
             or case.target_type != 'job' and given):
         problems.append({'path': 'case', 'code': 'invalid_target'})
-    if case.target_type != 'job' and not case.target_label.strip():
+    if case.target_type != 'job' and not arguments['case'].get('target_label', '').strip():
         problems.append({'path': 'case.target_label', 'code': 'missing'})
     if problems:
         return failure('invalid_structure', problems), None
@@ -203,8 +239,10 @@ def submit_review(arguments, contexts, job_reads, allowed_job_ids):
     group = next(name for minimum, name in GROUPS if meets >= minimum) if has_jd else None
     by_angle = {item.angle: item for item in review.angles}
     rewrites, removed, quote_check = checked_rewrites(review.rewrites, contexts[review.resume_attachment - 1])
+    removed += removed_long
     card = {'target': target, 'has_jd': has_jd, 'group': group, 'positioning': case.positioning,
-            'prosecution': [item.model_dump() for item in review.prosecution], 'defense': review.defense.model_dump(),
+            'prosecution': [item.model_dump(exclude={'response'}) for item in review.prosecution],
+            'defense': {'responses': [item.response for item in review.prosecution], 'strengths': review.defense.strengths},
             'angles': [by_angle[code].model_dump() | {'name': name} for code, name in ANGLES.items()],
             'fixes': [item.model_dump() for item in review.fixes], 'rewrites': rewrites,
             'removed_rewrites': removed, 'quote_check': quote_check}

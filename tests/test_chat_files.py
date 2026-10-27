@@ -13,6 +13,8 @@ import httpx
 from PIL import Image
 
 from app import chat_files, resume_pdf
+from app.attachment_text import normalize_attachment_text
+from app.radicals import RADICALS
 from app.store import encode
 import test_m2_chat as chats
 
@@ -36,6 +38,27 @@ def docx(text='合成履歷', *, body=None, xml=None, path='word/document.xml'):
     return output.getvalue()
 
 
+class AttachmentTextChecks(unittest.TestCase):
+    def test_radical_table_size_and_required_entries(self):
+        self.assertEqual(len(RADICALS), 112)
+        self.assertEqual(RADICALS[0x2EA0], 0x6C11)
+        self.assertEqual(RADICALS[0x2ED1], 0x9577)
+
+    def test_radicals_symbols_nfkc_and_idempotence(self):
+        cases = [('⻑', '長'), ('⺠', '民'), ('⾄', '至'), ('∕⁄╱', '///'),
+                 ('‐‑‒–—―−', '-------'), ('ＡＰＩ ７５％', 'API 75%'),
+                 ('一般文字 API 2026 / -\n下一行', '一般文字 API 2026 / -\n下一行')]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                actual = normalize_attachment_text(source)
+                self.assertEqual(actual, expected)
+                self.assertEqual(normalize_attachment_text(actual), actual)
+        combined = ''.join(source for source, _ in cases)
+        normalized = normalize_attachment_text(combined)
+        self.assertEqual(normalized, ''.join(expected for _, expected in cases))
+        self.assertEqual(normalize_attachment_text(normalized), normalized)
+
+
 class DocxChecks(unittest.TestCase):
     def prepare(self, data):
         return asyncio.run(chat_files.prepare({'data': data, 'extension': '.docx', 'filename': '合成.docx'}))
@@ -48,12 +71,12 @@ class DocxChecks(unittest.TestCase):
         self.assertNotIn(marker, str(raised.exception))
 
     def test_docx_order_paragraphs_tables_tabs_breaks_and_normalization(self):
-        raw = docx(body='<w:p><w:r><w:t>提升勝率⾄ ７５％</w:t><w:t>，維護ＡＰＩ。</w:t>'
+        raw = docx(body='<w:p><w:r><w:t>提升勝率⾄ ７５％</w:t><w:t>，⻑⺠∕⁄╱–‑−，維護ＡＰＩ。</w:t>'
                    '<w:tab/><w:t>欄位</w:t><w:br/><w:t>第二行</w:t><w:cr/><w:t>第三行</w:t></w:r></w:p>'
                    '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>儲存格一</w:t></w:r></w:p></w:tc>'
                    '<w:tc><w:p><w:r><w:t>儲存格二</w:t></w:r></w:p></w:tc></w:tr></w:tbl>')
         context, metadata = self.prepare(raw)
-        expected = '提升勝率至 75%,維護API。\t欄位\n第二行\n第三行\n儲存格一\n儲存格二'
+        expected = '提升勝率至 75%,長民///---,維護API。\t欄位\n第二行\n第三行\n儲存格一\n儲存格二'
         self.assertEqual(context, {'kind': 'text', 'filename': '合成.docx', 'text': expected})
         self.assertEqual(metadata, {'kind': 'text', 'filename': '合成.docx', 'characters': len(expected)})
         from test_resume_review import arguments, submit
@@ -173,6 +196,19 @@ class DocxChecks(unittest.TestCase):
             marker = 'PRIVATE-EXCEPTION-' + error.__name__
             with self.subTest(error=error), patch('app.chat_files.ElementTree.fromstring', side_effect=error(marker)):
                 self.assert_error(docx(marker), marker, chat_files.WORD_ERROR)
+
+
+class TextNormalizationChecks(unittest.TestCase):
+    def test_txt_markdown_and_bom_normalize_before_context_and_metadata(self):
+        source = '⻑⺠⾄ ∕⁄╱ ‐‑‒–—―− ＡＰＩ ７５％'
+        expected = '長民至 /// ------- API 75%'
+        for extension in ('.txt', '.md', '.markdown'):
+            for bom in (b'', b'\xef\xbb\xbf'):
+                with self.subTest(extension=extension, bom=bom):
+                    context, metadata = asyncio.run(chat_files.prepare({
+                        'data': bom + source.encode(), 'extension': extension, 'filename': '合成' + extension}))
+                    self.assertEqual(context['text'], expected)
+                    self.assertEqual(metadata['characters'], len(expected))
 
 
 class ChatFileChecks(unittest.TestCase):

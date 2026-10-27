@@ -3191,6 +3191,7 @@ async function testResumeReviewCardStreamingHistoryAndIncomplete() {
   assert.equal(restored.textContent, live.textContent, "history and SSE use one renderer");
   assert.ok(restored.textContent.includes("已具備")); assert.ok(restored.textContent.includes("需補強"));
   assert.ok(restored.textContent.includes("職缺身分未核對"));
+  assert.ok(restored.textContent.includes("辯護：有工作內容"), "saved defense.responses still renders beside its issue");
   assert.ok(restored.textContent.includes("原句未逐字核對，數字無法核實"));
   assert.ok(restored.textContent.includes("已移除 2 組無法核對的建議"));
   assert.ok(restored.textContent.includes("片段隨對話保存；刪除對話會移除，已產生的備份不會。"));
@@ -3207,6 +3208,14 @@ async function testResumeReviewCardStreamingHistoryAndIncomplete() {
   assert.ok(!direction.textContent.includes("優先修改重點"));
   const pasted = home.context.JobCards.resumeReviewCard({...data, target: {type: "jd_text", label: "後端"}});
   assert.ok(pasted.textContent.includes("使用者提供的職缺內容"));
+  assert.equal(all(pasted, item => item.tagName === "P" && item.textContent === "開發者").length, 1);
+  const noPositioning = home.context.JobCards.resumeReviewCard({...data, positioning: ""});
+  assert.equal(all(noPositioning, item => item.tagName === "P" && item.textContent === "").length, 0, "optional positioning must not leave an empty paragraph");
+  assert.equal(all(noPositioning, item => item.tagName === "SMALL" && item.textContent === "同一模型的六種檢查角度").length, 1);
+  for (const extension of ["txt", "md"]) {
+    assert.equal(home.context.JobCards.resumeReviewChecklist({...data, positioning: ""}, extension).content,
+      home.context.JobCards.resumeReviewChecklist(data, extension).content, "the checklist never included positioning");
+  }
 
   const oldAngle = {angle: "jd_match", name: "JD 關鍵條件對照", status: "needs", reason: "缺少依據"};
   const legacy = home.context.JobCards.resumeReviewCard({...data, angles: [oldAngle]});

@@ -8,6 +8,8 @@ import subprocess
 import sys
 import unicodedata
 
+from .attachment_text import normalize_attachment_text
+
 MAX_BYTES = 20 * 1024 * 1024
 MAX_PAGES = 20
 MAX_TEXT = 30000
@@ -46,7 +48,7 @@ def extract_pdf(data):
                 total_stream += length
                 if length > MAX_STREAM or total_stream > 10 * 1024 * 1024:
                     raise ResumeError('PDF 內容過於複雜，請重新匯出較精簡的履歷。')
-                text = unicodedata.normalize('NFKC', page.extract_text() or '')
+                text = normalize_attachment_text(page.extract_text() or '')
                 text = ''.join(c for c in text if c in '\n\t' or not unicodedata.category(c).startswith('C')).strip()
                 texts.append(text)
                 if sum(map(len, texts)) > MAX_TEXT:
@@ -55,7 +57,7 @@ def extract_pdf(data):
             if len(text) > MAX_TEXT:
                 raise ResumeError('履歷文字最多 30,000 字，請縮短後再上傳。')
             if not text:
-                raise ResumeError('這份 PDF 沒有可讀取的文字；請改用可選取文字的 PDF，掃描圖片版目前無法解析。')
+                raise ResumeError('這份 PDF 沒有可讀取的文字（可能是掃描檔）；請改附可選取文字的 PDF 或 Word，或把每頁截圖成 PNG／JPG 附上（截圖無法逐字核對原句）。')
             return {'text': text, 'pages': len(reader.pages)}
     except ResumeError:
         raise

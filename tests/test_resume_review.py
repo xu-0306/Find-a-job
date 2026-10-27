@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from pydantic import Field
 
 from app import chat, resume_review as review
 from app.llm_wire import build_payload
@@ -20,8 +21,8 @@ CONTEXTS = [{'kind': 'text', 'text': RESUME}, {'text': '只在職缺附件的句
 def arguments(target='jd_text', meets=4):
     return {'resume_attachment': 1,
             'case': {'target_type': target, 'target_label': '後端工程師', 'positioning': '服務開發者'},
-            'prosecution': [{'issue': '缺少驗證方式', 'impact': '成果難以核對'}],
-            'defense': {'responses': ['有具體的服務開發內容'], 'strengths': ['具備 API 經驗']},
+            'prosecution': [{'issue': '缺少驗證方式', 'impact': '成果難以核對', 'response': '有具體的服務開發內容'}],
+            'defense': {'strengths': ['具備 API 經驗']},
             'angles': [{'angle': code, 'status': 'meets' if index < meets else 'needs', 'reason': '履歷包含服務開發內容'}
                        for index, code in enumerate(review.ANGLES)],
             'fixes': [{'what': '補充成果', 'how': '說明驗證方式', 'need_from_user': ''}],
@@ -32,13 +33,26 @@ def submit(data, contexts=CONTEXTS, reads=(), allowed=()):
     return review.submit_review(data, contexts, reads, allowed)
 
 
+def string_limits(schema):
+    def collect(node, path=()):
+        if '$ref' in node:
+            node = schema['$defs'][node['$ref'].rsplit('/', 1)[-1]]
+        if node.get('type') == 'string' and 'maxLength' in node:
+            yield path, node['maxLength']
+        for name, field in node.get('properties', {}).items():
+            yield from collect(field, (*path, name))
+        if 'items' in node:
+            yield from collect(node['items'], (*path, 0))
+    return collect(schema)
+
+
 class ReviewContractChecks(unittest.TestCase):
-    def test_description_requires_matching_response_count(self):
-        sentences = review.DESCRIPTION.split('。')
-        self.assertTrue(any('defense.responses' in sentence and 'prosecution' in sentence
-                            and '筆數必須等於' in sentence and '依序一一對應' in sentence
-                            and 'prosecution 為空時 responses 也是空陣列' in sentence
-                            for sentence in sentences))
+    def test_description_requires_response_in_each_issue(self):
+        self.assertIn('每個扣分點都要附 response（承認，或反駁並附依據）', review.DESCRIPTION)
+        schema = review.ResumeReview.model_json_schema()
+        self.assertIn('response', schema['$defs']['Issue']['required'])
+        self.assertNotIn('responses', schema['$defs']['Defense']['properties'])
+        self.assertNotIn('defense.responses', review.DESCRIPTION)
 
     def test_description_covers_every_schema_limit(self):
         schema = review.ResumeReview.model_json_schema()
@@ -67,7 +81,7 @@ class ReviewContractChecks(unittest.TestCase):
                     pattern = rf'{field}{operator}{limit}筆'
                 self.assertRegex(review.DESCRIPTION, pattern)
         self.assertIn('中文一字算 1 字元', review.DESCRIPTION)
-        self.assertIn('任何一項超過，整份提交都會驗證失敗', review.DESCRIPTION)
+        self.assertIn('請寫在上限內；一般文字超過會被截斷，改寫的 original／suggested 超過會整組被移除', review.DESCRIPTION)
 
     def assert_invalid(self, data, path=None):
         result, card = submit(data)
@@ -78,12 +92,11 @@ class ReviewContractChecks(unittest.TestCase):
         self.assertTrue(all(set(detail) == {'path', 'code'} for detail in result['details']))
         return result
 
-    def test_collection_limits_and_response_count_both_directions(self):
+    def test_collection_limits(self):
         # Every upper bound is tested at the bound and one beyond it; zero is valid.
         for field, limit in [('prosecution', 3), ('fixes', 3), ('rewrites', 5)]:
             for count in (0, limit, limit + 1):
                 data = arguments(); data[field] = [copy.deepcopy(data[field][0]) for _ in range(count)]
-                if field == 'prosecution': data['defense']['responses'] = ['依據'] * min(count, limit)
                 with self.subTest(field=field, count=count):
                     if count > limit: self.assert_invalid(data, field)
                     else: self.assertTrue(submit(data)[0]['accepted'])
@@ -93,7 +106,8 @@ class ReviewContractChecks(unittest.TestCase):
             else: self.assertTrue(submit(data)[0]['accepted'])
         for count in (0, 2, 4):
             data = arguments(); data['defense']['responses'] = ['回應'] * count
-            self.assert_invalid(data, 'defense.responses')
+            result = self.assert_invalid(data, 'defense')
+            self.assertEqual(result['details'], [{'path': 'defense', 'code': 'extra_field'}])
 
     def test_six_unique_angles_and_valid_status_and_code(self):
         for count in (0, 5, 7):
@@ -110,23 +124,33 @@ class ReviewContractChecks(unittest.TestCase):
         self.assertEqual([item['name'] for item in card['angles']], list(review.ANGLES.values()))
 
     def test_every_string_limit_and_no_input_in_details(self):
-        fields = [(('case', 'target_label'), 40), (('case', 'positioning'), 40),
-                  (('prosecution', 0, 'issue'), 30), (('prosecution', 0, 'impact'), 30),
-                  (('defense', 'responses', 0), 50), (('defense', 'strengths', 0), 40),
-                  (('angles', 2, 'reason'), 50), (('fixes', 0, 'what'), 30),
-                  (('fixes', 0, 'how'), 50), (('fixes', 0, 'need_from_user'), 30),
-                  (('rewrites', 0, 'original'), 80), (('rewrites', 0, 'suggested'), 100), (('rewrites', 0, 'reason'), 30)]
-        for path, limit in fields:
+        schema = review.ResumeReview.model_json_schema()
+        for path, limit in string_limits(schema):
             for length in (limit, limit + 1):
                 data = arguments(); parent = data
                 for key in path[:-1]: parent = parent[key]
                 parent[path[-1]] = '隱' * length
+                before = copy.deepcopy(data)
                 with self.subTest(path=path, length=length):
-                    if length <= limit: self.assertTrue(submit(data)[0]['accepted'])
+                    result, card = submit(data, contexts=[{'kind': 'image'}])
+                    self.assertTrue(result['accepted'])
+                    self.assertEqual(data, before, 'preprocessing must not mutate the tool arguments')
+                    if path[0] == 'rewrites' and path[-1] in ('original', 'suggested') and length > limit:
+                        self.assertEqual(card['rewrites'], [])
+                        self.assertEqual(card['removed_rewrites'], 1)
+                        self.assertEqual(result['removed_rewrites'], 1)
                     else:
-                        result = self.assert_invalid(data, review.field_path(path))
-                        self.assertEqual(result['details'][0]['code'], 'too_long')
-                        self.assertNotIn('隱', encode(result))
+                        card_path = path
+                        if path[0] == 'case':
+                            card_path = ('positioning',) if path[-1] == 'positioning' else ('target', 'label')
+                        elif path[0] == 'prosecution' and path[-1] == 'response':
+                            card_path = ('defense', 'responses', path[1])
+                        value = card
+                        for key in card_path: value = value[key]
+                        self.assertEqual(len(value), limit)
+                        self.assertEqual(value, '隱' * limit if length == limit else '隱' * (limit - 1) + '…')
+                        self.assertEqual(result['removed_rewrites'], 0)
+                    self.assertNotIn('隱', encode(result))
         for where in ((), ('case',), ('defense',), ('angles', 0), ('prosecution', 0), ('fixes', 0), ('rewrites', 0)):
             for field in ('group', 'verdict', 'meets_count', '私人輸入'):
                 data = arguments(); parent = data
@@ -134,6 +158,69 @@ class ReviewContractChecks(unittest.TestCase):
                 parent[field] = '私人履歷'
                 result = self.assert_invalid(data)
                 self.assertNotIn('私人', encode(result))
+
+    def test_truncation_uses_the_supplied_schema(self):
+        class Toy(review.ReviewModel):
+            text: str = Field(max_length=7)
+        schema = Toy.model_json_schema()
+        data = {'text': '界' * 8, 'unknown': ['任' * 20, {'nested': True}]}
+        before = copy.deepcopy(data)
+        trimmed, removed = review.trim_text(data, schema)
+        self.assertEqual(trimmed, {'text': '界' * 6 + '…', 'unknown': data['unknown']})
+        self.assertIsNot(trimmed, data)
+        self.assertIsNot(trimmed['unknown'], data['unknown'])
+        self.assertEqual(removed, 0)
+        self.assertEqual(Toy.model_validate({'text': trimmed['text']}).text, '界' * 6 + '…')
+        schema['properties']['text']['maxLength'] = 3
+        self.assertEqual(review.trim_text(data, schema)[0]['text'], '界界…')
+        self.assertEqual(data, before)
+
+    def test_long_rewrites_are_removed_and_counts_include_quote_failures(self):
+        data = arguments()
+        data['rewrites'] += [{'original': '長' * 81, 'suggested': '短句', 'reason': ''},
+                             {'original': RESUME, 'suggested': '長' * 101, 'reason': ''},
+                             {'original': '附件沒有的句子', 'suggested': '短句', 'reason': ''}]
+        before = copy.deepcopy(data)
+        result, card = submit(data)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(card['rewrites'], [data['rewrites'][0]])
+        self.assertEqual(card['removed_rewrites'], 3)
+        self.assertEqual(result['removed_rewrites'], 3)
+        self.assertEqual(data, before)
+
+    def test_trimming_preserves_type_shape_and_item_limit_errors(self):
+        for path, _ in string_limits(review.ResumeReview.model_json_schema()):
+            for invalid in (17, None, [], {}):
+                data = arguments(); parent = data
+                for key in path[:-1]: parent = parent[key]
+                parent[path[-1]] = invalid
+                with self.subTest(path=path, invalid=invalid):
+                    self.assertEqual(review.trim_text(data, review.ResumeReview.model_json_schema())[0], data)
+                    self.assert_invalid(data, review.field_path(path))
+        data = arguments()
+        data['case'].update(job_id='識別' * 100, url='網址' * 100)
+        data['angles'][0].update(angle='角度' * 100, status='狀態' * 100)
+        self.assertEqual(review.trim_text(data, review.ResumeReview.model_json_schema()), (data, 0))
+        for invalid in (None, 7, 'invalid', {'original': '長' * 81, 'suggested': '句', 'reason': 7},
+                        {'original': '長' * 81, 'suggested': '句'},
+                        {'original': '長' * 81, 'suggested': '句', 'reason': '', 'private': 'marker'}):
+            data = arguments(); data['rewrites'].append(invalid)
+            self.assert_invalid(data)
+        data = arguments(); data['rewrites'] = [{'original': '長' * 81, 'suggested': '句', 'reason': ''}] * 6
+        self.assert_invalid(data, 'rewrites')
+        data = arguments(); data['angles'][0]['reason'] = '長' * 51
+        data['angles'][5]['angle'] = data['angles'][0]['angle']
+        self.assertEqual(self.assert_invalid(data, 'angles')['details'], [{'path': 'angles', 'code': 'duplicate_angle'}])
+
+    def test_issue_responses_keep_the_saved_card_contract_and_order(self):
+        data = arguments()
+        data['prosecution'].append({'issue': '第二點', 'impact': '第二影響', 'response': '第二依據'})
+        result, card = submit(data)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(card['prosecution'], [{'issue': item['issue'], 'impact': item['impact']} for item in data['prosecution']])
+        self.assertEqual(card['defense'], {'responses': ['有具體的服務開發內容', '第二依據'], 'strengths': data['defense']['strengths']})
+        del data['prosecution'][0]['response']
+        self.assert_invalid(data, 'prosecution[0].response')
 
     def test_required_fields_and_wrong_types(self):
         for key in arguments():
@@ -177,6 +264,9 @@ class ReviewContractChecks(unittest.TestCase):
             self.assertTrue(submit(data, reads=[read], allowed=['a'])[0]['accepted'])
 
     def test_optional_fields_and_required_non_job_target_label(self):
+        data = arguments(); del data['case']['positioning']
+        result, card = submit(data)
+        self.assertTrue(result['accepted']); self.assertEqual(card['positioning'], '')
         data = arguments(); del data['fixes'][0]['need_from_user']
         result, card = submit(data)
         self.assertTrue(result['accepted']); self.assertEqual(card['fixes'][0]['need_from_user'], '')
@@ -184,15 +274,16 @@ class ReviewContractChecks(unittest.TestCase):
         reads = [{'job_id': 'a', 'status': 'success', 'detail': {'summary': 'JD', 'title': '讀取職稱'}}]
         result, card = submit(data, reads=reads, allowed=['a'])
         self.assertTrue(result['accepted']); self.assertEqual(card['target']['label'], '讀取職稱')
+        schema = review.ResumeReview.model_json_schema()
+        label_limit = schema['$defs']['ReviewCase']['properties']['target_label']['maxLength']
         for target in ('direction', 'jd_text'):
-            for label in (None, '', ' \n\t'):
+            for label in (None, '', ' \n\t', ' ' * (label_limit + 1)):
                 data = arguments(target)
                 if label is None: del data['case']['target_label']
                 else: data['case']['target_label'] = label
                 result = self.assert_invalid(data, 'case.target_label')
                 self.assertEqual(result['details'], [{'path': 'case.target_label', 'code': 'missing'}])
-        schema = review.ResumeReview.model_json_schema()
-        for model, field in [('Fix', 'need_from_user'), ('ReviewCase', 'target_label')]:
+        for model, field in [('Fix', 'need_from_user'), ('ReviewCase', 'target_label'), ('ReviewCase', 'positioning')]:
             self.assertNotIn(field, schema['$defs'][model]['required'])
             self.assertEqual(schema['$defs'][model]['properties'][field]['default'], '')
 
@@ -270,6 +361,19 @@ class ReviewContractChecks(unittest.TestCase):
             self.assertIn(text, review.DESCRIPTION)
         for text in ('沒附履歷', '都沒有先問', '取得同意才改方向', '無分組不自行下判決', '不引用或改寫姓名'):
             self.assertIn(text, chat.SYSTEM)
+
+    def test_shared_attachment_normalization_for_quotes_words_and_contacts(self):
+        plain = '長民至 / API-服務'
+        variants = '⻑⺠⾄ ∕ API–服務'
+        for source, original, suggested in [(variants, plain, plain), (plain, variants, variants)]:
+            data = arguments()
+            data['rewrites'] = [{'original': original, 'suggested': suggested, 'reason': ''}]
+            result, card = submit(data, contexts=[{'text': source}])
+            self.assertEqual(card['rewrites'], data['rewrites'])
+            self.assertEqual(result['removed_rewrites'], 0)
+            self.assertEqual(review.normalize(variants), review.normalize(plain))
+        data['rewrites'] = [{'original': '維護服務', 'suggested': '維護服務 0912–345–678', 'reason': ''}]
+        self.assertEqual(submit(data, contexts=[{'text': '維護服務'}])[1]['removed_rewrites'], 1)
 
     def test_images_keep_unverifiable_rewrites(self):
         data = arguments(); data['rewrites'] = [{'original': '', 'suggested': '任意 9999', 'reason': ''}]
@@ -405,6 +509,42 @@ class ReviewChatChecks(unittest.TestCase):
         # Responses stores each result in all following requests; take the last request once.
         return [json.loads(item['output']) for item in payloads[-1]['input'] if item.get('type') == 'function_call_output']
 
+    def assert_saved_failures(self, ident, output, results):
+        history = self.client.get('/api/messages', params={'limit': 100}).json()['items']
+        saved = next(item['content']['events'] for item in history
+                     if item['request_id'] == ident and item['role'] == 'assistant')
+        statuses = [event['data'] for event in saved if event['event'] == 'tool_status'
+                    and event['data']['name'] == 'submit_resume_review']
+        expected = [{'error': result['error'], 'details': result['details']} if not result['accepted'] else None
+                    for result in results]
+        self.assertEqual([status.get('review_failure') for status in statuses], expected)
+        self.assertTrue(all(status['phase'] == 'completed' for status in statuses))
+        self.assertTrue(all('review_failure' not in data for name, data in output if name == 'tool_status'))
+        return saved
+
+    def test_failed_review_persists_only_safe_diagnostics_and_logs_codes(self):
+        marker = 'PRIVATE-MARKER-9X'
+        data = arguments(); data['angles'][2]['status'] = marker
+        snapshots = []
+        save_reply = self.store.save_reply
+        def save(ident, content, *args):
+            snapshots.append(copy.deepcopy(content))
+            return save_reply(ident, content, *args)
+        with self.assertLogs('uvicorn.error', 'WARNING') as logs, patch.object(self.store, 'save_reply', side_effect=save):
+            output, payloads = self.run_calls([('submit_resume_review', data), ('submit_resume_review', arguments())],
+                                              ident='failure-privacy')
+        results = self.results(payloads)
+        expected = {'error': 'invalid_structure', 'details': [{'path': 'angles[2].status', 'code': 'literal_error'}]}
+        saved = self.assert_saved_failures('failure-privacy', output, results)
+        self.assertEqual(saved[0]['data']['review_failure'], expected)
+        self.assertTrue(any(event['data'].get('review_failure') == expected and event['data']['phase'] == 'completed'
+                            for snapshot in snapshots for event in snapshot['events'] if event['event'] == 'tool_status'))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('resume_review_failed request_id=failure-privacy error=invalid_structure codes=angles[2].status:literal_error', logs.output[0])
+        for value in (encode(saved), encode(saved[0]['data']['review_failure']), '\n'.join(logs.output), encode(results)):
+            self.assertNotIn(marker, value)
+        self.assertTrue(results[1]['accepted'])
+
     def test_all_protocols_accept_and_persist_the_same_card(self):
         for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
             with self.store.connect(write=True) as db:
@@ -417,14 +557,16 @@ class ReviewChatChecks(unittest.TestCase):
             history = self.client.get('/api/messages').json()['items']
             saved = history[-1]['content']['events']
             self.assertEqual(next(event['data'] for event in saved if event['event'] == 'resume_review'), card)
+            self.assertTrue(all('review_failure' not in event['data'] for event in saved if event['event'] == 'tool_status'))
+            self.assertTrue(all('review_failure' not in data for name, data in output if name == 'tool_status'))
             self.assertNotIn('text', history[-2]['content']['attachments'][0])
             if protocol == 'anthropic_messages': self.assertTrue(all(req['max_tokens'] == 8192 for req in requests))
 
     def test_normalized_attachments_reach_prompt_and_quote_source(self):
         from test_resume_chat import pdf
         from test_chat_files import docx
-        source = '提升勝率⾄ ７５％，維護ＡＰＩ。'
-        expected = '提升勝率至 75%,維護API。'
+        source = '提升勝率⾄ ７５％，⻑⺠∕⁄╱–‑−，維護ＡＰＩ。'
+        expected = '提升勝率至 75%,長民///---,維護API。'
         data = arguments('direction')
         data['rewrites'] = [{'original': expected, 'suggested': expected, 'reason': '核對合成字元'}]
         for extension in ('pdf', 'md', 'markdown', 'txt', 'docx'):
@@ -455,8 +597,8 @@ class ReviewChatChecks(unittest.TestCase):
     def test_full_length_chinese_payload_and_safe_error_result(self):
         data = arguments()
         data['case'].update(target_label='標' * 40, positioning='位' * 40)
-        data['prosecution'] = [{'issue': '問' * 30, 'impact': '影' * 30} for _ in range(3)]
-        data['defense'] = {'responses': ['答' * 50] * 3, 'strengths': ['優' * 40] * 2}
+        data['prosecution'] = [{'issue': '問' * 30, 'impact': '影' * 30, 'response': '答' * 50} for _ in range(3)]
+        data['defense'] = {'strengths': ['優' * 40] * 2}
         for angle in data['angles']: angle['reason'] = '據' * 50
         data['fixes'] = [{'what': '改' * 30, 'how': '法' * 50, 'need_from_user': '需' * 30} for _ in range(3)]
         data['rewrites'] = [{'original': '歷' * 80, 'suggested': '建' * 100, 'reason': '因' * 30} for _ in range(5)]
@@ -474,10 +616,10 @@ class ReviewChatChecks(unittest.TestCase):
         card = next(value for name, value in output if name == 'resume_review')
         self.assertEqual(len(card['rewrites']), 5); self.assertEqual(card['removed_rewrites'], 0)
         self.assertLessEqual(len(encode(data)), 16000)
-        invalid = arguments(); invalid['angles'][2]['reason'] = '不回灌的合成私人內容' * 20
+        invalid = arguments(); invalid['angles'][2]['status'] = '不回灌的合成私人內容' * 20
         output, payloads = self.run_calls([('submit_resume_review', invalid), ('submit_resume_review', arguments())], ident='safe-errors')
         result = self.results(payloads)[0]
-        self.assertEqual(result['details'], [{'path': 'angles[2].reason', 'code': 'too_long'}])
+        self.assertEqual(result['details'], [{'path': 'angles[2].status', 'code': 'literal_error'}])
         self.assertNotIn('不回灌', encode(result))
         self.assertTrue(self.results(payloads)[1]['accepted'])
         self.assertEqual(sum(name == 'resume_review' for name, _ in output), 1)
@@ -490,6 +632,7 @@ class ReviewChatChecks(unittest.TestCase):
         self.assertEqual(sum(name == 'resume_review' for name, _ in output), 1)
         self.assertEqual(output[-1][1]['status'], 'completed')
         self.assertEqual(sum(name == 'tool_status' and data.get('phase') == 'completed' for name, data in output), 3)
+        self.assert_saved_failures('review', output, results)
 
     def test_second_failure_stops_immediately_and_any_later_call_is_stopped(self):
         for attached, invalid, code in [(True, {}, 'invalid_structure'), (False, arguments(), 'attachment_not_found'),
@@ -502,6 +645,7 @@ class ReviewChatChecks(unittest.TestCase):
             self.assertEqual(results[1]['message'], '已停止審查，請用文字說明這次沒有完成檢查')
             self.assertFalse(any(name == 'resume_review' for name, _ in output))
             self.assertEqual(output[-1][1]['status'], 'completed', output)
+            self.assert_saved_failures(code, output, results)
 
     def test_bad_json_and_non_dict_still_interrupt(self):
         for index, raw in enumerate(('{broken', '[]', 'null')):
@@ -545,6 +689,7 @@ class ReviewChatChecks(unittest.TestCase):
         output, requests = self.run_calls([('submit_resume_review', data), ('get_job_details', {'job_id': job_id}), ('submit_resume_review', data)])
         results = self.results(requests)
         self.assertEqual(results[0]['error'], 'job_not_read'); self.assertTrue(results[-1]['accepted'])
+        self.assert_saved_failures('review', output, [results[0], results[-1]])
         card = next(data for name, data in output if name == 'resume_review')
         self.assertEqual(card['target']['label'], '來源職稱'); self.assertFalse(card['target']['identity_verified'])
         self.assertEqual(card['target']['url'], 'https://www.104.com.tw/job/synthetic')
@@ -585,6 +730,7 @@ class ReviewChatChecks(unittest.TestCase):
         self.assertEqual(results[2]['error'], 'jd_unavailable'); self.assertTrue(results[2]['stopped'])
         self.assertEqual(results[3]['error'], 'review_stopped')
         self.assertFalse(any(name == 'resume_review' for name, _ in output))
+        self.assert_saved_failures('review', output, [results[0], results[2], results[3]])
 
     def test_card_survives_failed_finish(self):
         output, _ = self.run_calls([('submit_resume_review', arguments())], finish=httpx.Response(403))

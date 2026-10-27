@@ -11,6 +11,7 @@ from zipfile import ZipFile
 from PIL import Image
 
 from . import resume_pdf
+from .attachment_text import normalize_attachment_text
 
 EXTENSIONS = {'.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.md', '.markdown', '.txt'}
 MAX_PIXELS = 20_000_000
@@ -54,7 +55,7 @@ def read_docx(data):
                 parts.append('\n')
             stack.append((element, parent, True))
             stack.extend((child, element.tag, False) for child in reversed(element))
-        text = unicodedata.normalize('NFKC', ''.join(parts))
+        text = normalize_attachment_text(''.join(parts))
         text = ''.join(c for c in text if c in '\n\t' or not unicodedata.category(c).startswith('C'))
         return re.sub(r'\n{3,}', '\n\n', text).strip()
     except Exception:
@@ -106,7 +107,7 @@ async def prepare(upload):
         text = await asyncio.to_thread(read_docx, data)
         return text_result(text, upload['filename'], word=True)
     try:
-        text = unicodedata.normalize('NFKC', data.decode('utf-8-sig'))
+        text = normalize_attachment_text(data.decode('utf-8-sig'))
     except UnicodeError:
         raise resume_pdf.ResumeError('Markdown／文字檔須使用 UTF-8 編碼，請重新另存後附上。') from None
     if any(unicodedata.category(c) == 'Cc' and c not in '\n\r\t' for c in text):

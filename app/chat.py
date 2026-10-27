@@ -1,6 +1,7 @@
 """One bounded chat task per application; durable claims live in SQLite."""
 import asyncio
 import json
+import logging
 import time
 
 import httpx
@@ -263,6 +264,12 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                             review_failures += 1
                             if review_failures >= 2:
                                 result.update(stopped=True, message='已停止審查，請用文字說明這次沒有完成檢查')
+                    if not result['accepted']:
+                        progress['review_failure'] = {'error': result['error'], 'details': result['details']}
+                        logging.getLogger('uvicorn.error').warning(
+                            'resume_review_failed request_id=%s error=%s codes=%s',
+                            request_id, result['error'],
+                            ','.join(f'{item["path"]}:{item["code"]}' for item in result['details']))
                 else:
                     result, public_event = await invoke(call['name'], arguments, deadline=deadline, finish_reserve=FINISH_RESERVE_SECONDS)
                     if call['name'] == 'get_job_details':
@@ -279,7 +286,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 if isinstance(result, dict) and result.get('source_results'):
                     progress['source_results'] = result['source_results']
                 store.save_reply(request_id, content, auth_hash)
-                queue.put_nowait(('tool_status', dict(progress)))
+                queue.put_nowait(('tool_status', {key: value for key, value in progress.items() if key != 'review_failure'}))
                 return result
 
             if initial_search:
@@ -392,7 +399,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
             for event in content['events']:
                 if event['event'] == 'tool_status' and event['data'].get('phase') == 'started':
                     event['data']['phase'] = 'interrupted'
-                    queue.put_nowait(('tool_status', dict(event['data'])))
+                    queue.put_nowait(('tool_status', {key: value for key, value in event['data'].items() if key != 'review_failure'}))
         if public_error:
             content['events'].append({'event': 'error', 'data': public_error})
         try:

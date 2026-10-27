@@ -399,7 +399,8 @@
     else if (target.type === "jd_text") card.append(element("p", "使用者提供的職缺內容", "hint"));
     else if (!target.identity_verified) card.append(element("p", "職缺身分未核對", "hint"));
     if (data.has_jd && data.group) card.append(element("p", data.group, "notice"));
-    card.append(element("small", "同一模型的六種檢查角度"), element("p", data.positioning));
+    card.append(element("small", "同一模型的六種檢查角度"));
+    if (data.positioning) card.append(element("p", data.positioning));
     const unfinished = element("p", "收尾未完成", "notice");
     unfinished.setAttribute("role", "status");
     card.setReplyStatus = value => { unfinished.hidden = !["interrupted", "failed"].includes(value); };

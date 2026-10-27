@@ -53,7 +53,8 @@ class AttachmentNormalizationChecks(unittest.TestCase):
         from test_chat_files import docx
         from test_resume_review import arguments, submit
         for source, expected in [('提升勝率⾄ ７５％，維護ＡＰＩ。', '提升勝率至 75%,維護API。'),
-                                 ('⼯作經驗：ﬃ、㍿', '工作經驗:ffi、株式会社')]:
+                                 ('⼯作經驗：ﬃ、㍿', '工作經驗:ffi、株式会社'),
+                                 ('⻑⺠⾄ ∕⁄╱ ‐‑‒–—―−', '長民至 /// -------')]:
             parsed = resume_pdf.extract_pdf(pdf(source))
             self.assertEqual(parsed['text'], expected)
             for extension in ('.pdf', '.md', '.markdown', '.txt', '.docx'):
@@ -85,6 +86,11 @@ class AttachmentNormalizationChecks(unittest.TestCase):
         context, _ = asyncio.run(chat_files.prepare({'extension': '.png', 'data': raw, 'filename': '合成.png'}))
         self.assertEqual(context['data'], b64encode(raw).decode('ascii'))
         self.assertNotIn('text', context)
+
+    def test_scanned_pdf_guidance_is_exact_and_private(self):
+        with self.assertRaises(resume_pdf.ResumeError) as raised:
+            resume_pdf.extract_pdf(pdf(''))
+        self.assertEqual(str(raised.exception), '這份 PDF 沒有可讀取的文字（可能是掃描檔）；請改附可選取文字的 PDF 或 Word，或把每頁截圖成 PNG／JPG 附上（截圖無法逐字核對原句）。')
 
 
 class ResumeChecks(unittest.TestCase):
