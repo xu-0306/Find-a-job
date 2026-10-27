@@ -66,6 +66,27 @@ class ResumeReview(ReviewModel):
     rewrites: list[Rewrite] = Field(max_length=5)
 
 
+def limits_description():
+    schema = ResumeReview.model_json_schema()
+
+    def describe(node, path=''):
+        if '$ref' in node:
+            node = schema['$defs'][node['$ref'].rsplit('/', 1)[-1]]
+        if 'properties' in node:
+            return '；'.join(filter(None, (
+                describe(field, f'{path}.{name}' if path else name)
+                for name, field in node['properties'].items())))
+        if 'maxItems' in node:
+            count = (f'恰{node["maxItems"]}' if node.get('minItems') == node['maxItems']
+                     else f'≤{node["maxItems"]}')
+            return f'{path}{count}筆（{describe(node["items"]).replace("；", "、")}）'
+        if 'maxLength' in node:
+            return f'{path or "每筆"}≤{node["maxLength"]}字'
+        return ''
+
+    return '上限（中文一字算 1 字元）：' + describe(schema) + '。任何一項超過，整份提交都會驗證失敗。'
+
+
 CLOSING = ('卡片已顯示全部內容，收尾只寫 1～3 句（目標、分組或「無判決」、下一步），'
            '不重述卡片內容：不重述角度、修改項或任何改寫；使用者要求列出改寫時，指引看卡片。')
 RULES = ('不新增履歷沒有的經歷、技能、成果、職稱或數字；需要缺少的數字時用〔待補：…〕佔位，'
@@ -78,7 +99,9 @@ DESCRIPTION = ('使用者附履歷並要求檢查、評估或優化時，確定�
                'case.target_type=job：job_id 或 url 恰給一個，先在本回合 get_job_details 取得 success 且 summary 非空的職缺說明；讀不到請使用者貼職缺說明，取得同意才改方向。'
                'jd_text：使用者在訊息或附件提供職缺說明；direction：使用者指定或同意的職務方向，不出分組。後兩者不得提供 job_id 或 url。'
                '沒有附件請先要求附上；沒有目標或方向先問，不提交。不得送判決、分組或計數欄位。六角度各一：'
-               + '、'.join(f'{code}（{name}）' for code, name in ANGLES.items()) + '。' + RULES)
+               + '、'.join(f'{code}（{name}）' for code, name in ANGLES.items()) + '。'
+               '\n\ndefense.responses 筆數必須等於 prosecution 的筆數，依序一一對應；prosecution 為空時 responses 也是空陣列。'
+               + '\n\n' + limits_description() + '\n\n' + RULES)
 
 
 def failure(code, details=None):

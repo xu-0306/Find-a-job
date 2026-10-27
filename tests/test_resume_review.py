@@ -1,6 +1,7 @@
 """Synthetic review contracts, privacy boundaries and the real chat tool loop."""
 import copy
 import json
+import re
 import unicodedata
 import unittest
 from unittest.mock import patch
@@ -32,6 +33,42 @@ def submit(data, contexts=CONTEXTS, reads=(), allowed=()):
 
 
 class ReviewContractChecks(unittest.TestCase):
+    def test_description_requires_matching_response_count(self):
+        sentences = review.DESCRIPTION.split('。')
+        self.assertTrue(any('defense.responses' in sentence and 'prosecution' in sentence
+                            and '筆數必須等於' in sentence and '依序一一對應' in sentence
+                            and 'prosecution 為空時 responses 也是空陣列' in sentence
+                            for sentence in sentences))
+
+    def test_description_covers_every_schema_limit(self):
+        schema = review.ResumeReview.model_json_schema()
+
+        def collect(node, path=()):
+            if '$ref' in node:
+                node = schema['$defs'][node['$ref'].rsplit('/', 1)[-1]]
+            for kind in ('maxLength', 'maxItems', 'minItems'):
+                if kind in node:
+                    yield path, kind, node[kind]
+            for name, field in node.get('properties', {}).items():
+                yield from collect(field, (*path, name))
+            if 'items' in node:
+                yield from collect(node['items'], path)
+
+        for path, kind, limit in collect(schema):
+            with self.subTest(path='.'.join(path), kind=kind, limit=limit):
+                field = re.escape('.'.join(path))
+                if kind == 'maxLength':
+                    parent = re.escape('.'.join(path[:-1]))
+                    child = re.escape(path[-1])
+                    pattern = (rf'(?:{field}|{parent}[^；。]*（[^）]*\b{child})≤{limit}字'
+                               rf'|{field}[^；。]*（每筆≤{limit}字）')
+                else:
+                    operator = '[≤恰]' if kind == 'maxItems' else '[≥恰]'
+                    pattern = rf'{field}{operator}{limit}筆'
+                self.assertRegex(review.DESCRIPTION, pattern)
+        self.assertIn('中文一字算 1 字元', review.DESCRIPTION)
+        self.assertIn('任何一項超過，整份提交都會驗證失敗', review.DESCRIPTION)
+
     def assert_invalid(self, data, path=None):
         result, card = submit(data)
         self.assertFalse(result['accepted']); self.assertIsNone(card)
