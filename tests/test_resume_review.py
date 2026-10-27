@@ -1,6 +1,7 @@
 """Synthetic review contracts, privacy boundaries and the real chat tool loop."""
 import copy
 import json
+import unicodedata
 import unittest
 from unittest.mock import patch
 
@@ -239,6 +240,80 @@ class ReviewContractChecks(unittest.TestCase):
         self.assertEqual(result['quote_check'], 'unchecked_image'); self.assertEqual(result['removed_rewrites'], 0)
         self.assertEqual(card['rewrites'], data['rewrites'])
 
+    def test_status_threshold_is_shared_before_closing(self):
+        threshold = 'status 只看這個角度是否有會實質影響這次投遞的缺口：有才標需補強；只是可再潤飾就標已具備，潤飾建議放在修改項或改寫。'
+        for text in (review.RULES, chat.SYSTEM, review.DESCRIPTION):
+            self.assertIn(threshold, text)
+            self.assertLess(text.index(threshold), text.index(review.CLOSING))
+        self.assertIn('使用者附履歷並要求檢查、看、評或優化履歷時', chat.SYSTEM)
+
+    def test_english_terms_are_members_of_selected_resume_word_set(self):
+        data = arguments()
+        data['rewrites'][0]['suggested'] = '使用 Docker 開發服務'
+        contexts = [{'text': RESUME}, {'text': '職缺要求 Docker'}]
+        self.assertEqual(submit(data, contexts=contexts)[1]['removed_rewrites'], 1)
+        data['rewrites'] = [{'original': '維護服務', 'suggested': '使用 pYtHoN. 維護服務', 'reason': ''}]
+        contexts = [{'text': '維護服務\n其他技能：Python Cloud'}]
+        self.assertEqual(submit(data, contexts=contexts)[1]['rewrites'], data['rewrites'])
+        for short, other in [('C', 'Cloud'), ('R', 'Rstudio'), ('Go', 'Golang')]:
+            with self.subTest(short=short):
+                data['rewrites'][0]['suggested'] = short + ' 維護服務'
+                self.assertEqual(submit(data, contexts=[{'text': '維護服務\n' + other}])[1]['removed_rewrites'], 1)
+        data['rewrites'][0]['suggested'] = '維護服務〔待補：Docker〕'
+        self.assertEqual(submit(data, contexts=contexts)[1]['rewrites'], data['rewrites'])
+        self.assertEqual(review.english_words('C++ C# Node.js ASP.NET Objective-C Go R Python.-'),
+                         {'c++', 'c#', 'node.js', 'asp.net', 'objective-c', 'go', 'r', 'python'})
+
+    def test_contacts_in_original_or_suggested_remove_the_pair(self):
+        contacts = ['0912-345-678', '0912 345 678', '0912345678', '(02) 2345-6789', '02-2345-6789',
+                    '+886 912 345 678', '+886 (0) 912 345 678', '0912\t345\t678',
+                    'A123456789', '12345678', 'me@example.com', 'me@mail.example.com',
+                    'ｍｅ＠ｅｘａｍｐｌｅ．ｃｏｍ']
+        for contact in contacts:
+            normalized = unicodedata.normalize('NFKC', contact)
+            self.assertTrue(review.has_contact(normalized), contact)
+            for field in ('original', 'suggested'):
+                with self.subTest(contact=contact, field=field):
+                    pair = {'original': '維護服務', 'suggested': '維護服務', 'reason': ''}
+                    # A placeholder isolates suggested-contact removal from the existing number/word checks.
+                    pair[field] = contact if field == 'original' else '維護服務〔待補：' + contact + '〕'
+                    data = arguments(); data['rewrites'] = [pair]
+                    result, card = submit(data, contexts=[{'text': normalized + '\n維護服務'}])
+                    self.assertEqual(result['removed_rewrites'], 1)
+                    self.assertEqual(card['removed_rewrites'], 1)
+                    self.assertEqual(card['rewrites'], [])
+            # Also cover the ordinary, unbracketed suggestion with its number and word checks satisfied.
+            data = arguments(); data['rewrites'] = [{'original': contact, 'suggested': contact, 'reason': ''}]
+            self.assertEqual(submit(data, contexts=[{'text': contact}])[1]['removed_rewrites'], 1)
+
+    def test_contact_checks_keep_years_percentages_money_and_nonphone_numbers(self):
+        safe = ['2019-2022', '2019 - 2022', '2020 2021 2022', '提升 75%', '營收成長 1,200,000 元',
+                '111-112 學年', '2019/03-2022/05', '近 3 年 5 個專案', '10912-345-678',
+                '03-2020 - 05-2022', '09-2019 - 06-2022', '2020-03-01 - 2022-05-31',
+                '2019-03 - 2022-05-31', '03 2020 - 05 2022', '缺陷數降至 0\n2019-2022 任職',
+                '03/2020 - 05/2022', '2020.03-2022.05']
+        for text in safe:
+            with self.subTest(text=text):
+                self.assertFalse(review.has_contact(text))
+                data = arguments(); data['rewrites'] = [{'original': text, 'suggested': text, 'reason': ''}]
+                result, card = submit(data, contexts=[{'text': text}])
+                self.assertEqual(result['removed_rewrites'], 0)
+                self.assertEqual(card['rewrites'], data['rewrites'])
+
+    def test_new_rules_share_removed_counter_and_skip_image_attachments(self):
+        data = arguments()
+        data['rewrites'] += [{'original': RESUME, 'suggested': '使用 Docker 開發服務', 'reason': ''},
+                             {'original': RESUME, 'suggested': '〔待補：0912-345-678〕', 'reason': ''}]
+        result, card = submit(data)
+        self.assertEqual(result['removed_rewrites'], 2)
+        self.assertEqual(card['removed_rewrites'], 2)
+        self.assertEqual(card['rewrites'], [data['rewrites'][0]])
+        data['rewrites'] = [{'original': 'me@example.com', 'suggested': 'Docker 0912345678', 'reason': ''}]
+        result, card = submit(data, contexts=[{'kind': 'image'}])
+        self.assertEqual(result['quote_check'], 'unchecked_image')
+        self.assertEqual(result['removed_rewrites'], 0)
+        self.assertEqual(card['rewrites'], data['rewrites'])
+
     def test_closing_contract_in_system_tool_description_and_success_result(self):
         result, _ = submit(arguments())
         for text in (chat.SYSTEM, review.DESCRIPTION, result['reminder']):
@@ -310,11 +385,12 @@ class ReviewChatChecks(unittest.TestCase):
 
     def test_normalized_attachments_reach_prompt_and_quote_source(self):
         from test_resume_chat import pdf
+        from test_chat_files import docx
         source = '提升勝率⾄ ７５％，維護ＡＰＩ。'
         expected = '提升勝率至 75%,維護API。'
         data = arguments('direction')
         data['rewrites'] = [{'original': expected, 'suggested': expected, 'reason': '核對合成字元'}]
-        for extension in ('pdf', 'md', 'markdown', 'txt'):
+        for extension in ('pdf', 'md', 'markdown', 'txt', 'docx'):
             for protocol in ('responses', 'chat_completions', 'anthropic_messages'):
                 with self.subTest(extension=extension, protocol=protocol):
                     with self.store.connect(write=True) as db:
@@ -329,7 +405,7 @@ class ReviewChatChecks(unittest.TestCase):
                         self.assertIn(review.CLOSING, encode(payload))
                         return chats.response(protocol, text='請看卡片並補充成果。')
                     self.app.state.llm_transport = httpx.MockTransport(provider)
-                    raw = pdf(source) if extension == 'pdf' else source.encode()
+                    raw = pdf(source) if extension == 'pdf' else docx(source) if extension == 'docx' else source.encode()
                     with patch('app.resume_review.submit_review', wraps=review.submit_review) as submitter:
                         response = self.client.post('/api/chat', data={'text': '檢查履歷，方向後端', 'request_id': f'nfkc-{extension}-{protocol}'},
                                                     files={'resume': (f'synthetic.{extension}', raw, 'application/octet-stream')})

@@ -71,7 +71,8 @@ CLOSING = ('卡片已顯示全部內容，收尾只寫 1～3 句（目標、分�
 RULES = ('不新增履歷沒有的經歷、技能、成果、職稱或數字；需要缺少的數字時用〔待補：…〕佔位，'
          '並在對應修改項 need_from_user 說明。不得引用市場統計或錄取率，扣分點前不寫正面評語。'
          'original 必須直接逐字抄錄附件解析文字，不先修正錯字或斷行；只改寫工作內容，不引用或改寫姓名、電話、email 等聯絡資料。'
-         '分組只能引用工具回傳值，無分組時不得自行下判決。每個角度獨立依履歷、職缺說明與檢辯內容判斷，不參照其他角度。' + CLOSING)
+         '分組只能引用工具回傳值，無分組時不得自行下判決。每個角度獨立依履歷、職缺說明與檢辯內容判斷，不參照其他角度。'
+         'status 只看這個角度是否有會實質影響這次投遞的缺口：有才標需補強；只是可再潤飾就標已具備，潤飾建議放在修改項或改寫。' + CLOSING)
 DESCRIPTION = ('使用者附履歷並要求檢查、評估或優化時，確定一個目標後提交；成功只限一次，失敗可修正一次，stopped=true 時以文字說明未完成並停止呼叫。'
                'resume_attachment 從 1 起算，單一附件填 1（標籤為「本次附件」）；多附件依本次第幾個附件選擇履歷。'
                'case.target_type=job：job_id 或 url 恰給一個，先在本回合 get_job_details 取得 success 且 summary 非空的職缺說明；讀不到請使用者貼職缺說明，取得同意才改方向。'
@@ -95,17 +96,33 @@ def normalize(text):
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC', text))
 
 
+def english_words(text):
+    return {word.rstrip('.-').lower() for word in re.findall(r'[A-Za-z][A-Za-z0-9.+#-]*', text)}
+
+
+def has_contact(text):
+    return bool(re.search(r'\S+@\S+\.\S+|\d{8,}', text)) or any(
+        len(re.findall(r'\d', match.group())) >= 9
+        for match in re.finditer(r'(?<![\d-])(?:\+886|0)\d*\)?(?:[ \t-]?\(?\d+\)?)*', text))
+
+
 def checked_rewrites(rewrites, attachment):
     if attachment.get('kind') == 'image':
         return [item.model_dump() for item in rewrites], 0, 'unchecked_image'
-    source = normalize(attachment.get('text', ''))
+    full_text = unicodedata.normalize('NFKC', attachment.get('text', ''))
+    source = normalize(full_text)
+    source_words = english_words(full_text)
     kept = []
     for item in rewrites:
-        original = normalize(item.original)
-        before = set(re.findall(r'\d+', unicodedata.normalize('NFKC', item.original)))
-        suggested = re.sub(r'〔待補[:：][^〕]*〕', '', unicodedata.normalize('NFKC', item.suggested))
+        original_text = unicodedata.normalize('NFKC', item.original)
+        suggested_text = unicodedata.normalize('NFKC', item.suggested)
+        original = normalize(original_text)
+        before = set(re.findall(r'\d+', original_text))
+        suggested = re.sub(r'〔待補[:：][^〕]*〕', '', suggested_text)
         after = set(re.findall(r'\d+', suggested))
-        if original and original in source and after <= before:
+        if (original and original in source and after <= before
+                and english_words(suggested) <= source_words
+                and not has_contact(original_text) and not has_contact(suggested_text)):
             kept.append(item.model_dump())
     return kept, len(rewrites) - len(kept), 'checked'
 

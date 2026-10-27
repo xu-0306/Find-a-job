@@ -50,16 +50,18 @@ def pdf(text='Skills: GIS, ecology and field surveys.', pages=1, password=None):
 class AttachmentNormalizationChecks(unittest.TestCase):
     def test_pdf_markdown_and_txt_normalize_before_shared_context(self):
         from app import chat_files
+        from test_chat_files import docx
         from test_resume_review import arguments, submit
         for source, expected in [('提升勝率⾄ ７５％，維護ＡＰＩ。', '提升勝率至 75%,維護API。'),
                                  ('⼯作經驗：ﬃ、㍿', '工作經驗:ffi、株式会社')]:
             parsed = resume_pdf.extract_pdf(pdf(source))
             self.assertEqual(parsed['text'], expected)
-            for extension in ('.pdf', '.md', '.markdown', '.txt'):
+            for extension in ('.pdf', '.md', '.markdown', '.txt', '.docx'):
                 with self.subTest(source=source, extension=extension):
                     # The real parser is checked above; isolate its subprocess boundary here.
                     with patch('app.resume_pdf.parse_pdf', return_value=parsed):
-                        context, _ = asyncio.run(chat_files.prepare({'extension': extension, 'data': source.encode(), 'filename': '合成' + extension}))
+                        raw = docx(source) if extension == '.docx' else source.encode()
+                        context, _ = asyncio.run(chat_files.prepare({'extension': extension, 'data': raw, 'filename': '合成' + extension}))
                     self.assertEqual(context['text'], expected)
                     data = arguments('direction')
                     data['rewrites'] = [{'original': expected, 'suggested': expected, 'reason': '合成資料'}]

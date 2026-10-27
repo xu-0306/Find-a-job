@@ -51,8 +51,8 @@ class FakeElement {
   }
   click() { return this.disabled ? Promise.resolve([]) : this.dispatch("click"); }
   reset() { this.value = ""; for (const child of this.children) child.reset(); }
-  focus() { this.focused = true; }
-  select() { this.selected = true; }
+  focus() { this.focused = true; this.dispatchEvent({type: "focus", currentTarget: this}); }
+  select() { this.selected = true; this.selectCount = (this.selectCount || 0) + 1; this.selectionStart = 0; this.selectionEnd = this.value.length; }
   scrollIntoView() { this.scrolled = true; }
   getAttribute(name) { return this[name]; }
   removeAttribute(name) { delete this[name]; }
@@ -805,6 +805,286 @@ async function testEditRegenerationInPlace() {
   assert.equal(stale.elements.get("chat-list").children[1], staleReply);
   assert.equal(stale.state.input.value, "較新的修訂稿");
   assert.equal(stale.elements.get("message-edit-banner").hidden, false);
+}
+
+function testResumeReviewShortcutMarkup() {
+  const cards = [...homeHtml.matchAll(/<button type="button" class="quick-card" data-chat-draft="([^"]+)">([\s\S]*?)<\/button>/g)];
+  assert.equal(cards.length, 9);
+  const index = cards.findIndex(card => card[2].includes("<strong>檢查履歷</strong>"));
+  assert.ok(index > 0);
+  assert.match(cards[index - 1][2], /<strong>履歷找工作<\/strong>/);
+  assert.match(cards[index + 1][2], /<strong>求職建議<\/strong>/);
+  assert.equal(cards[index][1], "請檢查我附上的履歷是否適合＿＿（可貼 104 職缺網址、職缺說明，或寫想投的職務方向），並給我修改建議。");
+  assert.match(cards[index][2], /<small>附上履歷，對準一個職缺給修改建議<\/small>/);
+  assert.match(cards[index][2], /icons\.svg#edit/);
+  assert.match(cards[index][2], /class="icon arrow"/);
+}
+
+async function testAttachmentPromptShortcutReplacesUntouchedText() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const draft = homeHtml.match(/data-chat-draft="([^"]+)"[^>]*><svg[^>]*><use href="\/static\/icons.svg#edit"/)[1];
+  home.state.quickCard.dataset.chatDraft = draft;
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, draft);
+  assert.equal(home.state.fileInput.files.length, 1);
+  assert.equal(home.state.fetchCalls.length, 0);
+}
+
+async function testAttachmentPromptEditedTextAppendsAndDoesNotSelect() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  home.state.input.value += "我想投後端";
+  await home.state.input.dispatch("input");
+  const edited = home.state.input.value;
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, edited + "\n" + home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptFirstFocusSelectsAll() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.docx")]);
+  assert.equal(home.state.input.selectCount || 0, 0);
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1);
+  assert.equal(home.state.input.selectionStart, 0);
+  assert.equal(home.state.input.selectionEnd, home.state.input.value.length);
+}
+
+async function testAttachmentPromptFocusSelectsOnlyOnce() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  home.state.input.focus();
+  home.state.input.selectionStart = home.state.input.selectionEnd = 5;
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1);
+  assert.equal(home.state.input.selectionStart, 5);
+  assert.equal(home.state.input.selectionEnd, 5);
+}
+
+async function testAttachmentPromptReplacementClearsRecordBeforeFocus() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const prompt = home.state.input.value;
+  // Equal text makes clearing the provenance record observable even before focus checks equality.
+  home.state.quickCard.dataset.chatDraft = prompt;
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(home.state.input.selectCount || 0, 0, "the click's focus must not select the new draft");
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt + "\n" + prompt, "the cleared record cannot replace a later draft");
+}
+
+async function testAttachmentPromptOnlyRecordsActualAutomaticWrites() {
+  const home = createContext(); await settle();
+  const file = new File(["resume"], "resume.pdf");
+  const prompt = home.context.attachmentPrompt([file]);
+  home.state.input.value = prompt;
+  home.context.acceptAttachmentSelection([file]);
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt + "\n" + home.state.quickCard.dataset.chatDraft);
+
+  const changed = createContext(); await settle();
+  changed.context.acceptAttachmentSelection([file]);
+  changed.state.input.value = prompt + "自行修改";
+  await changed.state.input.dispatch("input");
+  changed.state.input.value = prompt;
+  changed.state.input.focus();
+  assert.equal(changed.state.input.selectCount || 0, 0, "editing invalidates the automatic-text record");
+  await changed.state.quickCard.click();
+  assert.equal(changed.state.input.value, prompt + "\n" + changed.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptAcceptedSendThenEditClearsRecord() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const prompt = home.state.input.value;
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(home.state.chatPayloads[0].text, prompt);
+  assert.equal(home.state.input.value, "");
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), null, "accepted clearing invalidates provenance before any edit");
+  home.context.prepareMessageEdit(prompt, [{filename: "resume.pdf"}], "1", "request-1");
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(home.elements.get("message-edit-banner").hidden, false);
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt + "\n" + home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptMessageEditClearsRecordWithoutSend() {
+  const home = createContext(); await settle();
+  const file = new File(["resume"], "resume.pdf");
+  home.context.acceptAttachmentSelection([file]);
+  const prompt = home.state.input.value;
+  home.context.removeAttachment(file);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), prompt);
+  home.context.prepareMessageEdit(prompt, [], "1", "older-request");
+  assert.equal(home.elements.get("message-edit-banner").hidden, false);
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(home.state.input.selectCount || 0, 0, "editing must clear provenance independently of accepted sends");
+  home.context.cancelMessageEdit();
+  assert.equal(home.state.input.value, prompt, "cancelling an edit preserves the draft");
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt + "\n" + home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptSignedOutClearsRecord() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const prompt = home.state.input.value;
+  home.context.signedOut();
+  assert.equal(home.state.input.value, "");
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), null);
+  // Restoring equal text must not revive provenance from the previous account.
+  home.state.input.value = prompt;
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, prompt + "\n" + home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptConversationSwitchPreservesUntouchedDraft() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const prompt = home.state.input.value;
+  const next = {id: "conversation-2", title: "另一段對話"};
+  home.state.conversations.push(next);
+  assert.equal(await home.context.openConversation(next), true);
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), prompt);
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptSearchPrefillsClearRecord() {
+  for (const action of ["continueSearch", "prefillDailyReminder"]) {
+    const home = createContext(); await settle();
+    const state = {id: "search-1", canContinue: true};
+    let submitted = 0;
+    home.elements.get("chat-form").requestSubmit = () => { submitted++; };
+    home.context[action](state);
+    const prefill = home.state.input.value;
+    assert.ok(prefill.length > 0, action);
+    home.state.input.value = "";
+    await home.state.input.dispatch("input");
+    // Equal output exposes stale provenance even if the two kinds of copy converge later.
+    home.context.attachmentPrompt = () => prefill;
+    home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+    assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), prefill);
+    home.context[action](state);
+    assert.equal(home.state.input.value, prefill, action);
+    assert.equal(home.state.input.selectCount || 0, 0, action + " must clear before focusing");
+    assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), null, action);
+    assert.equal(submitted, action === "continueSearch" ? 2 : 0);
+    await home.state.quickCard.click();
+    assert.equal(home.state.input.value, prefill + "\n" + home.state.quickCard.dataset.chatDraft, action);
+  }
+}
+
+async function testAttachmentPromptRejectedSendPreservesRecord() {
+  const home = createContext(); await settle();
+  const file = new File(["resume"], "resume.pdf");
+  home.context.acceptAttachmentSelection([file]);
+  const prompt = home.state.input.value;
+  home.context.fetch = async () => ({ok: false, status: 422, json: async () => ({error: {code: "invalid_input", message: "附件無法讀取"}})});
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.match(home.elements.get("chat-status").textContent, /訊息尚未送出/);
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(home.state.fileInput.files[0], file);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), prompt);
+  assert.equal(home.state.input.selectCount || 0, 0);
+  home.state.input.focus();
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptAcceptedComposerPreservesNewerDraft() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  const prompt = home.state.input.value;
+  home.context.clearAcceptedComposer({text: "earlier message", attachments: []});
+  assert.equal(home.state.input.value, prompt);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), prompt, "a different draft was not cleared");
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, home.state.quickCard.dataset.chatDraft);
+}
+
+async function testAttachmentPromptShortcutAppendClearsRecord() {
+  const home = createContext(); await settle();
+  home.context.acceptAttachmentSelection([new File(["resume"], "resume.pdf")]);
+  home.state.input.value += "補充";
+  const draft = home.state.input.value;
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, draft + "\n" + home.state.quickCard.dataset.chatDraft);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), null, "every shortcut write invalidates old provenance");
+  assert.equal(home.state.input.selectCount || 0, 0);
+}
+
+async function testAttachmentPromptShortcutThenReattachKeepsDraftAndRearms() {
+  const home = createContext(); await settle();
+  const file = new File(["resume"], "resume.pdf");
+  home.context.acceptAttachmentSelection([file]);
+  await home.state.quickCard.click();
+  const draft = home.state.input.value;
+  home.context.acceptAttachmentSelection([new File(["more"], "resume.docx")]);
+  assert.equal(home.state.input.value, draft);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), null);
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount || 0, 0);
+  await home.state.quickCard.click();
+  assert.equal(home.state.input.value, draft + "\n" + home.state.quickCard.dataset.chatDraft);
+  home.state.input.value = "";
+  await home.state.input.dispatch("input");
+  home.context.acceptAttachmentSelection([file]);
+  assert.equal(vm.runInContext("lastAttachmentPrompt", home.context), home.state.input.value);
+  home.state.input.focus();
+  assert.equal(home.state.input.selectCount, 1, "a fresh automatic write rearms first-focus selection");
+}
+
+async function testWordAttachmentsSharePickerDropChipsHistoryAndPrompt() {
+  const home = createContext(); await settle();
+  assert.match(homeHtml, /accept="[^"]*\.docx[,\"]/);
+  assert.match(homeHtml, /id="resume-help"[^>]*>[^<]*Word（\.docx）/);
+  const word = new File(["synthetic docx"], "履歷.DOCX");
+  home.state.fileInput.files = [word];
+  await home.state.fileInput.dispatch("change");
+  assert.equal(home.state.fileInput.files[0], word);
+  assert.equal(home.state.input.value, home.context.attachmentPrompt([new File(["pdf"], "resume.pdf")]));
+  assert.match(home.elements.get("resume-name").textContent, /履歷\.DOCX · Word/);
+  const history = home.context.chatMessage("user", "請檢查履歷", "completed", [], [{kind: "text", filename: word.name, characters: 10}]);
+  assert.match(history.textContent, /附件：履歷\.DOCX/);
+  await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(home.state.chatPayloads.at(-1).resume, word);
+  const drop = createContext(); await settle();
+  await drop.elements.get("chat").dispatch("drop", {dataTransfer: {types: ["Files"], files: [word]}, preventDefault() {}, stopPropagation() {}});
+  assert.equal(drop.state.fileInput.files[0], word);
+  assert.match(drop.elements.get("resume-name").textContent, / · Word/);
+}
+
+async function testLegacyAttachmentFormatsKeepDraftAndGiveSaveAsGuidance() {
+  const home = createContext(); await settle();
+  const word = new File(["resume"], "resume.docx");
+  home.context.acceptAttachmentSelection([word]);
+  home.state.input.value = "自行撰寫的草稿";
+  for (const extension of ["doc", "pages", "odt"]) {
+    home.state.fileInput.files = [new File(["private"], "legacy." + extension)];
+    await home.state.fileInput.dispatch("change");
+    assert.equal(home.elements.get("chat-status").textContent,
+      "舊版 Word／其他格式請另存為 .docx 或 PDF 後再附上。原附件與訊息草稿已保留。");
+    assert.equal(home.state.fileInput.files[0], word);
+    assert.equal(home.state.input.value, "自行撰寫的草稿");
+  }
 }
 
 async function testDraftShortcutsPortraitsAndResume() {
@@ -3041,6 +3321,24 @@ process.on("exit", () => {
 });
 
 (async () => {
+  testResumeReviewShortcutMarkup();
+  await testAttachmentPromptShortcutReplacesUntouchedText();
+  await testAttachmentPromptEditedTextAppendsAndDoesNotSelect();
+  await testAttachmentPromptFirstFocusSelectsAll();
+  await testAttachmentPromptFocusSelectsOnlyOnce();
+  await testAttachmentPromptReplacementClearsRecordBeforeFocus();
+  await testAttachmentPromptOnlyRecordsActualAutomaticWrites();
+  await testAttachmentPromptAcceptedSendThenEditClearsRecord();
+  await testAttachmentPromptMessageEditClearsRecordWithoutSend();
+  await testAttachmentPromptSignedOutClearsRecord();
+  await testAttachmentPromptConversationSwitchPreservesUntouchedDraft();
+  await testAttachmentPromptSearchPrefillsClearRecord();
+  await testAttachmentPromptRejectedSendPreservesRecord();
+  await testAttachmentPromptAcceptedComposerPreservesNewerDraft();
+  await testAttachmentPromptShortcutAppendClearsRecord();
+  await testAttachmentPromptShortcutThenReattachKeepsDraftAndRearms();
+  await testWordAttachmentsSharePickerDropChipsHistoryAndPrompt();
+  await testLegacyAttachmentFormatsKeepDraftAndGiveSaveAsGuidance();
   await testResumeReviewCardStreamingHistoryAndIncomplete();
   testFullWidthChatDesktopScope();
   await testReuseAttachmentsMemoryOnlyAndRelease();
@@ -3103,7 +3401,7 @@ process.on("exit", () => {
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
   testRunCompleted = true;
-  console.log("test_m3_home: 55 checks passed");
+  console.log("test_m3_home: 79 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

@@ -266,7 +266,9 @@ async def read_chat_request(request):
                 filename = file.filename.replace('\\', '/').split('/')[-1]
                 extension = Path(filename).suffix.lower()
                 if extension not in chat_files.EXTENSIONS:
-                    raise APIError(422, 'invalid_resume', '支援 PDF、PNG／JPEG／WebP、Markdown 與 TXT。')
+                    message = ('舊版 Word／其他格式請另存為 .docx 或 PDF 後再附上。' if extension in ('.doc', '.pages', '.odt')
+                               else '支援 PDF、Word（.docx）、PNG／JPEG／WebP、Markdown 與 TXT。')
+                    raise APIError(422, 'invalid_resume', message)
                 data = await file.read(resume_pdf.MAX_BYTES + 1)
                 if not data or len(data) > resume_pdf.MAX_BYTES:
                     raise APIError(422, 'invalid_resume', '每個附件大小須介於 1 byte 與 20 MiB。')

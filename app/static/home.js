@@ -12,6 +12,8 @@ let pendingChatAction = null;
 let editOrigin = null;
 let previousValidAttachments = [];
 let reusableAttachments = [];
+let lastAttachmentPrompt = null;
+let attachmentPromptSelected = false;
 const CHAT_RETRY_LIMIT = 5;
 const CHAT_RETRY_DELAY_MS = 5000;
 const chatSearchResults = new WeakMap();
@@ -978,6 +980,7 @@ function continueSearch(state) {
   $("#result-options-dialog")?.close();
   pendingChatAction = {type: "continue_search", search_id: state.id};
   input.value = "請繼續找一批不同的職缺。";
+  lastAttachmentPrompt = null;
   updateChatCount(); setResultView("chat"); input.focus();
   $("#chat-form").requestSubmit?.($("#chat-form button[type=submit]"));
 }
@@ -985,6 +988,7 @@ function prefillDailyReminder(state) {
   const input = $("#chat-form [name=text]"); if (!input) return;
   $("#result-options-dialog")?.close();
   input.value = `請把「${searchLabel(state) || "本次搜尋"}」存成每日搜尋條件，先整理成提案，等我確認後再更新。`;
+  lastAttachmentPrompt = null;
   updateChatCount(); showPage("chat"); setResultView("chat"); input.focus();
   setChatStatus("已預填每日提醒提案訊息，送出後仍需你確認才會生效。", "complete");
 }
@@ -1123,6 +1127,7 @@ function signedOut() {
   $("#conversation-history-status").textContent = ""; $("#conversation-query").value = ""; $("#active-conversation-title").textContent = "尚未選取對話";
   $("#conversation-history-status").setAttribute("aria-busy", "false"); $("#more-conversations").disabled = false;
   $("#chat-form").reset(); $("#chat-status").textContent = ""; $("#cancel-chat").hidden = true;
+  lastAttachmentPrompt = null;
   editOrigin = null; $("#message-edit-banner").hidden = true; $("#message-edit-status").textContent = "";
   previousValidAttachments = []; releaseReusableAttachments(); clearChatFileDrag();
   updateResumeSelection(); updateChatCount();
@@ -1865,7 +1870,10 @@ function clearAcceptedComposer(operation) {
   reusableAttachments = [...operation.attachments];
   updateReusableAttachments();
   const input = $("#chat-form [name=text]");
-  if (input.value.trim() === operation.text.trim()) input.value = "";
+  if (input.value.trim() === operation.text.trim()) {
+    input.value = "";
+    lastAttachmentPrompt = null;
+  }
   const selected = [...($("#resume-file").files || [])];
   if (operation.attachments.length && selected.length === operation.attachments.length && selected.every((file, index) => file === operation.attachments[index])) {
     $("#resume-file").value = "";
@@ -2004,6 +2012,7 @@ function prepareMessageEdit(text, attachments = [], messageId, requestId, elemen
   }
   editOrigin = {messageId: String(messageId), requestId: String(requestId), conversationId: String(selectedConversationId), element};
   input.value = String(text).slice(0, input.maxLength || 10000);
+  lastAttachmentPrompt = null;
   updateChatCount();
   const attachmentNote = attachments.length ? " 歷史附件原檔未保存，請重新附加原附件或替換成新附件後送出。" : "";
   $("#message-edit-status").textContent = `編輯這則訊息，重新生成這次回覆；後面的對話會保留。${attachmentNote}`;
@@ -2145,8 +2154,13 @@ document.querySelectorAll("[data-chat-draft]").forEach(button => {
   button.addEventListener("click", () => {
     const input = $("#chat-form [name=text]");
     if (input.readOnly) return;
-    input.value = (input.value.trim() ? input.value.trimEnd() + "\n" : "") + button.dataset.chatDraft;
+    if (lastAttachmentPrompt !== null && input.value === lastAttachmentPrompt) {
+      input.value = button.dataset.chatDraft;
+    } else {
+      input.value = (input.value.trim() ? input.value.trimEnd() + "\n" : "") + button.dataset.chatDraft;
+    }
     input.value = input.value.slice(0, input.maxLength || 10000);
+    lastAttachmentPrompt = null;
     updateChatCount(); input.focus();
   });
 });
@@ -2161,6 +2175,7 @@ const MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024;
 function attachmentKind(file) {
   const extension = String(file?.name || "").split(".").pop().toLowerCase();
   if (extension === "pdf") return "PDF";
+  if (extension === "docx") return "Word";
   if (["png", "jpg", "jpeg", "webp"].includes(extension)) return "圖片";
   if (["md", "markdown", "txt"].includes(extension)) return "文件";
   return "";
@@ -2171,7 +2186,8 @@ function attachmentError(files) {
   for (const file of files) {
     if (!file.size) return `${file.name} 是空檔案；原附件與訊息草稿已保留。`;
     if (file.size > MAX_ATTACHMENT_BYTES) return `${file.name} 超過 20 MiB 上限；原附件與訊息草稿已保留。`;
-    if (!attachmentKind(file)) return "支援 PDF、PNG／JPEG／WebP、Markdown 或 TXT；原附件與訊息草稿已保留。";
+    if (/\.(doc|pages|odt)$/i.test(file.name)) return "舊版 Word／其他格式請另存為 .docx 或 PDF 後再附上。原附件與訊息草稿已保留。";
+    if (!attachmentKind(file)) return "支援 PDF、Word（.docx）、PNG／JPEG／WebP、Markdown 或 TXT；原附件與訊息草稿已保留。";
   }
   if (files.reduce((total, file) => total + file.size, 0) > MAX_ATTACHMENT_TOTAL_BYTES) return "附件合計超過 50 MiB；原附件與訊息草稿已保留。";
   return "";
@@ -2232,7 +2248,7 @@ function restorePreviousAttachment() {
 function attachmentPrompt(files) {
   if (files.length > 1) return "請根據這些檔案整理技能與經驗的重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
   const kind = attachmentKind(files[0]);
-  if (kind === "PDF") return "請根據這份履歷整理技能與經驗，並搜尋適合我的職缺；缺少的條件請先和我確認。";
+  if (kind === "PDF" || kind === "Word") return "請根據這份履歷整理技能與經驗，並搜尋適合我的職缺；缺少的條件請先和我確認。";
   if (kind === "圖片") return "請根據這張圖片整理重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
   return "請根據這份文件整理重點，並協助我處理求職相關問題；缺少的條件請先和我確認。";
 }
@@ -2247,7 +2263,11 @@ function acceptAttachmentSelection(files) {
   }
   previousValidAttachments = merged;
   const text = $("#chat-form [name=text]");
-  if (!text.value.trim()) text.value = attachmentPrompt(merged);
+  if (!text.value.trim()) {
+    text.value = attachmentPrompt(merged);
+    lastAttachmentPrompt = text.value;
+    attachmentPromptSelected = false;
+  }
   updateResumeSelection(); updateChatCount();
   setChatStatus(merged.length > 1 ? `已附加 ${merged.length} 個檔案；可以修改訊息後再按送出。` : "已附加檔案；可以修改訊息後再按送出。");
   return true;
@@ -2317,7 +2337,17 @@ $("#chat").addEventListener("drop", event => {
 window.addEventListener("dragover", event => { if (transferHasFiles(event)) event.preventDefault(); });
 window.addEventListener("drop", event => { if (transferHasFiles(event)) { event.preventDefault(); clearChatFileDrag(); } });
 window.addEventListener("blur", clearChatFileDrag);
-$("#chat-form [name=text]").addEventListener("input", updateChatCount);
+$("#chat-form [name=text]").addEventListener("input", () => {
+  lastAttachmentPrompt = null;
+  updateChatCount();
+});
+$("#chat-form [name=text]").addEventListener("focus", () => {
+  const input = $("#chat-form [name=text]");
+  if (!attachmentPromptSelected && lastAttachmentPrompt !== null && input.value === lastAttachmentPrompt) {
+    input.select();
+    attachmentPromptSelected = true;
+  }
+});
 $("#chat-form [name=text]").addEventListener("keydown", event => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
