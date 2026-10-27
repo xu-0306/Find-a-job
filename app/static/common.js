@@ -114,6 +114,8 @@ async function api(path, options = {}, recoveryAttempted = false) {
     }
     const exception = new Error(errorMessage);
     exception.status = response.status;
+    exception.code = result?.error?.code;
+    exception.diagnostic = result?.error?.diagnostic;
     throw exception;
   }
   return result;

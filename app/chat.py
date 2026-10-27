@@ -6,14 +6,14 @@ import time
 import httpx
 
 from . import context_budget, sources, resume_review
-from .llm import LLMError, stream_model
+from .llm import LLMError, MODEL_HTTP_TIMEOUT, stream_model
 from .store import encode, now
 
 MAX_ROUNDS = 8
 # Hard cap on history rows read per turn; the token budget decides how many of them are sent.
 HISTORY_LIMIT = 200
 REFERENCE_ITEM_CAP = 200
-CHAT_SECONDS = 240
+CHAT_SECONDS = 600
 FINISH_RESERVE_SECONDS = 45
 # Conservative scheduling allowances, not provider SLAs: leave time to decide a tool,
 # generate a summary, or complete a short retry stream before the hard cap.
@@ -290,7 +290,7 @@ async def produce_reply(app, request_id, settings, key, protocol, tools, validat
                 messages.extend([{'role': 'assistant', 'content': '', 'tool_calls': [call]},
                     {'role': 'tool', 'tool_call_id': call['id'], 'content': encode(result)},
                     {'role': 'user', 'content': '已依續查操作取得以上新一批資料。請整理這批結果與新增數，不再重做同一次搜尋。'}])
-            async with httpx.AsyncClient(transport=app.state.llm_transport, timeout=30,
+            async with httpx.AsyncClient(transport=app.state.llm_transport, timeout=MODEL_HTTP_TIMEOUT,
                                          follow_redirects=False, trust_env=False) as client:
                 overflow_retried = False
                 for round_no in range(MAX_ROUNDS):

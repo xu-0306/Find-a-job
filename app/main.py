@@ -730,7 +730,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 settings = DEFAULT_SETTINGS | store.get(db, 'services', {})
                 key = store.get(db, 'llm_api_key', '')
                 store.put(db, 'llm_test', {})
-            async with asyncio.timeout(180):
+            async with asyncio.timeout(llm.MODEL_TEST_SECONDS):
                 result = await llm.test_connection(settings, key, app.state.llm_transport)
             with store.connect(write=True) as db:
                 ensure_active(db, auth['hash'])
@@ -740,7 +740,8 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 store.put(db, 'llm_test', result | {'signature': llm.signature(settings, key), 'tested_at': now().isoformat()})
             return result
         except llm.LLMError as exc:
-            raise APIError(503, exc.code, exc.message) from None
+            return JSONResponse({'error': {'code': exc.code, 'message': exc.message,
+                                          'diagnostic': exc.diagnostic, 'retryable': exc.retryable}}, status_code=503)
         except TimeoutError:
             raise APIError(503, 'test_timeout', '連線測試等候時間已到。') from None
         finally:

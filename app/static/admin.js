@@ -916,13 +916,13 @@ formAction($("#services"), async () => {
   await loadSettings(); await loadModelProfiles(); message("設定已保存，可測試模型與搜尋連線。");
 });
 action($("#llm-test"), async () => {
-  $("#llm-status").textContent = "正在測試文字與工具往返，請稍候…";
+  $("#llm-status").textContent = "正在測試文字與工具往返，推理模型可能需要較久，整體最多等候 10 分鐘…";
   try {
     const result = await api("/api/admin/llm-test", {method: "POST"});
     $("#llm-status").textContent = `文字與工具往返測試通過 · ${result.protocol}`;
     message("模型文字與工具測試通過，可以回到前台聊天。");
   } catch (error) {
-    $("#llm-status").textContent = error.message;
+    $("#llm-status").textContent = [error.code && `錯誤代碼：${error.code}`, error.message, error.diagnostic].filter(Boolean).join(" · ");
     throw error;
   }
 });

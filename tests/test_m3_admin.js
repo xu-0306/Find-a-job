@@ -217,10 +217,12 @@ async function testModelConnectionHttpErrorDisplay() {
     const detail = `模型服務回傳 HTTP ${code}（responses），請在後台檢查設定。`;
     harness.state.api = async target => {
       assert.equal(target, "/api/admin/llm-test");
-      throw Object.assign(new Error(detail), {status: 503});
+      throw Object.assign(new Error(detail), {status: 503, code: "provider_http_error", diagnostic: "account_disabled: 帳戶停用"});
     };
     await assert.rejects(testConnection(), error => error.message === detail);
-    assert.equal(status.textContent, detail, "show the provider HTTP code, independent of the app's 503 response");
+    assert.ok(status.textContent.includes(detail), "show the provider HTTP code, independent of the app's 503 response");
+    assert.match(status.textContent, /錯誤代碼：provider_http_error/);
+    assert.match(status.textContent, /account_disabled: 帳戶停用/);
   }
 }
 

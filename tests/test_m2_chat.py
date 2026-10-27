@@ -118,6 +118,7 @@ class ChatChecks(unittest.TestCase):
                     self.store.put(db, 'services', SETTINGS | {'llm_protocol': protocol})
                 requests = []
                 def provider(request):
+                    self.assertEqual(request.extensions['timeout'], {'connect': 30, 'read': 180, 'write': 30, 'pool': 30})
                     payload = json.loads(request.content)
                     requests.append(payload)
                     if len(requests) == 1:
@@ -416,6 +417,7 @@ class ChatChecks(unittest.TestCase):
             self.assertNotIn(KEY,result.text)
         requests=[]
         def probe(request):
+            self.assertEqual(request.extensions['timeout'], {'connect': 30, 'read': 180, 'write': 30, 'pool': 30})
             requests.append(request.url.path)
             payload=json.loads(request.content)
             if request.url.path.endswith('/responses'):
@@ -473,6 +475,48 @@ class ChatChecks(unittest.TestCase):
         self.assertEqual(result.status_code,503)
         self.assertEqual(result.json()['error']['code'],'tool_test_failed')
         self.assertEqual(self.client.get('/api/admin/settings').json()['connection_test_status'],'pending')
+
+    def test_admin_model_test_still_stops_at_total_deadline(self):
+        stream = HangingStream(threading.Event())
+        self.app.state.llm_transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={'Content-Type': 'text/event-stream'}, stream=stream))
+        with patch.object(llm, 'MODEL_TEST_SECONDS', 0.05):
+            result = self.admin_test()
+        self.assertEqual(result.json()['error']['code'], 'test_timeout')
+        self.assertTrue(stream.closed)
+        self.assertFalse(self.app.state.llm_test_busy)
+        self.assertFalse(self.history())
+
+    def test_admin_model_diagnostics_distinguish_transport_format_and_provider_errors(self):
+        cases = [
+            (httpx.ReadTimeout(''), 'connection_timeout', 'ReadTimeout'),
+            (httpx.ConnectError('TLS certificate verification failed'), 'connection_failed', 'TLS certificate'),
+            (httpx.Response(200, headers={'content-type': 'text/event-stream'}, text='data: invalid-json\n\n'), 'invalid_response', 'JSONDecodeError'),
+            (httpx.Response(403, json={'error': {'code': 'account_disabled', 'message': '帳戶停用 ' + KEY}}), 'authentication_failed', 'account_disabled'),
+            (httpx.Response(502, text='upstream unavailable ' + KEY), 'provider_unavailable', 'upstream unavailable'),
+            (httpx.Response(200, headers={'content-type': 'text/event-stream'}, text='data: ' + json.dumps({'type': 'error', 'error': {'code': 'quota_exhausted', 'message': 'No credit ' + KEY}}) + '\n\n'), 'provider_error', 'quota_exhausted'),
+        ]
+        for outcome, code, detail in cases:
+            with self.subTest(code=code):
+                def fail(request):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                self.app.state.llm_transport = httpx.MockTransport(fail)
+                result = self.admin_test()
+                self.assertEqual(result.status_code, 503)
+                error = result.json()['error']
+                self.assertEqual(error['code'], code)
+                self.assertIn(detail, error['diagnostic'])
+                self.assertIn('responses · 工具呼叫', error['diagnostic'])
+                self.assertNotIn(KEY, result.text)
+        self.assertFalse(self.history())
+
+    def test_model_diagnostic_redaction_and_bound(self):
+        detail = llm.diagnostic_text(f'{KEY} Bearer other-secret api_key=another-secret token=private-value ' + 'x' * 3000, KEY)
+        for secret in (KEY, 'other-secret', 'another-secret', 'private-value'):
+            self.assertNotIn(secret, detail)
+        self.assertLessEqual(len(detail), 1500)
 
     def test_provider_bom_bare_cr_and_split_unicode_preserve_reply(self):
         class Fragmented(httpx.AsyncByteStream):
