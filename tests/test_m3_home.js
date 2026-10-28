@@ -3268,10 +3268,12 @@ async function testResumeReviewCardStreamingHistoryAndIncomplete() {
 
 function testFullWidthChatDesktopScope() {
   const css = fs.readFileSync(path.join(__dirname, "..", "app", "static", "style.css"), "utf8");
-  const desktop = css.split("@media(min-width:1001px){")[1].split("@media(max-width:1000px){")[0];
+  const desktop = css.split("@media(min-width:1001px){")[1].split(/\r?\n\}/)[0];
   assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel\{[^}]*grid-template-columns:minmax\(0,1fr\)/);
   assert.match(desktop, /#user-panel:has\(#search-results-panel\[hidden\]\) #chat\{grid-column:1\/-1\}/);
-  assert.match(desktop, /#user-panel:has\(#search-results-panel\[hidden\]\) #chat-transcript,[^{]+\.chat-composer\{width:100%;max-width:960px;margin-inline:auto\}/);
+  assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) #chat-transcript,\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) \.chat-composer\{width:100%;max-width:1400px;margin-inline:auto\}/);
+  assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) \.chat-message:not\(\.chat-user\) \.chat-bubble\{max-width:min\(100%,1100px\)\}/);
+  assert.match(css, /(?:^|\})\.chat-bubble\{grid-column:2;width:fit-content;max-width:min\(100%,80ch\);/);
   assert.match(desktop, /#user-panel:has\(#search-results-panel:not\(\[hidden\]\)\)\{grid-template-columns:var\(--chat-w,var\(--chat-col\)\) 14px minmax\(0,1fr\);column-gap:0\}/);
   assert.match(desktop, /#panel-resizer\{display:block;grid-column:2;grid-row:3\}/);
   assert.match(desktop, /#search-results-panel\{grid-column:3\}/);
