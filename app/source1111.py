@@ -99,6 +99,7 @@ SINGLE_AREA_SECONDS = 45
 STARTUP_SECONDS = 20
 # Allow worker JSON output and context shutdown before the bridge's hard timeout.
 WORKER_GRACE_SECONDS = 8
+MAX_REPLY_BYTES = 2 * 1024 * 1024
 MAX_AREAS = 10
 MAX_SEARCH_PAGES = 5
 
@@ -158,10 +159,18 @@ def search_batch(payload, page, names, previous_totals):
     return {'areas': areas}
 
 
+IDLE_SECONDS = 600
+
+
 class Browser1111:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.script = Path(__file__).resolve().parents[1] / 'experiments' / '1111-playwright' / 'source.mjs'
+        self.process = None
+        self._request_id = 0
+        self._idle_task = None
+        self._idle_closing = False
+        self._closing = False
 
     async def _stop(self, process):
         # Terminate the owned Node subtree before cancellation can leave Chrome behind.
@@ -176,6 +185,76 @@ class Browser1111:
                 pass
         await process.wait()
 
+    def _cancel_idle(self):
+        if self._idle_task and not self._idle_task.done() and not self._idle_closing:
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    def _arm_idle(self):
+        self._cancel_idle()
+        self._idle_task = asyncio.create_task(self._idle_close())
+
+    async def _idle_close(self):
+        try:
+            await asyncio.sleep(IDLE_SECONDS)
+            async with self.lock:
+                # Shutdown owns its detached process until wait or forced cleanup completes.
+                self._idle_closing = True
+                if self.process is None:
+                    return
+                await self._graceful_close_locked()
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._idle_closing = False
+
+    async def _graceful_close_locked(self):
+        process, self.process = self.process, None
+        if process is None:
+            return
+        try:
+            if process.returncode is None and process.stdin:
+                process.stdin.close()
+                await asyncio.wait_for(process.wait(), WORKER_GRACE_SECONDS)
+            elif process.returncode is None:
+                await asyncio.wait_for(process.wait(), WORKER_GRACE_SECONDS)
+        except (asyncio.TimeoutError, OSError):
+            await self._stop(process)
+
+    async def close(self):
+        """Close the shared worker; safe to call repeatedly."""
+        self._closing = True
+        self._cancel_idle()
+        try:
+            await asyncio.wait_for(self.lock.acquire(), WORKER_GRACE_SECONDS)
+        except TimeoutError:
+            await self._kill_current(self.process)
+            return
+        try:
+            self._cancel_idle()
+            await self._graceful_close_locked()
+        finally:
+            self.lock.release()
+
+    async def _ensure_process(self):
+        if self.process is not None and self.process.returncode is None:
+            return self.process
+        self.process = None
+        node = shutil.which('node')
+        if not node or not self.script.is_file():
+            raise BrowserError('unsupported', '1111 實驗來源需 Node 20+、Chrome 及 experiments/1111-playwright 的 npm ci 依賴；不會自動安裝。')
+        self.process = await asyncio.create_subprocess_exec(node, str(self.script), '--serve', cwd=self.script.parent,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            limit=MAX_REPLY_BYTES,
+            **({'start_new_session': True} if os.name != 'nt' else {}))
+        return self.process
+
+    async def _kill_current(self, process):
+        if self.process is process:
+            self.process = None
+        if process is not None and process.returncode is None:
+            await self._stop(process)
+
     async def call(self, arguments, *, timeout=None):
         seconds = call_seconds(len(arguments.get('area_names', [])))
         started = time.monotonic()
@@ -183,72 +262,76 @@ class Browser1111:
         wait_seconds = seconds if caller_expires is None else max(0, caller_expires - started)
         executing = False
         try:
-            # Queue until the caller's deadline, or one execution cap without a deadline.
-            async with asyncio.timeout(wait_seconds) as timer, self.lock:
-                acquired = time.monotonic()
-                cap = seconds if caller_expires is None else min(seconds, caller_expires - acquired)
-                expires = acquired + cap
-                timer.reschedule(asyncio.get_running_loop().time() + max(0, cap))
-                if cap - WORKER_GRACE_SECONDS < SINGLE_AREA_SECONDS + STARTUP_SECONDS:
-                    raise BrowserError('time_limited')
-                node = shutil.which('node')
-                if not node or not self.script.is_file():
-                    raise BrowserError('unsupported', '1111 實驗來源需 Node 20+、Chrome 及 experiments/1111-playwright 的 npm ci 依賴；不會自動安裝。')
-                process = None
-                executing = True
-                starting = asyncio.create_task(asyncio.create_subprocess_exec(node, str(self.script), cwd=self.script.parent,
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                    **({'start_new_session': True} if os.name != 'nt' else {})))
-                cancelled = False
-                try:
-                    # Startup may already own a child when cancellation arrives; obtain its handle before cleanup.
-                    while not starting.done():
+            async with asyncio.timeout(wait_seconds) as timer:
+                self._cancel_idle()
+                async with self.lock:
+                    self._closing = False
+                    try:
+                        acquired = time.monotonic()
+                        cap = seconds if caller_expires is None else min(seconds, caller_expires - acquired)
+                        expires = acquired + cap
+                        timer.reschedule(asyncio.get_running_loop().time() + max(0, cap))
+                        if cap - WORKER_GRACE_SECONDS < SINGLE_AREA_SECONDS + STARTUP_SECONDS:
+                            raise BrowserError('time_limited')
+                        process = None
+                        executing = True
+                        public_result_error = False
+                        starting = asyncio.create_task(self._ensure_process())
                         try:
-                            await asyncio.shield(starting)
+                            cancelled = False
+                            while not starting.done():
+                                try:
+                                    await asyncio.shield(starting)
+                                except asyncio.CancelledError:
+                                    cancelled = True
+                            process = starting.result()
+                            if cancelled:
+                                raise asyncio.CancelledError
+                            if self._closing:
+                                raise BrowserError()
+                            self._request_id += 1
+                            request_id = str(self._request_id)
+                            worker_input = dict(arguments, budget_ms=max(1, int(
+                                (expires - time.monotonic() - WORKER_GRACE_SECONDS) * 1000)))
+                            process.stdin.write((json.dumps({'id': request_id, 'input': worker_input}, ensure_ascii=False) + '\n').encode('utf-8'))
+                            await process.stdin.drain()
+                            line = await process.stdout.readline()
+                            if not line or not line.endswith(b'\n'):
+                                raise BrowserError('unsupported')
+                            payload = json.loads(line)
+                            if (not isinstance(payload, dict) or payload.get('id') != request_id
+                                    or not isinstance(payload.get('result'), dict)):
+                                raise BrowserError('unsupported')
+                            if process.returncode is not None:
+                                raise BrowserError()
+                            result = payload['result']
+                            if result.get('status') != 'ok':
+                                status, message = result.get('status'), result.get('message')
+                                if status not in _MESSAGES or not isinstance(message, str) or not message or len(message) > 500:
+                                    raise BrowserError('unsupported')
+                                public_result_error = True
+                                raise BrowserError(status, message)
+                            return result
                         except asyncio.CancelledError:
-                            cancelled = True
-                    process = starting.result()
-                    if cancelled:
-                        raise asyncio.CancelledError
-                    # Lock wait and Node startup consume the same budget, never a fresh one.
-                    worker_input = dict(arguments, budget_ms=max(1, int(
-                        (expires - time.monotonic() - WORKER_GRACE_SECONDS) * 1000)))
-                    process.stdin.write(json.dumps(worker_input, ensure_ascii=False).encode('utf-8'))
-                    await process.stdin.drain()
-                    process.stdin.close()
-                    output = bytearray()
-                    while chunk := await process.stdout.read(65536):
-                        output.extend(chunk)
-                        if len(output) > 2 * 1024 * 1024:
-                            raise BrowserError('unsupported')
-                    await process.wait()
-                    payload = json.loads(output)
-                    if not isinstance(payload, dict):
-                        raise BrowserError('unsupported')
-                    if payload.get('status') != 'ok':
-                        status = payload.get('status')
-                        message = payload.get('message')
-                        # The worker emits only fixed public diagnostics, never raw page or browser errors.
-                        if status not in _MESSAGES or not isinstance(message, str) or len(message) > 500:
-                            raise BrowserError('unsupported')
-                        raise BrowserError(status, message)
-                    if process.returncode:
-                        raise BrowserError()
-                    return payload
-                finally:
-                    if process is not None and process.returncode is None:
-                        cleanup = asyncio.create_task(self._stop(process))
-                        while not cleanup.done():
-                            try:
-                                await asyncio.shield(cleanup)
-                            except asyncio.CancelledError:
-                                continue
-                        cleanup.result()
+                            await asyncio.shield(self._kill_current(process))
+                            raise
+                        except BrowserError:
+                            if not public_result_error:
+                                await self._kill_current(process)
+                            raise
+                        except (OSError, ValueError):
+                            await self._kill_current(process)
+                            raise
+                    finally:
+                        if self.process is not None and self.process.returncode is None and not self._closing:
+                            self._arm_idle()
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             if not executing:
                 raise BrowserError('time_limited') from None
             raise BrowserError('failed', '1111 查詢執行時間已到，已停止本次瀏覽器。') from None
+        except BrowserError:
+            raise
         except (OSError, ValueError):
             raise BrowserError('unsupported', '1111 執行環境或回傳格式無法辨識；請檢查 Node、Chrome 及實驗 npm ci 依賴。') from None

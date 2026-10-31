@@ -361,6 +361,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
         for active in list(app.state.active_chats.values()):
             active['task'].cancel()
             await active['task']
+        await app.state.sources.close()
 
     app = FastAPI(title="求職陪伴小幫手", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.store = store
@@ -599,12 +600,13 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             return settings_view(store, db)
 
     @app.put("/api/admin/settings")
-    def put_settings(body: Settings, auth=Depends(admin)):
+    async def put_settings(body: Settings, auth=Depends(admin)):
         with store.connect(write=True) as db:
             ensure_active(db, auth['hash'])
             previous_provider = reviews.active_provider(store, db)
             previous_search_key = store.get(db, (previous_provider or '').lower() + '_api_key', '')
             services = DEFAULT_SETTINGS | store.get(db, "services", {})
+            previous_1111_enabled = services.get("source_1111_enabled") is True
             for key in DEFAULT_SETTINGS:
                 if getattr(body, key) is not None:
                     services[key] = getattr(body, key)
@@ -614,6 +616,7 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                     db.execute("DELETE FROM settings WHERE key=?", (key,))
                 elif getattr(body, key):
                     store.put(db, key, getattr(body, key))
+            disable_1111 = previous_1111_enabled and services.get("source_1111_enabled") is False
             if any(getattr(body, key) or key in body.clear_secrets for key in ('brave_api_key', 'tavily_api_key')):
                 db.execute("DELETE FROM settings WHERE key='search_comparison'")
             if 'search_provider' in body.model_fields_set:
@@ -621,7 +624,10 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             provider = reviews.active_provider(store, db)
             if (provider, store.get(db, (provider or '').lower() + '_api_key', '')) != (previous_provider, previous_search_key):
                 db.execute("DELETE FROM settings WHERE key='search_test'")
-            return settings_view(store, db)
+            result = settings_view(store, db)
+        if disable_1111:
+            await app.state.sources.close()
+        return result
 
     def saved_model_view(db, profile):
         return profile_view(profile, DEFAULT_SETTINGS | store.get(db, "services", {}),

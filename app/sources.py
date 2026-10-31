@@ -430,6 +430,9 @@ class Sources:
         self.regions518 = None
         self.browser1111 = browser1111 or Browser1111()
 
+    async def close(self):
+        await self.browser1111.close()
+
     async def request(self, method, url, *, host=None, max_retries=1, **kwargs):
         if type(max_retries) is not int or max_retries < 0:
             raise ValueError('max_retries must be a non-negative integer')

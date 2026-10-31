@@ -1,6 +1,7 @@
 """Offline 1111 contract, switches, continuation and durable compatibility."""
 import asyncio
 import json
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 from app import backups, security
 from app.backup_verify import validate_backup
 from app.daily import commit_results
-from app.source1111 import Browser1111, BrowserError, search_rows, SINGLE_AREA_SECONDS, STARTUP_SECONDS, WORKER_GRACE_SECONDS, call_seconds
+from app.source1111 import Browser1111, BrowserError, search_rows, SINGLE_AREA_SECONDS, STARTUP_SECONDS, WORKER_GRACE_SECONDS, MAX_REPLY_BYTES, call_seconds
 from app.sources import Sources, SearchInput, enabled_sources
 from app.store import Job, Store, encode, now
 from test_m2_chat import ChatChecks, SETTINGS, events, response
@@ -74,8 +75,8 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
     async def check_queued_single_area(self, timeout, wait, expected_ms):
         # Real coroutine contention; only elapsed time is simulated, never lock acquisition.
         bridge = Browser1111()
-        process = AsyncMock(); process.returncode = 0; process.stdin = Mock(); process.stdin.drain = AsyncMock()
-        process.stdout.read.side_effect = [b'{"status":"ok"}', b'']
+        process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
+        process.stdout.readline = AsyncMock(return_value=b'{"id":"1","result":{"status":"ok"}}\n')
         elapsed = 100
         clock = Mock(); clock.monotonic.side_effect = lambda: elapsed
         held, release = asyncio.Event(), asyncio.Event()
@@ -111,23 +112,23 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await pending, {'status': 'ok'})
                 spawn.assert_awaited_once()
                 payload = json.loads(process.stdin.write.call_args.args[0])
-                self.assertEqual(payload['budget_ms'], expected_ms)
+                self.assertEqual(payload['input']['budget_ms'], expected_ms)
                 if timeout is not None:
-                    self.assertLessEqual(wait * 1000 + 1000 + payload['budget_ms'] + WORKER_GRACE_SECONDS * 1000, timeout * 1000)
+                    self.assertLessEqual(wait * 1000 + 1000 + payload['input']['budget_ms'] + WORKER_GRACE_SECONDS * 1000, timeout * 1000)
         self.assertFalse(bridge.lock.locked())
 
     async def test_single_area_cap_allows_startup_when_caller_has_more_time(self):
         # Without the cap reset, a single-area call loses 1s before admission and never starts.
         bridge = Browser1111()
-        process = AsyncMock(); process.returncode = 0; process.stdin = Mock(); process.stdin.drain = AsyncMock()
-        process.stdout.read.side_effect = [b'{"status":"ok"}', b'']
+        process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
+        process.stdout.readline = AsyncMock(return_value=b'{"id":"1","result":{"status":"ok"}}\n')
         clock = Mock(); clock.monotonic.side_effect = [100, 101, 101]
         with patch('app.source1111.time', clock), \
                 patch('app.source1111.shutil.which', return_value='node'), patch.object(Path, 'is_file', return_value=True), \
                 patch('app.source1111.asyncio.create_subprocess_exec', return_value=process) as spawn:
             await bridge.call({'area_names': []}, timeout=340)
         spawn.assert_awaited_once()
-        self.assertEqual(json.loads(process.stdin.write.call_args.args[0])['budget_ms'], 65000)
+        self.assertEqual(json.loads(process.stdin.write.call_args.args[0])['input']['budget_ms'], 65000)
 
     async def test_lock_timeout_keeps_same_page_and_cursor_without_browser_stop_message(self):
         # Without F6 the bridge says a browser was stopped and Sources lacks partial/quota diagnostics.
@@ -485,8 +486,8 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_bridge_worker_budget_is_smaller_and_accounts_for_lock_wait(self):
         bridge = Browser1111()
-        process = AsyncMock(); process.returncode = 0; process.stdin = Mock(); process.stdin.drain = AsyncMock()
-        process.stdout.read.side_effect = [b'{"status":"ok"}', b'']
+        process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
+        process.stdout.readline = AsyncMock(return_value=b'{"id":"1","result":{"status":"ok"}}\n')
         elapsed = 100
         clock = Mock(); clock.monotonic.side_effect = lambda: elapsed
         held, release = asyncio.Event(), asyncio.Event()
@@ -511,8 +512,8 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
             await pending
             spawn.assert_awaited_once()
         payload = json.loads(process.stdin.write.call_args.args[0])
-        self.assertEqual(payload['budget_ms'], 85000)
-        self.assertLess(payload['budget_ms'], 100000)
+        self.assertEqual(payload['input']['budget_ms'], 85000)
+        self.assertLess(payload['input']['budget_ms'], 100000)
 
     async def test_search_passes_only_remaining_tool_budget_to_browser(self):
         browser = AsyncMock(); browser.call.return_value = page()
@@ -536,7 +537,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
         bridge = Browser1111()
         process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
         async def stall(*args): await asyncio.sleep(10)
-        process.stdout.read.side_effect = stall
+        process.stdout.readline.side_effect = stall
         real_timeout = asyncio.timeout
         def short_timeout(seconds):
             timer = real_timeout(.01)
@@ -659,7 +660,7 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(BrowserError) as error: await bridge.call({'action': 'search'})
             self.assertEqual(error.exception.status, 'unsupported')
         process = AsyncMock(); process.returncode = None; process.stdin = Mock()
-        process.stdin.drain = AsyncMock(); process.stdout.read = AsyncMock(side_effect=asyncio.CancelledError)
+        process.stdin.drain = AsyncMock(); process.stdout.readline = AsyncMock(side_effect=asyncio.CancelledError)
         with patch('app.source1111.shutil.which', return_value='node'), patch.object(Path, 'is_file', return_value=True), \
                 patch('app.source1111.asyncio.create_subprocess_exec', return_value=process), \
                 patch.object(bridge, '_stop', new_callable=AsyncMock) as stop:
@@ -721,21 +722,21 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(diag['baseline'])
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM preference_baselines WHERE source='1111'").fetchone()[0], 0)
 
-    async def test_bridge_reads_segmented_json_until_eof(self):
+    async def test_bridge_reads_one_json_line(self):
         bridge = Browser1111()
-        output = json.dumps({'status': 'ok', 'detail': {'description': 'x' * 100000}}).encode()
-        process = AsyncMock(); process.returncode = 0; process.stdin = Mock(); process.stdin.drain = AsyncMock()
-        process.stdout.read.side_effect = [output[:500], output[500:60000], output[60000:], b'']
+        output = json.dumps({'id': '1', 'result': {'status': 'ok', 'detail': {'description': 'x' * 100000}}}).encode() + b'\n'
+        process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
+        process.stdout.readline = AsyncMock(return_value=output)
         with patch('app.source1111.shutil.which', return_value='node'), patch.object(Path, 'is_file', return_value=True), \
                 patch('app.source1111.asyncio.create_subprocess_exec', return_value=process):
             result = await bridge.call({'action': 'detail'})
         self.assertEqual(len(result['detail']['description']), 100000)
-        self.assertEqual(process.stdout.read.await_count, 4)
+        self.assertEqual(process.stdout.readline.await_count, 1)
 
     async def test_timeout_cleans_owned_process_and_next_call_can_run(self):
         bridge = Browser1111()
         process = AsyncMock(); process.returncode = None; process.stdin = Mock(); process.stdin.drain = AsyncMock()
-        process.stdout.read = AsyncMock(side_effect=TimeoutError)
+        process.stdout.readline = AsyncMock(side_effect=TimeoutError)
         with patch('app.source1111.shutil.which', return_value='node'), patch.object(Path, 'is_file', return_value=True), \
                 patch('app.source1111.asyncio.create_subprocess_exec', return_value=process), \
                 patch.object(bridge, '_stop', new_callable=AsyncMock) as stop:
@@ -745,6 +746,416 @@ class AdapterChecks(unittest.IsolatedAsyncioTestCase):
             self.assertIn('已停止本次瀏覽器', error.exception.message)
             stop.assert_awaited_once()
         self.assertFalse(bridge.lock.locked())
+
+
+class PersistentBridgeChecks(unittest.IsolatedAsyncioTestCase):
+    def process(self, replies):
+        process = AsyncMock()
+        process.returncode = None
+        process.pid = 123
+        process.stdin = Mock()
+        process.stdin.drain = AsyncMock()
+        process.stdout.readline = AsyncMock(side_effect=replies)
+        process.wait = AsyncMock()
+        return process
+
+    async def test_persistent_worker_writes_two_envelopes_and_spawns_once(self):
+        bridge = Browser1111()
+        process = self.process([
+            b'{"id":"1","result":{"status":"ok"}}\n',
+            b'{"id":"2","result":{"status":"ok"}}\n'])
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch('app.source1111.asyncio.create_subprocess_exec', return_value=process) as spawn:
+            self.assertEqual((await bridge.call({'action': 'search', 'area_names': []}))['status'], 'ok')
+            self.assertEqual((await bridge.call({'action': 'search', 'area_names': []}))['status'], 'ok')
+        spawn.assert_awaited_once()
+        self.assertEqual(process.stdin.write.call_count, 2)
+        self.assertIs(bridge.process, process)
+        await bridge.close()
+
+    async def test_dead_worker_respawns_and_protocol_failure_kills(self):
+        bridge = Browser1111()
+        first = self.process([b'{"id":"1","result":{"status":"ok"}}\n'])
+        second = self.process([b'{"id":"2","result":{"status":"ok"}}\n'])
+        async def launch(*args, **kwargs):
+            result = first if launch.calls == 0 else second
+            launch.calls += 1
+            return result
+        launch.calls = 0
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch('app.source1111.asyncio.create_subprocess_exec', side_effect=launch), \
+                patch.object(bridge, '_stop', new_callable=AsyncMock) as stop:
+            await bridge.call({'action': 'search', 'area_names': []})
+            first.returncode = -1
+            await bridge.call({'action': 'search', 'area_names': []})
+            second.stdout.readline = AsyncMock(return_value=b'{"id":"3","result":{}}\n')
+            with self.assertRaises(BrowserError):
+                await bridge.call({'action': 'search', 'area_names': []})
+        self.assertEqual(launch.calls, 2)
+        stop.assert_awaited_once_with(second)
+        self.assertIsNone(bridge.process)
+
+    async def test_public_status_keeps_worker_and_cancel_cleans_it(self):
+        bridge = Browser1111()
+        process = self.process([b'{"id":"1","result":{"status":"blocked","message":"blocked"}}\n'])
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch('app.source1111.asyncio.create_subprocess_exec', return_value=process), \
+                patch.object(bridge, '_stop', new_callable=AsyncMock) as stop:
+            with self.assertRaises(BrowserError) as error:
+                await bridge.call({'action': 'search', 'area_names': []})
+            self.assertEqual(error.exception.status, 'blocked')
+            self.assertIs(bridge.process, process)
+            process.stdout.readline = AsyncMock(side_effect=asyncio.CancelledError)
+            with self.assertRaises(asyncio.CancelledError):
+                await bridge.call({'action': 'search', 'area_names': []})
+        stop.assert_awaited_once_with(process)
+        self.assertIsNone(bridge.process)
+
+
+    async def test_real_pipe_accepts_100kb_and_keeps_worker(self):
+        await self.check_real_pipe(100000, True)
+
+    async def test_real_pipe_rejects_more_than_2mib_and_kills_worker(self):
+        await self.check_real_pipe(MAX_REPLY_BYTES + 1, False)
+
+    async def test_stream_reader_enforces_reply_limit(self):
+        for size, accepted in [(100000, True), (MAX_REPLY_BYTES + 1, False)]:
+            with self.subTest(size=size):
+                bridge = Browser1111()
+                process = self.process([])
+
+                async def launch(*args, **kwargs):
+                    process.stdout = asyncio.StreamReader(**({'limit': kwargs['limit']} if 'limit' in kwargs else {}))
+                    process.stdout.feed_data(json.dumps({'id': '1', 'result': {
+                        'status': 'ok', 'pad': 'x' * size}}).encode() + b'\n')
+                    return process
+
+                async def stop(owned):
+                    owned.returncode = -1
+
+                with patch('app.source1111.shutil.which', return_value='node'), \
+                        patch('app.source1111.asyncio.create_subprocess_exec', side_effect=launch), \
+                        patch.object(bridge, '_stop', side_effect=stop) as killed:
+                    if accepted:
+                        self.assertEqual(len((await bridge.call({'action': 'search'}))['pad']), size)
+                        killed.assert_not_awaited()
+                        self.assertIs(bridge.process, process)
+                    else:
+                        with self.assertRaises(BrowserError) as error:
+                            await bridge.call({'action': 'search'})
+                        self.assertEqual(error.exception.status, 'unsupported')
+                        killed.assert_awaited_once_with(process)
+                        self.assertIsNone(bridge.process)
+                    await bridge.close()
+
+    async def check_real_pipe(self, size, accepted):
+        bridge = Browser1111()
+        real_spawn = asyncio.create_subprocess_exec
+        processes = []
+        worker = """import sys, json
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({'id': request['id'], 'result': {'status': 'ok', 'pad': 'x' * SIZE}}), flush=True)
+""".replace('SIZE', str(size))
+
+        async def launch(*args, **kwargs):
+            process = await real_spawn(sys.executable, '-u', '-c', worker, **kwargs)
+            processes.append(process)
+            return process
+
+        async def stop(process):
+            process.kill()
+            await process.wait()
+
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch('app.source1111.asyncio.create_subprocess_exec', side_effect=launch), \
+                patch.object(bridge, '_stop', side_effect=stop) as killed:
+            try:
+                if accepted:
+                    result = await bridge.call({'action': 'search'})
+                    self.assertEqual(len(result['pad']), size)
+                    self.assertIs(bridge.process, processes[0])
+                    self.assertIsNone(processes[0].returncode)
+                    killed.assert_not_awaited()
+                else:
+                    with self.assertRaises(BrowserError) as error:
+                        await bridge.call({'action': 'search'})
+                    self.assertEqual(error.exception.status, 'unsupported')
+                    self.assertEqual(len(processes), 1)
+                    killed.assert_awaited_once_with(processes[0])
+                    self.assertIsNotNone(processes[0].returncode)
+                    self.assertIsNone(bridge.process)
+            finally:
+                await bridge.close()
+
+    async def test_mismatched_reply_id_kills_and_next_call_spawns(self):
+        bridge = Browser1111()
+        wrong = self.process([b'{"id":"wrong","result":{"status":"ok"}}\n'])
+        fresh = self.process([b'{"id":"2","result":{"status":"ok"}}\n'])
+
+        async def stop(process):
+            process.returncode = -1
+
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch('app.source1111.asyncio.create_subprocess_exec', side_effect=[wrong, fresh]) as spawn, \
+                patch.object(bridge, '_stop', side_effect=stop) as killed:
+            with self.assertRaises(BrowserError) as error:
+                await bridge.call({'action': 'search'})
+            self.assertEqual(error.exception.status, 'unsupported')
+            killed.assert_awaited_once_with(wrong)
+            self.assertEqual(wrong.returncode, -1)
+            self.assertIsNone(bridge.process)
+            self.assertEqual(await bridge.call({'action': 'search'}), {'status': 'ok'})
+            self.assertEqual(spawn.await_count, 2)
+            self.assertIs(bridge.process, fresh)
+            await bridge.close()
+
+    async def test_repeated_cancellation_during_spawn_kills_eventual_process(self):
+        bridge = Browser1111()
+        process = self.process([])
+        spawning, release = asyncio.Event(), asyncio.Event()
+
+        async def launch(*args, **kwargs):
+            spawning.set()
+            await release.wait()
+            return process
+
+        async def stop(owned):
+            owned.returncode = -1
+
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch('app.source1111.asyncio.create_subprocess_exec', side_effect=launch), \
+                patch.object(bridge, '_stop', side_effect=stop) as killed:
+            pending = asyncio.create_task(bridge.call({'action': 'search'}))
+            await spawning.wait()
+            pending.cancel()
+            await asyncio.sleep(0)
+            pending.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            killed.assert_awaited_once_with(process)
+            self.assertEqual(process.returncode, -1)
+            self.assertIsNone(bridge.process)
+
+    async def test_public_diagnostic_idle_expiry_closes_stdin_and_worker(self):
+        for status in ['blocked', 'failed']:
+            with self.subTest(status=status):
+                bridge = Browser1111()
+                process = self.process([json.dumps({'id': '1', 'result': {
+                    'status': status, 'message': status}}).encode() + b'\n'])
+                bridge.process = process
+                with patch('app.source1111.IDLE_SECONDS', .001):
+                    with self.assertRaises(BrowserError) as error:
+                        await bridge.call({'action': 'search'})
+                    self.assertEqual(error.exception.status, status)
+                    self.assertIsNotNone(bridge._idle_task)
+                    await asyncio.wait_for(bridge._idle_task, 1)
+                process.stdin.close.assert_called_once_with()
+                process.wait.assert_awaited_once_with()
+                self.assertIsNone(bridge.process)
+
+    async def test_time_limited_call_resets_idle_and_expires(self):
+        bridge = Browser1111()
+        process = self.process([b'{"id":"1","result":{"status":"ok"}}\n'])
+        bridge.process = process
+        with patch('app.source1111.IDLE_SECONDS', .01):
+            await bridge.call({'action': 'search'})
+            old_timer = bridge._idle_task
+            with self.assertRaises(BrowserError) as error:
+                await bridge.call({'action': 'search'}, timeout=1)
+            self.assertEqual(error.exception.status, 'time_limited')
+            self.assertIsNotNone(bridge._idle_task)
+            self.assertIsNot(old_timer, bridge._idle_task)
+            await asyncio.wait_for(bridge._idle_task, 1)
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(bridge.process)
+
+    async def test_new_call_before_idle_expiry_keeps_worker_until_it_finishes(self):
+        bridge = Browser1111()
+        process = self.process([b'{"id":"1","result":{"status":"ok"}}\n'])
+        bridge.process = process
+        reading, release = asyncio.Event(), asyncio.Event()
+
+        async def reply():
+            reading.set()
+            await release.wait()
+            return b'{"id":"2","result":{"status":"ok"}}\n'
+
+        with patch('app.source1111.IDLE_SECONDS', .001):
+            await bridge.call({'action': 'search'})
+            old_timer = bridge._idle_task
+            process.stdout.readline.side_effect = reply
+            pending = asyncio.create_task(bridge.call({'action': 'search'}))
+            await reading.wait()
+            await asyncio.sleep(.01)
+            self.assertTrue(old_timer.done())
+            process.stdin.close.assert_not_called()
+            self.assertIs(bridge.process, process)
+            release.set()
+            self.assertEqual(await pending, {'status': 'ok'})
+            await asyncio.wait_for(bridge._idle_task, 1)
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(bridge.process)
+
+    async def test_close_bounds_lock_wait_kills_call_and_returns_browser_error(self):
+        bridge = Browser1111()
+        process = self.process([])
+        bridge.process = process
+        reading, stopped = asyncio.Event(), asyncio.Event()
+        elapsed = 0
+
+        async def reply():
+            reading.set()
+            await stopped.wait()
+            return b''
+
+        async def stop(owned):
+            owned.returncode = -1
+            stopped.set()
+
+        async def expire(acquire, seconds):
+            nonlocal elapsed
+            self.assertEqual(seconds, WORKER_GRACE_SECONDS)
+            self.assertTrue(bridge.lock.locked())
+            acquire.close()
+            elapsed += seconds
+            raise TimeoutError
+
+        process.stdout.readline.side_effect = reply
+        with patch.object(bridge, '_stop', side_effect=stop) as killed:
+            pending = asyncio.create_task(bridge.call({'action': 'search'}))
+            await reading.wait()
+            with patch('app.source1111.asyncio.wait_for', side_effect=expire) as wait:
+                await bridge.close()
+            self.assertEqual(elapsed, WORKER_GRACE_SECONDS)
+            wait.assert_awaited_once()
+            killed.assert_awaited_once_with(process)
+            self.assertIsNone(bridge.process)
+            with self.assertRaises(BrowserError) as error:
+                await pending
+            self.assertEqual(error.exception.status, 'unsupported')
+            self.assertIsNone(bridge._idle_task)
+            await bridge.close()
+
+    async def test_close_waiting_for_call_cancels_rearmed_idle_timer(self):
+        bridge = Browser1111()
+        process = self.process([])
+        bridge.process = process
+        reading, release = asyncio.Event(), asyncio.Event()
+
+        async def reply():
+            reading.set()
+            await release.wait()
+            return b'{"id":"1","result":{"status":"ok"}}\n'
+
+        process.stdout.readline.side_effect = reply
+        pending = asyncio.create_task(bridge.call({'action': 'search'}))
+        await reading.wait()
+        closing = asyncio.create_task(bridge.close())
+        await asyncio.sleep(0)
+        release.set()
+        self.assertEqual(await pending, {'status': 'ok'})
+        await closing
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(bridge.process)
+        self.assertIsNone(bridge._idle_task)
+
+    async def test_close_during_idle_shutdown_does_not_cancel_process_wait(self):
+        bridge = Browser1111()
+        process = self.process([b'{"id":"1","result":{"status":"ok"}}\n'])
+        bridge.process = process
+        waiting, release = asyncio.Event(), asyncio.Event()
+        finished = False
+
+        async def wait():
+            nonlocal finished
+            waiting.set()
+            await release.wait()
+            finished = True
+            process.returncode = 0
+
+        process.wait.side_effect = wait
+        with patch('app.source1111.IDLE_SECONDS', .001):
+            await bridge.call({'action': 'search'})
+            timer = bridge._idle_task
+            await waiting.wait()
+            closing = asyncio.create_task(bridge.close())
+            await asyncio.sleep(0)
+            premature = timer.done()
+            release.set()
+            await timer
+            await closing
+        self.assertFalse(premature)
+        self.assertTrue(finished)
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(bridge.process)
+
+    async def test_close_during_spawn_kills_process_when_handle_arrives(self):
+        bridge = Browser1111()
+        process = self.process([b'{"id":"1","result":{"status":"ok"}}\n'])
+        spawning, release = asyncio.Event(), asyncio.Event()
+
+        async def launch(*args, **kwargs):
+            spawning.set()
+            await release.wait()
+            return process
+
+        async def expire(acquire, seconds):
+            self.assertEqual(seconds, WORKER_GRACE_SECONDS)
+            acquire.close()
+            raise TimeoutError
+
+        async def stop(owned):
+            owned.returncode = -1
+
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch('app.source1111.asyncio.create_subprocess_exec', side_effect=launch), \
+                patch.object(bridge, '_stop', side_effect=stop) as killed:
+            pending = asyncio.create_task(bridge.call({'action': 'search'}))
+            await spawning.wait()
+            with patch('app.source1111.asyncio.wait_for', side_effect=expire):
+                await bridge.close()
+            self.assertFalse(pending.done())
+            release.set()
+            with self.assertRaises(BrowserError) as error:
+                await pending
+            self.assertEqual(error.exception.status, 'failed')
+            killed.assert_awaited_once_with(process)
+            self.assertEqual(process.returncode, -1)
+            process.stdin.write.assert_not_called()
+            self.assertIsNone(bridge.process)
+            self.assertIsNone(bridge._idle_task)
+
+
+    async def test_idle_timer_is_reset_and_close_is_idempotent(self):
+        bridge = Browser1111()
+        process = self.process([
+            b'{"id":"1","result":{"status":"ok"}}\n',
+            b'{"id":"2","result":{"status":"ok"}}\n'])
+        with patch('app.source1111.shutil.which', return_value='node'), \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch('app.source1111.asyncio.create_subprocess_exec', return_value=process):
+            await bridge.call({'action': 'search', 'area_names': []})
+            old_timer = bridge._idle_task
+            await bridge.call({'action': 'search', 'area_names': []})
+            self.assertTrue(old_timer.cancelled() or old_timer.done())
+            await bridge.close()
+            await bridge.close()
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(bridge.process)
+
+
+
+class SourcesCloseChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_close_awaits_owned_browser(self):
+        browser = AsyncMock()
+        await Sources(browser1111=browser).close()
+        browser.close.assert_awaited_once_with()
 
 
 class RouteChecks(unittest.TestCase):
@@ -872,6 +1283,15 @@ class RouteChecks(unittest.TestCase):
         result = self.client.post('/api/jobs/' + ident + '/details').json()
         self.assertEqual(result['status'], 'unsupported')
         self.browser.call.assert_not_awaited()
+
+    def test_disabling_1111_closes_owned_browser(self):
+        self.configure(True)
+        reply = self.client.put(
+            '/api/admin/settings', json={'source_1111_enabled': False},
+            headers={'X-CSRF-Token': security.csrf(self.admin_token)})
+        self.assertEqual(reply.status_code, 200)
+        self.assertFalse(reply.json()['source_1111_enabled'])
+        self.browser.close.assert_awaited_once_with()
 
     def test_settings_false_default_and_saved_switch_survive_restart(self):
         self.assertFalse(self.client.get('/api/admin/settings').json()['source_1111_enabled'])

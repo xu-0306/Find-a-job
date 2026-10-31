@@ -23,6 +23,9 @@ class WorkspaceChecks(unittest.TestCase):
         owner = self
 
         class Source:
+            async def close(self):
+                pass
+
             async def search(self, arguments, *, continuation=None, exclude_ids=None, exclude_companies=None, deadline=None, finish_reserve=0):
                 owner.search_calls.append((continuation, exclude_ids))
                 owner.company_exclusions.append(exclude_companies)

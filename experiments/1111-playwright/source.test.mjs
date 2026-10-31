@@ -56,6 +56,8 @@ async function fixture(input, options = {}) {
   });
   // DOM correctness must not depend on sub-second CI browser startup.
   const result = await runSource(wrapper, input, 5000);
+  assert.equal(closed, false);
+  await wrapper.close();
   assert.equal(closed, true);
   return { result, requests, catalogueRequests, pageCount };
 }
@@ -160,7 +162,7 @@ test('budget returns two complete regions and defers every later region without 
     request: { get: async (url, options) => { timeouts.push(options.timeout); return { ok: () => true, json: async () => catalogue }; } } };
   const result = await runSource(context, { ...search, page: 1, budget_ms: 100000,
     area_names: ['台北市', '台南市', '測試縣', '台南市中正區'] }, 30000, () => elapsed);
-  assert.equal(closed, true); assert.equal(requests.length, 2);
+  assert.equal(closed, false); assert.equal(requests.length, 2);
   assert.deepEqual(result.areas.map(area => area.status), ['ok', 'ok', 'time_limited', 'time_limited']);
   for (const area of result.areas.slice(0, 2)) {
     assert.deepEqual(area.jobs.map(job => job.id), ['501']);
@@ -180,14 +182,14 @@ test('DOM wait uses the remaining area budget after a slow navigation', async ()
     evaluate: () => { reads++; return new Promise(() => {}); } };
   const result = await runSource({ pages: () => [page], close: async () => { closed = true; } },
     { ...search, budget_ms: SINGLE_AREA_MS }, 30000, () => elapsed);
-  assert.equal(result.status, 'failed'); assert.equal(closed, true); assert.equal(reads, 2);
+  assert.equal(result.status, 'failed'); assert.equal(closed, false); assert.equal(reads, 2);
 }, { timeout: 1000 });
 
 test('invalid stdin returns one safe JSON line before launching Chrome', () => {
   for (const raw of ['not-json', JSON.stringify({ action: 'run', code: 'private' }), 'x'.repeat(32769)]) {
-    const child = spawnSync(process.execPath, ['source.mjs'], { cwd: new URL('.', import.meta.url), input: raw, encoding: 'utf8' });
+    const child = spawnSync(process.execPath, ['source.mjs', '--serve'], { cwd: new URL('.', import.meta.url), input: raw, encoding: 'utf8' });
     assert.equal(child.status, 0); assert.equal(child.stderr, ''); assert.equal(child.stdout.trim().split('\n').length, 1);
-    assert.deepEqual(JSON.parse(child.stdout), { status: 'failed', message: '1111 查詢參數不正確。' });
+    assert.equal(JSON.parse(child.stdout).id, null); assert.equal(JSON.parse(child.stdout).result.status, 'failed');
   }
 });
 
@@ -227,7 +229,7 @@ async function mockSearchMetadata(fields, apiHits, { preview = false } = {}) {
   };
   const result = await runSource({ pages: () => [page], close: async () => { closed = true; } },
     { ...search, page: 1 }, 1000);
-  assert.equal(closed, true); assert.equal(onResponse, undefined);
+  assert.equal(closed, false); assert.equal(onResponse, undefined);
   return result;
 }
 

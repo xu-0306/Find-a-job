@@ -5,9 +5,8 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "probe": "node probe.mjs",
-    "source": "node source.mjs",
     "session": "node session.mjs",
-    "test": "node --test --test-concurrency=1 probe.test.mjs source.test.mjs source.budget.test.mjs session.test.mjs"
+    "test": "node --test --test-concurrency=1 probe.test.mjs source.test.mjs source.budget.test.mjs session.test.mjs serve.test.mjs"
   },
   "dependencies": {
     "patchright": "1.63.0",

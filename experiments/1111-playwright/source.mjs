@@ -100,7 +100,6 @@ export async function runSource(context, input, timeoutMs = 30000, now = () => p
     page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(operationTimeout());
     page.setDefaultNavigationTimeout(operationTimeout());
-    await page.bringToFront();
     if (input.action === 'search') {
       const results = [];
       let blocked = false;
@@ -178,47 +177,129 @@ export async function runSource(context, input, timeoutMs = 30000, now = () => p
     return await failure();
   } finally {
     if (onResponse) page?.off('response', onResponse);
-    await context.close().catch(() => {});
   }
 }
 
-async function main() {
-  let input;
-  try {
-    process.stdin.setEncoding('utf8');
-    let raw = '';
-    for await (const chunk of process.stdin) {
-      raw += chunk;
-      if (Buffer.byteLength(raw, 'utf8') > 32768) throw new Error('oversized input');
+// One isolated browser belongs to this server, never to an individual request.
+export async function serve({ stdin = process.stdin, stdout = process.stdout, signals = process,
+    loadChromium = async () => (await import('patchright')).chromium, now = () => performance.now() } = {}) {
+  let context, launching;
+  let invalid = false, closing = false;
+  let pending = Promise.resolve();
+  let raw = Buffer.alloc(0), oversized = false;
+  const invalidInput = () => ({ status: 'failed', message: '1111 \u67e5\u8a62\u53c3\u6578\u4e0d\u6b63\u78ba\u3002' });
+  const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+  const bounded = async (work, milliseconds) => {
+    let timer;
+    try {
+      await Promise.race([work, new Promise(resolve => { timer = setTimeout(resolve, milliseconds); })]);
+    } finally { clearTimeout(timer); }
+  };
+  async function closeContext() {
+    const owned = context;
+    context = undefined;
+    if (owned) await owned.close().catch(() => { /* Never expose raw browser diagnostics. */ });
+  }
+  async function request(line, tooLong) {
+    if (closing) return;
+    let id = null, input, result;
+    try {
+      const envelope = JSON.parse(line.toString('utf8'));
+      if (validId(envelope?.id)) id = envelope.id;
+      if (tooLong || id === null) throw new Error('invalid envelope');
+      input = envelope.input;
+      validateInput(input);
+    } catch { result = invalidInput(); }
+    if (!result) {
+      const started = now();
+      const cold = !context || invalid;
+      let starting = cold;
+      try {
+        if (cold) {
+          await closeContext();
+          invalid = false;
+          launching = (async () => {
+            const chromium = await loadChromium();
+            // Empty profile isolates this worker; no personal cookies, challenge clicks or retries.
+            context = await chromium.launchPersistentContext('', { channel: 'chrome', headless: false, viewport: null, timeout: LAUNCH_TIMEOUT_MS });
+            const owned = context;
+            const invalidate = () => { if (context === owned) invalid = true; };
+            owned.on?.('close', invalidate);
+            owned.browser?.()?.on?.('disconnected', invalidate);
+          })();
+          try { await launching; } finally { launching = undefined; }
+        }
+        starting = false;
+        let page = context.pages()[0];
+        if (!page || page.isClosed()) page = await context.newPage();
+        if (cold) await page.bringToFront();
+        const budget = workerBudget(input) - (cold ? now() - started : 0);
+        result = await runSource(context, { ...input, budget_ms: Math.max(1, Math.floor(budget)) }, 30000, now);
+        if (invalid) result = failed();
+        if (result.status === 'blocked' || result.areas?.some(area => area.status === 'blocked')) {
+          await page.bringToFront().catch(() => { /* Focus is best effort; preserve the diagnostic. */ });
+        }
+      } catch {
+        invalid = true;
+        result = starting ? unsupported('1111 實驗來源需要已安裝 Chrome 與 Patchright 的桌面環境。') : failed();
+      }
     }
-    input = JSON.parse(raw);
-    validateInput(input);
-  } catch {
-    console.log(JSON.stringify({ status: 'failed', message: '1111 查詢參數不正確。' }));
-    return;
+    if (!closing) await new Promise((resolve, reject) => {
+      stdout.write(JSON.stringify({ id, result }) + '\n', error => error ? reject(error) : resolve());
+    });
   }
-  console.log(JSON.stringify(await runWorker(input)));
-}
-
-export async function runWorker(input, { loadChromium = async () => (await import('patchright')).chromium,
-    now = () => performance.now() } = {}) {
-  const started = now();
-  let context;
-  let result;
+  function enqueue() {
+    const line = raw, tooLong = oversized;
+    raw = Buffer.alloc(0); oversized = false;
+    pending = pending.then(() => request(line, tooLong));
+    // Attach the rejection handler immediately; transport errors end service safely.
+    pending.catch(failTransport);
+  }
+  function receive(chunk) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let start = 0;
+    for (let index = 0; index <= bytes.length; index++) {
+      if (index < bytes.length && bytes[index] !== 10) continue;
+      const part = bytes.subarray(start, index);
+      if (raw.length + part.length + 1 > 32768) oversized = true;
+      if (!oversized) raw = Buffer.concat([raw, part]);
+      if (index < bytes.length) enqueue();
+      start = index + 1;
+    }
+  }
+  let finish, failTransport;
+  const ended = new Promise((resolve, reject) => { finish = resolve; failTransport = reject; });
+  const eof = () => { if (raw.length || oversized) enqueue(); finish(true); };
+  const signal = () => { closing = true; finish(false); };
+  stdin.on('data', receive);
+  stdin.once('end', eof);
+  stdin.once('error', failTransport);
+  signals.on('SIGTERM', signal);
+  signals.on('SIGINT', signal);
   try {
-    const chromium = await loadChromium();
-    // Empty profile creates an isolated temporary session; no challenge clicks or retries.
-    context = await chromium.launchPersistentContext('', { channel: 'chrome', headless: false, viewport: null, timeout: LAUNCH_TIMEOUT_MS });
-    const budget = workerBudget(input);
-    result = await runSource(context, { ...input, budget_ms: Math.max(1, Math.floor(budget - (now() - started))) }, 30000, now);
-  } catch {
-    result = unsupported('1111 實驗來源需要已安裝 Chrome 與 Patchright 的桌面環境。');
+    await ended;
+    // EOF normally drains queued requests; a dead parent cannot leave an active browser indefinitely.
+    await bounded((async () => {
+      await pending;
+      closing = true;
+      await closeContext();
+    })(), WORKER_GRACE_MS);
   } finally {
-    await context?.close().catch(() => {});
+    closing = true;
+    stdin.off('data', receive);
+    stdin.off('end', eof);
+    stdin.off('error', failTransport);
+    signals.off('SIGTERM', signal);
+    signals.off('SIGINT', signal);
+    await bounded((async () => { if (launching) await launching; await closeContext(); })(), WORKER_GRACE_MS);
   }
-  return result;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => { console.log(JSON.stringify(failed())); });
+  if (process.argv[2] === '--serve') {
+    serve().then(() => process.exit(0), error => { console.error(error); process.exit(1); });
+  } else {
+    console.error('Usage: node source.mjs --serve');
+    process.exitCode = 1;
+  }
 }

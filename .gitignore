@@ -83,6 +83,7 @@
 !/experiments/1111-playwright/source.mjs
 !/experiments/1111-playwright/source.test.mjs
 !/experiments/1111-playwright/source.budget.test.mjs
+!/experiments/1111-playwright/serve.test.mjs
 !/experiments/1111-playwright/README.md
 
 # Never publish generated data or credentials, even under an allowed directory.
