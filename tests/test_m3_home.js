@@ -51,13 +51,16 @@ class FakeElement {
   }
   click() { return this.disabled ? Promise.resolve([]) : this.dispatch("click"); }
   reset() { this.value = ""; for (const child of this.children) child.reset(); }
-  focus() { this.focused = true; this.dispatchEvent({type: "focus", currentTarget: this}); }
+  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; this.focused = true; this.dispatchEvent({type: "focus", currentTarget: this}); }
   select() { this.selected = true; this.selectCount = (this.selectCount || 0) + 1; this.selectionStart = 0; this.selectionEnd = this.value.length; }
   scrollIntoView() { this.scrolled = true; }
-  getAttribute(name) { return this[name]; }
+  getAttribute(name) { return name === "open" ? this.open ? "" : null : this[name]; }
   removeAttribute(name) { delete this[name]; }
   dispatchEvent(event) { for (const listener of this.listeners[event.type] || []) listener(event); }
-  closest(selector) { return selector === ".job-card" && this.className === "job-card item" ? this : this.parentElement?.closest(selector); }
+  closest(selector) {
+    if (selector === "details.other-candidates" && this.tagName === "DETAILS" && (this.className || "").split(" ").includes("other-candidates")) return this;
+    return selector === ".job-card" && this.className === "job-card item" ? this : this.parentElement?.closest(selector);
+  }
   remove() { if (!this.parentElement) return; const parent = this.parentElement; parent.children.splice(parent.children.indexOf(this), 1); this.parentElement = null; }
   contains(element) { return element === this || this.children.some(child => child.contains(element)); }
   get nextElementSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) + 1]; }
@@ -185,7 +188,7 @@ function keyForTest() {
     body: new FakeElement("body"),
     documentElement: {dataset: {}},
     addEventListener(type, listener) { (documentListeners[type] ||= []).push(listener); },
-    createElement: tag => new FakeElement(tag),
+    createElement: tag => Object.assign(new FakeElement(tag), {ownerDocument: document}),
     createElementNS: (_namespace, tag) => new FakeElement(tag),
     createDocumentFragment: () => new FakeElement("fragment"),
     querySelector(selector) {
@@ -203,6 +206,7 @@ function keyForTest() {
     },
     querySelectorAll: selector => selector === "[data-chat-draft]" ? [quickCard] : selector === "[data-page]" ? navButtons : selector === ".job-card" ? [...elements.values()].flatMap(root => all(root, item => item.className === "job-card item")) : [],
   };
+  for (const element of [...elements.values(), input, submit]) element.ownerDocument = document;
   const listeners = Object.create(null);
   const clock = new FakeClock();
   const key = keyForTest();
@@ -2321,7 +2325,7 @@ async function testConversationWorkingListConverges() {
   const job = (id, company) => ({id, source: "104", title: `T${id}`, company_name: company, url: `https://jobs.example/${id}`});
   const mainCards = () => list.children.filter(item => item.className === "job-card item");
   const featuredIds = () => mainCards().filter(card => all(card, item => item.className === "job-featured").length).map(card => card.dataset.jobId);
-  const removedSection = () => list.children.find(item => item.className === "removed-jobs");
+  const removedSection = () => list.children.find(item => item.tagName === "DETAILS" && item.children[0]?.textContent.startsWith("已移出 "));
   const first = home.context.chatMessage("assistant", "", "running");
   home.context.renderChatEvent(first, "jobs", {search_id: "w-1", criteria: {keyword: "研發替代役"}, items: [job("w1", "工研院"), job("w2", "光寶"), job("w3", "直得")]});
   home.context.renderChatEvent(first, "recommendations", {items: [{job_id: "w1", reasons: ["舊理由"]}, {job_id: "w2"}]});
@@ -2337,9 +2341,10 @@ async function testConversationWorkingListConverges() {
   const removed = removedSection();
   assert.ok(removed, "removed jobs stay reachable");
   assert.equal(removed.tagName, "DETAILS"); assert.equal(removed.open, false, "the removed section starts collapsed");
+  assert.equal(removed.className, "removed-jobs", "removed jobs never receive the other-candidates opacity override");
   assert.equal(removed.children[0].textContent, "已移出 2");
   assert.match(removed.textContent, /公司已排除/); assert.match(removed.textContent, /移出原因：需要外派/);
-  assert.equal(home.elements.get("search-results-title").textContent, "這段對話的職缺（2 筆）");
+  assert.equal(home.elements.get("search-results-title").textContent, "精選 2 · 其他候選 0");
 
   // Recommending a removed job again brings it back.
   home.context.renderChatEvent(second, "recommendations", {items: [{job_id: "w3"}]});
@@ -2366,7 +2371,8 @@ async function testHistoryPagesUseTheServerWorkingList() {
   const featuredIds = () => list.children.filter(item => item.className === "job-card item")
     .filter(card => all(card, item => item.className === "job-featured").length).map(card => card.dataset.jobId);
   const assistant = events => ({role: "assistant", content: {text: "", status: "completed", events}});
-  const cardIds = () => list.children.filter(item => item.className === "job-card item").map(card => card.dataset.jobId);
+  const cardIds = () => list.children.flatMap(item => item.tagName === "DETAILS" && item.children[0]?.textContent.startsWith("其他候選 ") ? item.children.slice(1) : [item])
+    .filter(item => item.className === "job-card item").map(card => card.dataset.jobId);
   const search = {search_id: "h-1", criteria: {keyword: "品管"}, items: [job("h1"), job("h2"), job("h3")]};
   const state = {shortlist: ["h2"], removed: [{job_id: "h1", by: "agent", reason: "外派"}]};
   // The newest page holds no jobs event: the search happened many turns earlier.
@@ -3266,12 +3272,200 @@ async function testResumeReviewCardStreamingHistoryAndIncomplete() {
   assert.deepEqual([...home.storage.values], storageBefore, "copy and download save no new browser data");
 }
 
+async function testOtherCandidatesDisclosure() {
+  const home = createContext(); await settle();
+  const list = home.elements.get("search-results-list");
+  const panelTitle = home.elements.get("search-results-title");
+  const job = id => ({id, source: "104", title: id, url: `https://jobs.example/${id}`});
+  const message = home.context.chatMessage("assistant", "", "running");
+  const disclosure = () => list.children.find(item => item.tagName === "DETAILS" && item.children[0]?.textContent.startsWith("其他候選 "));
+  const directCards = () => list.children.filter(item => item.className === "job-card item");
+  home.context.renderChatEvent(message, "jobs", {search_id: "disclosure-empty", items: []});
+  home.context.renderChatEvent(message, "jobs", {search_id: "disclosure", total_count: 99, items: [job("a"), job("b"), job("c")]});
+  assert.equal(panelTitle.textContent, "這段對話的職缺（3 筆）");
+  assert.equal(disclosure(), undefined, "without featured jobs all candidates stay outside details");
+  assert.deepEqual(directCards().map(card => card.dataset.jobId), ["a", "b", "c"]);
+  home.context.renderChatEvent(message, "recommendations", {items: [{job_id: "b"}]});
+  assert.equal(panelTitle.textContent, "精選 1 · 其他候選 2");
+  assert.deepEqual(directCards().map(card => card.dataset.jobId), ["b"]);
+  assert.equal(disclosure().className, "removed-jobs other-candidates", "reuse the disclosure style with the candidate opacity modifier");
+  const css = fs.readFileSync(path.join(__dirname, "..", "app", "static", "style.css"), "utf8");
+  assert.match(css, /\.removed-jobs>summary\{min-height:44px;display:flex;align-items:center;[^}]*\}/);
+  assert.match(css, /\.removed-jobs>summary::before\{content:"▸";content:"▸"\/"";color:var\(--muted\);margin-right:6px\}/);
+  assert.match(css, /\.removed-jobs\[open\]>summary::before\{content:"▾";content:"▾"\/"";\}/);
+  assert.match(css, /\.removed-jobs\[open\]\{display:grid;grid-template-columns:repeat\(auto-fill,minmax\(min\(320px,100%\),1fr\)\);gap:10px\}/);
+  assert.match(css, /\.removed-jobs>summary\{grid-column:1\/-1\}/);
+  assert.match(css, /\.removed-jobs \.job-card\{opacity:\.75\}\.removed-jobs\.other-candidates \.job-card:not\(\.is-not-interested\)\{opacity:1\}/);
+  assert.ok(css.includes('.removed-jobs.other-candidates .job-card:not(.is-not-interested){opacity:1}') && css.includes('.job-card.is-not-interested{opacity:.65}'), "the candidate override excludes dismissed cards and retains their dimming rule");
+  assert.ok(css.includes('content:"▸";content:"▸"/"";'), "collapsed marker keeps the fallback and empty alternative text");
+  assert.ok(css.includes('content:"▾";content:"▾"/"";'), "expanded marker keeps the fallback and empty alternative text");
+  assert.equal(disclosure().children[0].tagName, "SUMMARY");
+  assert.equal(disclosure().children[0].textContent, "其他候選 2");
+  assert.equal(disclosure().open, false);
+  assert.equal(disclosure().getAttribute("open"), null, "collapsed details have no open attribute");
+  assert.deepEqual(disclosure().children.slice(1).map(card => card.dataset.jobId), ["a", "c"]);
+  assert.equal(home.elements.get("results-count-badge").textContent, "(3)");
+  assert.equal(list.children.at(-1).className, "continue-footer");
+  const old = disclosure(); old.open = true; await old.dispatch("toggle");
+  home.context.renderSearchResultsPanel();
+  assert.notEqual(disclosure(), old);
+  assert.equal(disclosure().open, true, "replaceChildren preserves the expanded state");
+  old.open = false; await old.dispatch("toggle");
+  home.context.renderSearchResultsPanel();
+  assert.equal(disclosure().open, true, "a queued toggle from a detached section cannot overwrite the current state");
+  await home.context.loadMessages(false, "conversation-1");
+  home.context.renderChatEvent(message, "jobs", {search_id: "disclosure-empty", items: []});
+  home.context.renderChatEvent(message, "jobs", {search_id: "disclosure", items: [job("a"), job("b"), job("c")]});
+  home.context.renderChatEvent(message, "recommendations", {items: [{job_id: "b"}]});
+  assert.equal(disclosure().open, true, "refreshing the same conversation keeps the preference");
+  disclosure().open = false; await disclosure().dispatch("toggle");
+  home.context.renderSearchResultsPanel(); assert.equal(disclosure().open, false);
+  disclosure().open = true; await disclosure().dispatch("toggle");
+  const salary = all(home.elements.get("search-results-controls"), item => item.tagName === "INPUT")[0];
+  salary.checked = true; await salary.dispatch("change");
+  assert.equal(panelTitle.textContent, "這段對話的職缺（3 筆）", "an empty filter retains the existing no-featured title");
+  salary.checked = false; await salary.dispatch("change");
+  assert.equal(panelTitle.textContent, "精選 1 · 其他候選 2");
+  assert.equal(disclosure().open, true);
+  await home.context.loadMessages(false, "conversation-other");
+  home.context.renderChatEvent(message, "jobs", {search_id: "disclosure-empty", items: []});
+  home.context.renderChatEvent(home.context.chatMessage("assistant", "", "running"), "jobs", {search_id: "other", items: [job("d"), job("e")]});
+  home.context.renderChatEvent(home.context.chatMessage("assistant", "", "running"), "recommendations", {items: [{job_id: "d"}]});
+  assert.equal(disclosure().open, false, "switching conversations resets to collapsed");
+  assert.equal(panelTitle.textContent, "精選 1 · 其他候選 1");
+  const many = Array.from({length: 140}, (_, index) => job(`candidate-${index}`));
+  home.context.renderChatEvent(message, "jobs", {search_id: "many", items: many});
+  home.context.applyConversationWork({shortlist: many.slice(0, 4).map(item => item.id), removed: []});
+  home.context.renderSearchResultsPanel();
+  assert.equal(directCards().length, 4);
+  assert.equal(disclosure().children.length - 1, 138, "all other candidates, including the previous batch, remain reachable");
+  assert.equal(panelTitle.textContent, "精選 4 · 其他候選 138");
+}
+
+async function testFocusJobExpandsOtherCandidatesBeforeScrolling() {
+  const home = createContext(); await settle();
+  const panel = home.elements.get("search-results-panel");
+  const list = home.elements.get("search-results-list");
+  panel.querySelectorAll = selector => selector === ".job-card" ? all(list, item => item.className === "job-card item") : [];
+  const featured = {id: "featured", source: "104", title: "Featured", url: "https://jobs.example/featured"};
+  const candidate = {id: "candidate", source: "104", title: "Candidate", url: "https://jobs.example/candidate"};
+  const message = home.context.chatMessage("assistant", "", "running");
+  home.context.renderChatEvent(message, "jobs", {search_id: "focus-disclosure", items: [featured, candidate]});
+  home.context.renderChatEvent(message, "recommendations", {items: [{job_id: featured.id}]});
+  const disclosure = () => list.children.find(item => item.tagName === "DETAILS" && item.className.split(" ").includes("other-candidates"));
+  const section = disclosure();
+  const calls = [];
+  let open = section.open;
+  Object.defineProperty(section, "open", {get: () => open, set: value => { open = value; calls.push(["open", value]); }});
+  const cards = panel.querySelectorAll(".job-card");
+  cards.find(card => card.dataset.jobId === featured.id).scrollIntoView = () => calls.push(["scroll-featured", section.open]);
+  cards.find(card => card.dataset.jobId === candidate.id).scrollIntoView = () => calls.push(["scroll-candidate", section.open]);
+  assert.equal(section.open, false);
+  home.context.focusJobByUrl(featured.url);
+  assert.equal(section.open, false, "focusing a featured job keeps other candidates collapsed");
+  assert.equal(vm.runInContext("otherCandidatesOpen", home.context), false);
+  assert.deepEqual(calls, [["scroll-featured", false]]);
+  calls.length = 0;
+  home.context.focusJobByUrl(candidate.url);
+  assert.equal(section.open, true);
+  assert.equal(vm.runInContext("otherCandidatesOpen", home.context), true);
+  assert.deepEqual(calls, [["open", true], ["scroll-candidate", true]], "expand synchronously before scrolling to the candidate");
+  assert.equal(disclosure(), section, "focusing the candidate does not replace the results");
+  home.context.renderSearchResultsPanel();
+  assert.notEqual(disclosure(), section);
+  assert.equal(disclosure().open, true, "the next render keeps the candidate visible");
+  assert.equal(vm.runInContext("otherCandidatesOpen", home.context), true);
+}
+
+async function testFirstResultsPreserveReadingAndFocus() {
+  for (const [width, atBottom] of [[1710, true], [1280, false], [1000, false], [375, true]]) {
+    const home = createContext(); await settle();
+    home.context.window.matchMedia = query => ({matches: query === "(min-width:1001px)" && width > 1000});
+    home.context.updateSearchState({search_id: "reading", items: [{id: "read", source: "104", title: "Read"}]}, null, {render: false});
+    const panel = home.elements.get("search-results-panel"); panel.hidden = true;
+    const viewport = home.elements.get("chat-transcript");
+    viewport.clientHeight = 300; viewport.scrollTop = atBottom ? 900 : 350;
+    Object.defineProperty(viewport, "scrollHeight", {get: () => panel.hidden ? 1200 : 2200});
+    let measurements = 0;
+    viewport.getBoundingClientRect = () => { measurements++; return {top: panel.hidden ? 100 : 120}; };
+    const older = new FakeElement(); const anchor = new FakeElement();
+    older.getBoundingClientRect = () => ({top: -200, bottom: -20});
+    anchor.getBoundingClientRect = () => {
+      const top = (panel.hidden ? 410 : 770) - viewport.scrollTop;
+      return {top, bottom: top + 500};
+    };
+    home.elements.get("chat-list").replaceChildren(older, anchor);
+    home.state.input.focus();
+    const active = home.context.document.activeElement;
+    const status = home.elements.get("chat-status"); status.textContent = "Searching"; status.dataset.state = "pending";
+    home.context.renderSearchResultsPanel();
+    assert.equal(panel.hidden, false);
+    assert.equal(home.context.document.activeElement, active, "showing results never takes focus from the draft");
+    assert.equal(status.textContent, "Searching", "existing live-region progress remains intact");
+    assert.equal(status.dataset.state, "pending");
+    if (width > 1000) {
+      assert.equal(viewport.scrollTop, atBottom ? 2200 : 690, "desktop follows the bottom or restores the same message and offset");
+      if (!atBottom) assert.equal(anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top, -40);
+      assert.equal(home.elements.get("latest-message").hidden, atBottom);
+    } else {
+      assert.equal(viewport.scrollTop, atBottom ? 900 : 350, "mobile tab behavior is unchanged");
+      assert.equal(measurements, 0, "mobile does not measure or restore desktop anchors");
+      assert.equal(home.elements.get("chat").classList.contains("results-view"), false);
+    }
+    const previousMeasurements = measurements;
+    viewport.scrollTop = 175;
+    home.context.renderSearchResultsPanel();
+    assert.equal(viewport.scrollTop, 175, "later calls do not repeat the transition");
+    assert.equal(measurements, previousMeasurements);
+    assert.equal(home.context.document.activeElement, active);
+  }
+}
+
+function testComposerHelpAndQuickGrid() {
+  const form = homeHtml.match(/<form id="chat-form"[\s\S]*?<\/form>/)[0];
+  const transcript = homeHtml.slice(homeHtml.indexOf('id="chat-transcript"'), homeHtml.indexOf('id="latest-message"'));
+  assert.doesNotMatch(transcript, /composer-help|resume-help/);
+  assert.match(form, /<div class="composer-meta"><details class="composer-help"><summary>附件限制與資料說明<\/summary><p id="resume-help"/);
+  assert.match(form, /id="resume-file"[^>]*aria-describedby="resume-help"/);
+  assert.match(form, /<textarea[^>]*aria-describedby="resume-help"/);
+  assert.equal((homeHtml.match(/id="resume-help"/g) || []).length, 1);
+  assert.match(form, /id="resume-help"[^>]*tabindex="0"/, "the bounded help text can be scrolled with a keyboard");
+  const promise = "只有在你確認後，才會變更每日搜尋條件。";
+  const footnote = form.match(/<p class="composer-footnote">([\s\S]*?)<\/p>/)[1];
+  const helpText = form.match(/<p id="resume-help"[^>]*>([\s\S]*?)<\/p>/)[1];
+  assert.ok(footnote.startsWith(promise), "the confirmation promise is first in the always-visible footnote");
+  assert.match(footnote, /。<span class="composer-reassurance">[^<]+<\/span><span id="chat-count" class="hint" aria-live="off">0\/10000<\/span>$/);
+  assert.ok(!helpText.includes(promise), "the help body does not repeat the confirmation promise");
+  assert.equal(form.split(promise).length - 1, 1);
+  assert.match(form, /<\/p><\/details><\/div><p class="composer-footnote">/, "footnote follows the separate help row outside collapsed details");
+  const css = fs.readFileSync(path.join(__dirname, "..", "app", "static", "style.css"), "utf8");
+  assert.match(css, /\.composer-meta\{display:grid;grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(css, /\.composer-help\{min-width:0\}/);
+  assert.match(css, /\.composer-help summary\{[^}]*white-space:nowrap/);
+  assert.match(css, /summary\{cursor:pointer;min-height:44px;padding:8px 0\}/);
+  assert.match(css, /@media\(max-width:600px\)\{[^\n]*\.composer-footnote \.composer-reassurance\{display:none\}/);
+  assert.match(css, /@media\(max-height:600px\)\{\.home:has\(#chat:not\(\[hidden\]\)\) \.chat-heading p,\.home:has\(#chat:not\(\[hidden\]\)\) \.composer-footnote\{display:none\}/);
+  assert.doesNotMatch(css, /\.composer-meta>\.composer-footnote/);
+  assert.match(css, /\.composer-help>p\{max-height:20dvh;overflow-y:auto;overscroll-behavior:contain\}/);
+  assert.match(css, /@media\(max-height:600px\)\{[^\n]*\.composer-help summary\{padding:0\}/);
+  assert.match(css, /\.quick-grid\{display:grid;grid-template-columns:repeat\(4,minmax\(0,1fr\)\);gap:10px\}/);
+  assert.match(css, /\.quick-card:last-child:nth-child\(4n\+1\)\{grid-column:1\/-1\}/);
+  assert.match(css, /@media\(max-width:1100px\)\{\.quick-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}\.quick-card:last-child:nth-child\(odd\)\{grid-column:1\/-1\}/);
+  assert.match(css, /@media\(max-width:360px\)\{\.quick-grid\{grid-template-columns:1fr\}/);
+  assert.doesNotMatch(css, /nth-child\(9\)/);
+}
+
 function testFullWidthChatDesktopScope() {
   const css = fs.readFileSync(path.join(__dirname, "..", "app", "static", "style.css"), "utf8");
   const desktop = css.split("@media(min-width:1001px){")[1].split(/\r?\n\}/)[0];
   assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel\{[^}]*grid-template-columns:minmax\(0,1fr\)/);
   assert.match(desktop, /#user-panel:has\(#search-results-panel\[hidden\]\) #chat\{grid-column:1\/-1\}/);
-  assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) #chat-transcript,\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) \.chat-composer\{width:100%;max-width:1400px;margin-inline:auto\}/);
+  const singleColumn = ".home:has(#chat:not([hidden])) #user-panel:has(#search-results-panel[hidden]) ";
+  const aligned = ["#chat-transcript", ".chat-composer", ".chat-heading", ".chat-status-panel"].map(selector => singleColumn + selector).join(",");
+  assert.ok(desktop.includes(aligned + "{width:100%;max-width:1400px;margin-inline:auto}"), "the same single-column rule aligns all four elements");
+  assert.ok(desktop.includes(singleColumn + "#latest-message{right:max(12px,calc((100% - 1400px)/2 + 12px))}"));
+  assert.match(css, /#latest-message\{position:absolute;right:12px;bottom:12px;/);
+  assert.match(css, /#chat-transcript\{flex:1;min-height:0;overflow-y:auto;/);
   assert.match(desktop, /\.home:has\(#chat:not\(\[hidden\]\)\) #user-panel:has\(#search-results-panel\[hidden\]\) \.chat-message:not\(\.chat-user\) \.chat-bubble\{max-width:min\(100%,1100px\)\}/);
   assert.match(css, /(?:^|\})\.chat-bubble\{grid-column:2;width:fit-content;max-width:min\(100%,80ch\);/);
   assert.match(desktop, /#user-panel:has\(#search-results-panel:not\(\[hidden\]\)\)\{grid-template-columns:var\(--chat-w,var\(--chat-col\)\) 14px minmax\(0,1fr\);column-gap:0\}/);
@@ -3396,6 +3590,10 @@ process.on("exit", () => {
   testChatHeadingMarkupMovesLatestButtonOutOfHeading();
   testSearchTitleIsNotRepeatedWhenUnlabelled();
   await testExcludedCompanyChipsAndRemovedCounts();
+  await testOtherCandidatesDisclosure();
+  await testFocusJobExpandsOtherCandidatesBeforeScrolling();
+  await testFirstResultsPreserveReadingAndFocus();
+  testComposerHelpAndQuickGrid();
   await testConversationWorkingListConverges();
   await testHistoryPagesUseTheServerWorkingList();
   await testUnrelatedEditKeepsRecommendationReasons();
@@ -3412,7 +3610,7 @@ process.on("exit", () => {
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
   testRunCompleted = true;
-  console.log("test_m3_home: 79 checks passed");
+  console.log("test_m3_home: 83 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

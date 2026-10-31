@@ -88,6 +88,7 @@ let activeSearchState = null;
 // null keeps the result panel on the conversation-wide aggregate. Selecting a
 // batch stores that search id without changing which search receives events.
 let resultSearchId = null;
+let otherCandidatesOpen = false;
 let resultSort = "recommended";
 const resultSources = new Set();
 let salaryOnly = false;
@@ -665,7 +666,19 @@ function resultControl(label, pressed, callback) {
 }
 function showSearchPanel() {
   const panel = $("#search-results-panel");
-  if (panel) panel.hidden = Boolean($("#chat")?.hidden);
+  if (!panel) return;
+  const hidden = Boolean($("#chat")?.hidden);
+  const preserveReading = panel.hidden && !hidden && window.matchMedia("(min-width:1001px)").matches;
+  const viewport = $("#chat-transcript");
+  const follow = preserveReading && chatAtBottom();
+  const top = preserveReading ? viewport.getBoundingClientRect().top : 0;
+  const anchor = preserveReading && !follow
+    ? [...$("#chat-list").children].find(message => message.getBoundingClientRect().bottom > top) : null;
+  const offset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  panel.hidden = hidden;
+  if (follow) scrollChatToBottom();
+  else if (anchor) viewport.scrollTop += anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - offset;
+  if (preserveReading) updateLatestMessage();
 }
 function setResultView(view) {
   resultView = view === "results" ? "results" : "chat";
@@ -718,9 +731,13 @@ function renderSearchResultsPanel() {
   showSearchPanel();
   panel.dataset.searchId = state.id;
   const title = $("#search-results-title");
-  if (title) title.textContent = state.isAggregate ? `這段對話的職缺（${availableJobCount(state)} 筆）` : ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
   const summary = $("#search-results-summary");
   const jobs = resultJobs(state);
+  const featured = jobs.filter(isFeaturedJob);
+  const rest = jobs.filter(job => !featured.includes(job));
+  if (title) title.textContent = state.isAggregate
+    ? featured.length ? `精選 ${featured.length} · 其他候選 ${rest.length}` : `這段對話的職缺（${availableJobCount(state)} 筆）`
+    : ["本次搜尋", searchLabel(state)].filter(Boolean).join(" · ");
   const counts = updateResultCounts(state, jobs);
   if (summary) summary.textContent = counts.short;
   const fullCounts = $("#search-results-counts");
@@ -803,15 +820,22 @@ function renderSearchResultsPanel() {
     if (state.canContinue || state.jobs.size) list.append(continueFooter(state, counts.total));
     return;
   }
-  const featured = jobs.filter(isFeaturedJob);
-  const rest = jobs.filter(job => !featured.includes(job));
   if (featured.length) {
     list.append(node("h3", `精選 ${featured.length}`));
     for (const job of featured) list.append(resultCardJob(state, job));
   }
   if (rest.length) {
-    list.append(node("h3", `其他候選 ${rest.length}`));
-    for (const job of rest) list.append(resultCardJob(state, job));
+    if (featured.length) {
+      const section = node("details", undefined, "removed-jobs other-candidates");
+      section.open = otherCandidatesOpen;
+      section.append(node("summary", `其他候選 ${rest.length}`));
+      section.addEventListener("toggle", () => { if (section.parentElement === list) otherCandidatesOpen = section.open; });
+      for (const job of rest) section.append(resultCardJob(state, job));
+      list.append(section);
+    } else {
+      list.append(node("h3", `其他候選 ${rest.length}`));
+      for (const job of rest) list.append(resultCardJob(state, job));
+    }
   }
   if (removed.length) list.append(removedSection());
   list.append(continueFooter(state, counts.total));
@@ -915,6 +939,8 @@ function focusJob(job, state = activeSearchState) {
   const cards = panel ? [...(panel.querySelectorAll?.(".job-card") || [])] : [];
   const target = cards.find(card => String(card.dataset.jobId) === id);
   if (target) {
+    const section = target.closest("details.other-candidates");
+    if (section && !section.open) { section.open = true; otherCandidatesOpen = true; }
     target.scrollIntoView?.({block: "center"}); target.classList.add("job-highlight");
     setTimeout(() => target.classList.remove("job-highlight"), 1800);
   }
@@ -1795,6 +1821,7 @@ async function loadMessages(more = false, conversationId = selectedConversationI
   const result = await api(`/api/messages?${parameters}`);
   if (!csrfToken || requestToken !== csrfToken || request !== messageLoadRequest) return false;
   const changed = id !== selectedConversationId;
+  if (changed) otherCandidatesOpen = false;
   const viewport = $("#chat-transcript");
   const top = viewport.scrollTop;
   const height = viewport.scrollHeight;
