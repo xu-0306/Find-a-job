@@ -62,12 +62,18 @@ class SearchInput(Input):
     exclude_companies: list[str] = Field(default_factory=list, max_length=20,
         description='使用者要求排除的公司。同時列出使用者說法與搜尋結果中出現的公司全名（例如簡稱與全名各一項）；比對忽略全半形、空白及「股份有限公司」等字樣，任一項包含於公司名稱即排除。排除會套用到這段對話之後的所有搜尋與續查。')
 
+    include_companies: list[str] = Field(default_factory=list, max_length=5,
+        description='使用者指名要找某公司的職缺時必須填 include_companies，不能只把公司名放進 keyword；列出使用者說法與公司全名／簡稱各一項，只保留公司名稱符合且屬於該公司本身的職缺，不含廠區駐廠、現場、門市或承包商的職缺。來源只能用關鍵字查，criteria.keyword仍須填該公司的主要名稱。沒有符合的就如實說明「這次查到的職缺裡沒有合適的」，不放寬。')
+
     def model_post_init(self, context):
         if any(x not in ('104', '518', '1111') for x in self.sources) or len(set(self.sources)) != len(self.sources):
             raise ValueError('來源不符或重複')
         if any(not name or len(name) > 80 or len(company_key(name)) < 2 for name in self.exclude_companies):
             raise ValueError('排除公司名稱須為2～80字')
         self.exclude_companies = list(dict.fromkeys(self.exclude_companies))
+        if any(not name or len(name) > 80 or len(company_key(name)) < 2 for name in self.include_companies):
+            raise ValueError('指名公司名稱須為2～80字')
+        self.include_companies = list(dict.fromkeys(self.include_companies))
 
 
 class DetailInput(Input):
@@ -222,6 +228,7 @@ def mcp_once(name, arguments, cancelled):
 
 _CONTINUATION_VERSION = 2
 _MAX_NEW_PAGES = 5
+_COMPANY_1111_MAX_PAGES = 2
 AREA_ROW_FLOOR = 5
 MULTI_AREA_ROW_CAP = 50
 _HTTP_TIMEOUT_SECONDS = 30
@@ -522,12 +529,15 @@ class Sources:
         excluded = ({str(exclude_ids)} if isinstance(exclude_ids, str) else
                     {str(value) for value in (exclude_ids or []) if value is not None})
         company_keys = [key for key in map(company_key, exclude_companies or []) if len(key) >= 2]
+        include_keys = [key for key in map(company_key, arguments.include_companies) if len(key) >= 2]
+        company_candidates = company_matches = 0
         saved_sources = cursor.get('sources', {}) if cursor else {}
         cursor_sources = {}
         area_rows = {}
 
         def is_excluded(job):
-            return bool(_source_job_keys(job) & excluded) or company_excluded(job.company_name, company_keys)
+            return (bool(_source_job_keys(job) & excluded) or company_excluded(job.company_name, company_keys)
+                    or bool(include_keys) and not company_excluded(job.company_name, include_keys))
 
         def new_area_state():
             return {
@@ -621,7 +631,7 @@ class Sources:
                                 set_unsupported(area, '518 尚無此地區的可靠對應，未改查全國。')
 
                 def add_jobs(area, jobs):
-                    nonlocal source_new, source_duplicates, source_excluded
+                    nonlocal source_duplicates, source_excluded
                     queue = queues[area['key']]
                     for job in jobs:
                         if job.source_job_id in seen_ids:
@@ -658,6 +668,7 @@ class Sources:
                                 progressed = True
 
                 def normalize_candidates(area, candidates):
+                    nonlocal company_candidates, company_matches
                     jobs = []
                     for candidate in candidates:
                         try:
@@ -668,6 +679,9 @@ class Sources:
                             warning('部分來源職缺格式不完整，已略過。', area_states[area['key']])
                     if candidates and not jobs and any(isinstance(item, dict) and item.get('is_ad') is not True for item in candidates):
                         raise SourceError()
+                    if include_keys:
+                        company_candidates += len(jobs)
+                        company_matches += sum(company_excluded(job.company_name, include_keys) for job in jobs)
                     return jobs
 
                 def apply_page(area, state, page, page_cursor, page_result):
@@ -826,7 +840,8 @@ class Sources:
                     if pages_fetched >= max_pages and any(area_states[area['key']]['has_next'] for area in area_specs):
                         page_limited = True
                 elif source == '1111':
-                    max_pages = max(_MAX_NEW_PAGES, len(area_specs))
+                    page_cap = _COMPANY_1111_MAX_PAGES if include_keys else MAX_SEARCH_PAGES
+                    max_pages = max(_COMPANY_1111_MAX_PAGES if include_keys else _MAX_NEW_PAGES, len(area_specs))
                     while not source_blocked and len(rows) < limit and pages_fetched < max_pages:
                         pending = [area for area in area_specs
                                    if area_states[area['key']]['has_next'] and area['key'] not in failed_this_call]
@@ -907,10 +922,15 @@ class Sources:
                             else:
                                 state['page_signatures'].append(signature)
                             add_jobs(area, jobs)
-                            if page >= MAX_SEARCH_PAGES and state['has_next']:
+                            if page >= page_cap and state['has_next']:
                                 diagnostic['truncated'] = True
                                 state['has_next'] = False
-                                warning('1111 實驗來源最多查五頁，仍可能有更多職缺，請調整條件或至來源網站查看。', state)
+                                if include_keys:
+                                    message = f'1111指名公司的搜尋只查前{_COMPANY_1111_MAX_PAGES}頁，未再翻頁。'
+                                    if message not in result['filter_warnings']:
+                                        result['filter_warnings'].append(message)
+                                else:
+                                    warning('1111 實驗來源最多查五頁，仍可能有更多職缺，請調整條件或至來源網站查看。', state)
                         consume_queues()
                         if deferred or len(rows) >= limit:
                             break
@@ -1016,6 +1036,9 @@ class Sources:
             diagnostic['excluded_count'] = source_excluded
             result['source_results'].append(diagnostic)
 
+        if include_keys and company_candidates > 0 and continuation is None:
+            result['filter_warnings'].append(
+                f'來源回傳{company_candidates}筆，公司名稱符合{company_matches}筆；其餘是標題或內文提到該名稱的其他公司職缺，已略過。')
         result['area_results'] = [area_rows[(area['key'], source)] for area in area_specs for source in arguments.sources]
         result['can_continue'] = any(
             area['has_next'] or area['remaining']

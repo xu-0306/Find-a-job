@@ -171,7 +171,14 @@ class SourceChatChecks(unittest.TestCase):
                          tool.get('function', tool) for tool in payload['tools']}
                 self.assertIn('url', tools['get_job_details'].get('parameters', tools['get_job_details'].get('input_schema'))['properties'])
                 self.assertIn('只有使用者要找、推薦或比較職缺', tools['search_jobs']['description'])
+                self.assertIn('include_companies', tools['search_jobs']['description'])
+                parameters = tools['search_jobs'].get('parameters', tools['search_jobs'].get('input_schema'))
+                include_schema = parameters['properties']['include_companies']
+                self.assertEqual(include_schema['maxItems'], 5)
+                for concept in ('使用者說法', '公司全名／簡稱', '公司名稱符合', 'criteria.keyword', '沒有符合'):
+                    self.assertIn(concept, include_schema['description'])
                 from app.chat import SYSTEM
+                self.assertIn('include_companies', SYSTEM)
                 for principle in ('詢問特定職缺時不搜尋', '不用搜尋去找', '1～3句', '尚未確認'):
                     self.assertIn(principle, SYSTEM)
                 self.assertIn(SYSTEM, json.dumps(payload, ensure_ascii=False))

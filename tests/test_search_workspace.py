@@ -60,6 +60,37 @@ class WorkspaceChecks(unittest.TestCase):
         self.assertEqual(output[-1][1]['status'], 'completed', output)
         return next(data for event, data in output if event == 'jobs'), output
 
+    def test_include_companies_snapshot_and_continuation_keep_filter(self):
+        from app.sources import Sources
+        self.configure()
+        pages = []
+
+        async def provider(name, args):
+            number = args['page']; pages.append(number)
+            return dict(jobs=[dict(job_no=f'{number}{i}', job_name='資料工程師', company=company, is_ad=False,
+                url=f'https://www.104.com.tw/job/u{number}{i}') for i, company in enumerate(
+                ['雲岑曜石股份有限公司', '其他僱主'])], total=4, has_next=number < 2), None
+
+        self.app.state.sources = Sources(mcp_call=provider)
+        self.script(('search_jobs', {'criteria': {'keyword': '雲岑曜石'}, 'sources': ['104'], 'limit': 1,
+                                    'include_companies': ['雲岑曜石']}), '已整理。')
+        output = self.chat('include-first', text='只查104')
+        first = next(data for event, data in output if event == 'jobs')
+        self.assertEqual(first['criteria_input']['include_companies'], ['雲岑曜石'])
+        self.assertEqual([item['source_job_id'] for item in first['items']], ['10'])
+        self.assertEqual(first['excluded_count'], 1)
+        warnings = first['filter_warnings']
+        self.assertEqual(warnings.count('來源回傳2筆，公司名稱符合1筆；其餘是標題或內文提到該名稱的其他公司職缺，已略過。'), 1)
+        continued = self.chat('include-next', action={'type': 'continue_search', 'search_id': first['search_id']})
+        self.assertEqual(continued[-1][1]['status'], 'completed', continued)
+        second = next(data for event, data in continued if event == 'jobs')
+        self.assertEqual(second['criteria_input']['include_companies'], ['雲岑曜石'])
+        self.assertEqual([item['source_job_id'] for item in second['items']], ['20'])
+        self.assertEqual(second['excluded_count'], 1)
+        self.assertEqual(second['filter_warnings'], warnings)
+        self.assertEqual(pages, [1, 2])
+        self.assertFalse(second['can_continue'])
+
     def test_remote_type_is_saved_returned_and_replayed(self):
         self.configure()
         self.remote_type = "fully_remote"

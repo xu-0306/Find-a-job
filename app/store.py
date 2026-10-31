@@ -23,7 +23,7 @@ class Input(BaseModel):
 
 
 class Criteria(Input):
-    keyword: str = Field(min_length=1, max_length=100, description="職務名稱或技能詞（一個精簡片語）；地區放 area_codes，薪資、正職兼職、福利等不放這裡（518 會比對任一詞，泛用詞會帶回不相干職缺）。")
+    keyword: str = Field(min_length=1, max_length=100, description="一個精簡職務或技能片語；指名公司搜尋時填該公司主要名稱並搭配include_companies。地區放area_codes，薪資、工作性質與福利不放這裡。")
     area_codes: list[str] = Field(default_factory=list, max_length=20)
     min_monthly_salary: int | None = Field(default=None, ge=0, le=10000000)
     remote_only: StrictBool = Field(default=False, description="使用者要求遠端、遠距或在家工作時設為 true；這些字不要放進 keyword。")

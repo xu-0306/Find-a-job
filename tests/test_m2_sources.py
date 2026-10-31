@@ -212,6 +212,308 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
             with self.subTest(names=names), self.assertRaises(ValueError):
                 SearchInput(criteria={'keyword': '採購'}, exclude_companies=names)
 
+    def test_include_companies_input_is_bounded_and_daily_default_is_empty(self):
+        from app.sources import DailySearchInput
+        self.assertEqual(SearchInput(criteria={'keyword': '採購'}).include_companies, [])
+        self.assertEqual(DailySearchInput(criteria={'keyword': '採購'}).include_companies, [])
+        self.assertEqual(DailySearchInput(criteria={'keyword': '採購'}).limit, 100)
+        self.assertEqual(SearchInput(criteria={'keyword': '採購'},
+            include_companies=['霽禾流光', '雲岑曜石', '霽禾流光']).include_companies, ['霽禾流光', '雲岑曜石'])
+        for names in ([''], [' '], ['A'], ['x' * 81], ['霽禾流光'] * 6, ['股份有限公司'], ['A-']):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                SearchInput(criteria={'keyword': '採購'}, include_companies=names)
+        for names in (['xy'], ['x' * 80], [f'霽禾流光{i}' for i in range(5)]):
+            with self.subTest(names=names):
+                self.assertEqual(SearchInput(criteria={'keyword': '採購'}, include_companies=names).include_companies, names)
+
+    def test_include_company_schema_and_prompt_concepts(self):
+        from app.chat import SYSTEM
+        schema = SearchInput.model_json_schema()['properties']['include_companies']
+        self.assertEqual(schema['maxItems'], 5)
+        self.assertEqual(schema['items']['type'], 'string')
+        self.assertNotIn('include_companies', SearchInput.model_json_schema()['required'])
+        for concept in ('使用者說法', '公司全名／簡稱', '公司名稱符合', 'criteria.keyword', '沒有符合'):
+            self.assertIn(concept, schema['description'])
+        self.assertIn('include_companies', SYSTEM)
+
+    async def test_include_companies_matches_names_aliases_and_latin_boundaries_with_exclusions(self):
+        companies = ['璇嶼映川科技股份有限公司(沐橋)', '曦沐星橋科技股份有限公司', 'Meta Lumen Labs',
+                     'MetalWorks', '別家僱主', '曦沐星橋研究', '曦沐星橋開發']
+
+        async def provider(name, args):
+            return dict(jobs=[dict(job_no=str(i), job_name='曦沐星橋現場職缺', company=company, is_ad=False,
+                url=f'https://www.104.com.tw/job/u{i}') for i, company in enumerate(companies, 1)],
+                total=len(companies), has_next=False), None
+
+        arguments = SearchInput(criteria={'keyword': '曦沐星橋'}, sources=['104'],
+                                include_companies=['沐橋', '曦沐星橋', 'meta'])
+        result = await Sources(mcp_call=provider).search(arguments,
+            exclude_companies=['曦沐星橋研究'], exclude_ids={'104:7'})
+        self.assertEqual([job.source_job_id for job in result['items']], ['1', '2', '3'])
+        self.assertEqual(result['excluded_count'], 4)
+        self.assertEqual(result['source_results'][0]['excluded_count'], 4)
+        self.assertEqual(result['filter_warnings'], [
+            '來源回傳7筆，公司名稱符合5筆；其餘是標題或內文提到該名稱的其他公司職缺，已略過。'])
+        self.assertFalse(result['can_continue'])
+
+    async def test_include_http_pagination_still_fetches_five_pages(self):
+        from urllib.parse import urlencode
+        for source in ('104', '518'):
+            with self.subTest(source=source):
+                calls = []
+                arguments = SearchInput(criteria={'keyword': '霽禾流光'}, sources=[source],
+                                        include_companies=['霽禾流光'])
+
+                async def provider(name, args):
+                    number = args['page']; calls.append(number)
+                    return dict(jobs=[dict(job_no=str(number), job_name='職缺',
+                        company='霽禾流光' if number == 5 else '別家僱主',
+                        url=f'https://www.104.com.tw/job/u{number}')], total=100, has_next=True), None
+
+                def transport(request):
+                    number = int(re.search(r'-P-(\d+)', request.url.path)[1]); calls.append(number)
+                    company = '霽禾流光' if number == 5 else '別家僱主'
+                    query = urlencode(dict(ad=arguments.criteria.keyword, aa=''))
+                    return httpx.Response(200, text=f'<link rel="next" href="/job-index-P-{number+1}.html?{query}">'
+                        f'<div id="listContent"><div class="job__card" data-id="A{number}" data-url="/job-A{number}.html">'
+                        f'<a class="job__title" href="/job-A{number}.html">職缺</a>'
+                        f'<span class="job__comp__name">{company}</span></div></div>')
+
+                result = await Sources(httpx.MockTransport(transport), mcp_call=provider, interval=0).search(arguments)
+                self.assertEqual(calls, [1, 2, 3, 4, 5])
+                self.assertEqual([job.company_name for job in result['items']], ['霽禾流光'])
+                self.assertEqual(result['excluded_count'], 4)
+                self.assertTrue(result['can_continue'])
+                self.assertIn('來源回傳5筆，公司名稱符合1筆；其餘是標題或內文提到該名稱的其他公司職缺，已略過。',
+                              result['filter_warnings'])
+
+    async def test_include_1111_stops_at_two_pages_and_default_still_stops_at_five(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        for include, count, matches in ((False, 1, True), (True, 1, True), (True, 3, True), (True, 1, False)):
+            with self.subTest(include=include, areas=count, matches=matches):
+                areas = [dict(code=str(910000 + i), name=f'合成區{i}') for i in range(count)]
+                browser = AsyncMock()
+
+                async def worker(args):
+                    number = args['page']
+                    return dict(status='ok', areas=[dict(page([
+                        dict(row(str(100000 + index * 1000 + number * 100 + i)),
+                             company='霽禾流光' if matches and i == 0 else '別家僱主') for i in range(30)],
+                        number=number, size=30, total=3000), area_name=name)
+                        for index, name in enumerate(args['area_names'])])
+
+                browser.call.side_effect = worker
+                arguments = SearchInput(criteria={'keyword': '霽禾流光', 'area_codes': [area['code'] for area in areas]},
+                    sources=['1111'], include_companies=['霽禾流光'] if include else [])
+                with patch('app.sources.area_catalog', return_value=areas):
+                    result = await Sources(browser1111=browser).search(arguments, exclude_companies=['別家僱主'])
+                self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list],
+                                 [1, 2] if include else [1, 2, 3, 4, 5])
+                self.assertEqual(len(result['items']), count * int(matches) * (2 if include else 5))
+                self.assertEqual(result['excluded_count'], count * (30 - int(matches)) * (2 if include else 5))
+                self.assertFalse(result['can_continue'])
+                self.assertIsNone(result['continuation'])
+                self.assertTrue(all(area['completed'] for area in result['area_results']))
+                self.assertEqual(result['filter_warnings'].count('1111指名公司的搜尋只查前2頁，未再翻頁。'), int(include))
+
+    async def test_include_1111_keeps_twenty_fifth_row_before_queue_limit(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        browser = AsyncMock()
+        browser.call.return_value = page([dict(row(str(100000 + index)),
+            company='霽禾流光' if index == 24 else '別家僱主') for index in range(30)], size=30, total=30)
+        result = await Sources(browser1111=browser).search(SearchInput(
+            criteria={'keyword': '霽禾流光'}, sources=['1111'], include_companies=['霽禾流光']))
+        self.assertEqual([job.source_job_id for job in result['items']], ['100024'])
+        self.assertEqual(result['excluded_count'], 29)
+        self.assertEqual(browser.call.await_count, 1)
+        self.assertFalse(result['can_continue'])
+        self.assertIn('來源回傳30筆，公司名稱符合1筆；其餘是標題或內文提到該名稱的其他公司職缺，已略過。',
+                      result['filter_warnings'])
+
+    async def test_include_1111_continuation_keeps_overflow_without_third_page(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        browser = AsyncMock()
+
+        async def worker(args):
+            number = args['page']
+            # Page two has more matching rows than the remaining display limit.
+            return page([dict(row(str(100000 + number * 100 + i)), company='霽禾流光')
+                         if i < number else dict(row(str(100000 + number * 100 + i)), company='別家僱主')
+                         for i in range(30)], number=number, size=30, total=300)
+
+        browser.call.side_effect = worker
+        service = Sources(browser1111=browser)
+        arguments = SearchInput(criteria={'keyword': '霽禾流光'}, sources=['1111'], limit=1,
+                                include_companies=['霽禾流光'])
+        first = await service.search(arguments)
+        self.assertTrue(first['can_continue'])
+        second = await service.search(arguments, continuation=first['continuation'])
+        self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list], [1, 2])
+        self.assertEqual([job.source_job_id for job in second['items']], ['100200'])
+        self.assertTrue(second['can_continue'])
+        state = json.loads(second['continuation'])['sources']['1111']['areas']['all']
+        self.assertFalse(state['has_next'])
+        self.assertEqual([job['source_job_id'] for job in state['remaining']], ['100201'])
+        self.assertEqual(second['filter_warnings'], [
+            '1111 為實驗來源，可能因人機驗證受阻；地點、薪資未能解析，請至來源核對。',
+            '1111指名公司的搜尋只查前2頁，未再翻頁。'])
+        third = await service.search(arguments, continuation=second['continuation'])
+        self.assertEqual([job.source_job_id for job in third['items']], ['100201'])
+        self.assertFalse(third['can_continue'])
+        self.assertIsNone(third['continuation'])
+        self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list], [1, 2])
+        self.assertEqual(sum(result['filter_warnings'].count('1111指名公司的搜尋只查前2頁，未再翻頁。')
+                             for result in (first, second, third)), 1)
+
+    async def test_include_1111_page_cap_keeps_http_continuation(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        calls = []
+
+        async def provider(name, args):
+            number = args['page']; calls.append(number)
+            return dict(jobs=[dict(job_no=str(number), job_name='職缺', company='別家僱主',
+                url=f'https://www.104.com.tw/job/u{number}')], total=100, has_next=True), None
+
+        async def worker(args):
+            number = args['page']
+            return page([dict(row(str(100000 + number * 100 + i)), company='別家僱主')
+                         for i in range(30)], number=number, size=30, total=300)
+
+        browser = AsyncMock(); browser.call.side_effect = worker
+        result = await Sources(mcp_call=provider, browser1111=browser).search(SearchInput(
+            criteria={'keyword': '霽禾流光'}, sources=['104', '1111'], include_companies=['霽禾流光']))
+        self.assertEqual(calls, [1, 2, 3, 4, 5])
+        self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list], [1, 2])
+        self.assertTrue(result['can_continue'])
+        states = json.loads(result['continuation'])['sources']
+        self.assertEqual({source for source, state in states.items()
+                          if any(area['has_next'] for area in state['areas'].values())}, {'104'})
+        self.assertFalse(states['1111']['areas']['all']['remaining'])
+        self.assertTrue(result['source_results'][1]['truncated'])
+        self.assertEqual(result['filter_warnings'].count('1111指名公司的搜尋只查前2頁，未再翻頁。'), 1)
+
+    async def test_include_1111_exactly_two_pages_is_not_truncated(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        browser = AsyncMock()
+        browser.call.side_effect = lambda args: page([
+            dict(row(str(100000 + args['page'])), company='霽禾流光')], number=args['page'], total=2)
+        result = await Sources(browser1111=browser).search(SearchInput(
+            criteria={'keyword': '霽禾流光'}, sources=['1111'], include_companies=['霽禾流光']))
+        self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list], [1, 2])
+        self.assertEqual([job.source_job_id for job in result['items']], ['100001', '100002'])
+        self.assertNotIn('1111指名公司的搜尋只查前2頁，未再翻頁。', result['filter_warnings'])
+        self.assertFalse(result['source_results'][0]['truncated'])
+        self.assertFalse(result['can_continue'])
+        self.assertIsNone(result['continuation'])
+        self.assertTrue(result['area_results'][0]['completed'])
+
+    async def test_include_1111_failed_area_can_retry_after_other_area_caps(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        areas = [dict(code='910001', name='合成北區'), dict(code='910002', name='合成南區')]
+        browser = AsyncMock()
+
+        async def worker(args):
+            number = args['page']
+            if browser.call.await_count == 1:
+                return dict(status='ok', areas=[dict(area_name=areas[0]['name'], status='failed', message='合成查詢失敗'),
+                    dict(page([dict(row('200101'), company='別家僱主')], total=3), area_name=areas[1]['name'])])
+            return dict(status='ok', areas=[dict(page([
+                dict(row(str(100100 + number)), company='別家僱主' if number == 2 else '霽禾流光')],
+                number=number, total=3 if number == 2 else 1), area_name=args['area_names'][0])])
+
+        browser.call.side_effect = worker
+        service = Sources(browser1111=browser)
+        arguments = SearchInput(criteria={'keyword': '霽禾流光', 'area_codes': [area['code'] for area in areas]},
+                                sources=['1111'], include_companies=['霽禾流光'])
+        with patch('app.sources.area_catalog', return_value=areas):
+            first = await service.search(arguments)
+            self.assertEqual([area['status'] for area in first['area_results']], ['failed', 'success'])
+            self.assertEqual([area['completed'] for area in first['area_results']], [False, True])
+            self.assertTrue(first['can_continue'])
+            states = json.loads(first['continuation'])['sources']['1111']['areas']
+            self.assertTrue(states['910001']['has_next'])
+            self.assertEqual(states['910001']['next_page'], 1)
+            self.assertFalse(states['910002']['has_next'])
+            self.assertEqual(first['filter_warnings'].count('1111指名公司的搜尋只查前2頁，未再翻頁。'), 1)
+            second = await service.search(arguments, continuation=first['continuation'])
+        self.assertEqual([(call.args[0]['page'], call.args[0]['area_names']) for call in browser.call.await_args_list],
+                         [(1, ['合成北區', '合成南區']), (2, ['合成南區']), (1, ['合成北區'])])
+        self.assertEqual([job.source_job_id for job in second['items']], ['100101'])
+        self.assertFalse(second['can_continue'])
+        self.assertIsNone(second['continuation'])
+        self.assertTrue(all(area['completed'] for area in second['area_results']))
+        self.assertNotIn('1111指名公司的搜尋只查前2頁，未再翻頁。', second['filter_warnings'])
+
+    async def test_include_unavailable_or_empty_sources_have_no_candidate_count(self):
+        from unittest.mock import AsyncMock
+        from app.source1111 import BrowserError
+        from test_source1111 import page
+        for source in ('104', '1111'):
+            for status in ('blocked', 'failed', 'empty'):
+                with self.subTest(source=source, status=status):
+                    provider = AsyncMock()
+                    browser = AsyncMock()
+                    if status == 'empty':
+                        provider.return_value = dict(jobs=[], total=0, has_next=False), None
+                        browser.call.return_value = page([], total=0)
+                    else:
+                        provider.side_effect = SourceError(status)
+                        browser.call.side_effect = BrowserError(status)
+                    result = await Sources(mcp_call=provider, browser1111=browser).search(SearchInput(
+                        criteria={'keyword': '霽禾流光'}, sources=[source], include_companies=['霽禾流光']))
+                    self.assertEqual(result['source_results'][0]['status'], status)
+                    self.assertFalse(result['items'])
+                    self.assertEqual(result['filter_warnings'], [])
+                    self.assertEqual(result['can_continue'], status != 'empty')
+
+    async def test_include_1111_cap_preserves_overflow_for_next_display(self):
+        from unittest.mock import AsyncMock
+        from test_source1111 import page, row
+        browser = AsyncMock()
+        browser.call.side_effect = lambda args: page([
+            dict(row(str(100000 + args['page'] * 100 + i)),
+                 company='霽禾流光' if args['page'] == 2 else '別家僱主') for i in range(3)],
+            number=args['page'], size=3, total=9)
+        service = Sources(browser1111=browser)
+        arguments = SearchInput(criteria={'keyword': '霽禾流光'}, sources=['1111'], limit=2,
+                                include_companies=['霽禾流光'])
+        first = await service.search(arguments)
+        self.assertEqual([job.source_job_id for job in first['items']], ['100200', '100201'])
+        self.assertEqual(first['excluded_count'], 3)
+        self.assertTrue(first['can_continue'])
+        state = json.loads(first['continuation'])['sources']['1111']['areas']['all']
+        self.assertFalse(state['has_next'])
+        self.assertEqual([job['source_job_id'] for job in state['remaining']], ['100202'])
+        second = await service.search(arguments, continuation=first['continuation'])
+        self.assertEqual([job.source_job_id for job in second['items']], ['100202'])
+        self.assertFalse(second['can_continue'])
+        self.assertIsNone(second['continuation'])
+        self.assertEqual([call.args[0]['page'] for call in browser.call.await_args_list], [1, 2])
+        self.assertEqual(sum(result['filter_warnings'].count('1111指名公司的搜尋只查前2頁，未再翻頁。')
+                             for result in (first, second)), 1)
+
+    async def test_include_filters_queued_candidates_on_continuation(self):
+        async def provider(name, args):
+            return dict(jobs=[dict(job_no=str(i), job_name='職缺', company=company,
+                url=f'https://www.104.com.tw/job/u{i}') for i, company in enumerate(
+                ['霽禾流光', '別家僱主', '霽禾流光'], 1)], total=3, has_next=False), None
+
+        service = Sources(mcp_call=provider)
+        arguments = SearchInput(criteria={'keyword': '霽禾流光'}, sources=['104'], limit=1)
+        first = await service.search(arguments)
+        arguments.include_companies = ['霽禾流光']
+        second = await service.search(arguments, continuation=first['continuation'])
+        self.assertEqual([job.source_job_id for job in second['items']], ['3'])
+        self.assertEqual(second['excluded_count'], 1)
+        self.assertFalse(second['can_continue'])
+        self.assertEqual(second['filter_warnings'], [])
+
     async def test_continuation_rejects_changed_page_size_before_network(self):
         calls = []
 
