@@ -12,6 +12,66 @@ class WorkspaceChecks(unittest.TestCase):
     setUp = ChatChecks.setUp
     tearDown = ChatChecks.tearDown
 
+    def check_next_step(self, *, candidates, source_status='success', area_status='success'):
+        self.configure()
+        original = self.app.state.sources.search
+        async def search(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            if not candidates:
+                result['items'] = []
+            result['source_results'][0]['status'] = source_status
+            result['area_results'][0]['status'] = area_status
+            return result
+        self.app.state.sources.search = search
+        request_id = 'next-' + source_status + '-' + area_status
+        output = self.chat(request_id)
+        result = next(data for event, data in output if event == 'jobs')
+        payload = self.provider_calls[1]
+        tool_result = next(json.loads(item['output']) for item in payload['input'] if item.get('type') == 'function_call_output')
+        self.assertNotIn('next_step', result)
+        self.assertEqual({key: value for key, value in tool_result.items() if key != 'next_step'}, result)
+        with self.store.connect() as db:
+            content = json.loads(db.execute("SELECT content_json FROM messages WHERE request_id=? AND role='assistant'",
+                                            (request_id,)).fetchone()[0])
+        stored = next(event['data'] for event in content['events'] if event['event'] == 'jobs')
+        self.assertNotIn('next_step', stored)
+        self.assertEqual({key: value for key, value in stored.items() if key != '_continuation'}, result)
+        self.assertEqual(len(self.provider_calls), 2, 'no additional model round')
+        step = tool_result.get('next_step', '')
+        if candidates:
+            self.assertIn('present_job_recommendations', step)
+            self.assertIn('job_id', step)
+            self.assertIn('accepted_count', step)
+            self.assertIn('沒有合適的', step)
+        else:
+            self.assertNotIn('present_job_recommendations', step)
+        blocked = source_status != 'success' or area_status != 'success'
+        if blocked:
+            self.assertIn('無法確認／受阻', step)
+            self.assertIn('不得說成「沒有職缺」', step)
+            self.assertIn('分開交代', step)
+        else:
+            self.assertNotIn('不得說成「沒有職缺」', step)
+        if not candidates and not blocked:
+            self.assertNotIn('next_step', tool_result)
+
+    def test_next_step_candidates_all_success(self):
+        self.check_next_step(candidates=True)
+
+    def test_next_step_candidates_source_blocked(self):
+        self.check_next_step(candidates=True, source_status='blocked')
+
+    def test_next_step_empty_all_success(self):
+        self.check_next_step(candidates=False)
+
+    def test_next_step_empty_area_blocked(self):
+        self.check_next_step(candidates=False, area_status='blocked')
+
+    def test_next_step_other_incomplete_structured_statuses(self):
+        for status in ('failed', 'not_queried', 'unsupported'):
+            with self.subTest(status=status):
+                self.check_next_step(candidates=False, source_status=status)
+
     def configure(self, protocol='responses'):
         from test_m2_chat import SETTINGS
         with self.store.connect(write=True) as db:

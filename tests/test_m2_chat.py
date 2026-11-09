@@ -587,5 +587,10 @@ class ChatChecks(unittest.TestCase):
                 Store(directory)
 
 
+class SearchStatusPromptChecks(unittest.TestCase):
+    def test_opening_summary_cannot_call_unavailable_sources_empty(self):
+        self.assertIn('被擋、失敗或未查的來源不可寫成「沒有職缺」，開頭總結句也適用。', chat.SYSTEM)
+
+
 if __name__ == '__main__':
     unittest.main()

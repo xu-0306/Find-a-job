@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 from contextlib import asynccontextmanager
@@ -188,6 +188,15 @@ class CompanyRestore(Input):
 
 class AreaLookup(Input):
     query: str = Field(min_length=1, max_length=100)
+
+
+class ConversationBulkDelete(Input):
+    ids: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(min_length=1, max_length=500)
+
+    @field_validator('ids')
+    @classmethod
+    def unique_ids(cls, values):
+        return list(dict.fromkeys(values))
 
 
 class ConversationTitle(Input):
@@ -1361,15 +1370,32 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
             db.execute('UPDATE conversations SET title=?,updated_at=? WHERE id=?', (body.title, now().isoformat(), conversation_id))
             return conversation_view(db, conversation_id, auth['user_id'])
 
-    @app.delete('/api/conversations/{conversation_id}', status_code=204)
-    async def delete_conversation(conversation_id: str, auth=Depends(user)):
+    def delete_conversations(ids, auth, *, require_one=False):
         active = app.state.active_chats.get(auth['user_id'])
-        if active and active.get('conversation_id') == conversation_id:
+        if active and active.get('conversation_id') in ids:
             raise APIError(409, 'chat_busy', '這段對話正在回覆，請先停止回覆再刪除。')
         with store.connect(write=True) as db:
-            ensure_active(db, auth['hash']); conversation_view(db, conversation_id, auth['user_id'])
-            db.execute('DELETE FROM messages WHERE conversation_id=?', (conversation_id,))
-            db.execute('DELETE FROM conversations WHERE id=?', (conversation_id,))
+            ensure_active(db, auth['hash'])
+            if require_one:
+                conversation_view(db, ids[0], auth['user_id'])
+            deleted = 0
+            # Leave room for the user id under SQLite's legacy 999-parameter limit.
+            for offset in range(0, len(ids), 900):
+                batch = ids[offset:offset + 900]
+                placeholders = ','.join('?' for _ in batch)
+                owned = f'SELECT id FROM conversations WHERE user_id=? AND id IN ({placeholders})'
+                db.execute(f'DELETE FROM messages WHERE conversation_id IN ({owned})', [auth['user_id'], *batch])
+                deleted += db.execute(f'DELETE FROM conversations WHERE user_id=? AND id IN ({placeholders})',
+                                      [auth['user_id'], *batch]).rowcount
+            return deleted
+
+    @app.post('/api/conversations/bulk-delete')
+    async def bulk_delete_conversations(body: ConversationBulkDelete, auth=Depends(user)):
+        return {'deleted': delete_conversations(body.ids, auth)}
+
+    @app.delete('/api/conversations/{conversation_id}', status_code=204)
+    async def delete_conversation(conversation_id: str, auth=Depends(user)):
+        delete_conversations([conversation_id], auth, require_one=True)
         return Response(status_code=204)
 
     @app.get('/api/messages')
@@ -1557,7 +1583,16 @@ def create_app(data_dir=None, *, automatic_daily=True, native_sharing=False, adm
                 excluded_companies=excluded_companies, excluded_job_ids=excluded_job_ids)
             result.setdefault('duplicate_count', len(items) - len(new_ids))
             result.setdefault('can_continue', bool(continuation))
-            return {key: value for key, value in result.items() if key != '_continuation'}, ('jobs', result)
+            next_steps = []
+            if items:
+                next_steps.append('要在回覆列出推薦職缺，必須先用 present_job_recommendations 提交其 job_id，精選筆數只能引用 accepted_count；沒有合適的就明說沒有，不提交。')
+            if any(item.get('status') in ('blocked', 'failed', 'not_queried', 'unsupported')
+                   for item in [*result.get('source_results', []), *result.get('area_results', [])]):
+                next_steps.append('受阻、失敗、未查或不支援的來源只能說「無法確認／受阻」，不得說成「沒有職缺」；多個來源狀態不同須分開交代，開頭總結也不可合併。')
+            tool_result = {key: value for key, value in result.items() if key != '_continuation'}
+            if next_steps:
+                tool_result['next_step'] = ''.join(next_steps)
+            return tool_result, ('jobs', result)
         if name == 'get_company_reviews':
             result = await company_reviews(arguments, auth_hash)
             return result, ('review', result)

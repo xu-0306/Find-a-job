@@ -63,6 +63,18 @@ class IsolationChecks(unittest.TestCase):
                             encode({'text': text, 'status': 'completed', 'events': []}), now().isoformat(), ident))
         return ident
 
+    def test_bulk_delete_ignores_other_users_and_missing_ids(self):
+        mine = self.conversation_with_messages(self.alice, 'bulk-alice')
+        theirs = self.conversation_with_messages(self.bob, 'bulk-bob')
+        result = self.alice.post('/api/conversations/bulk-delete', json={'ids': [mine, theirs, 'missing', mine]})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json(), {'deleted': 1})
+        self.assertEqual(self.alice.get('/api/conversations').json()['items'], [])
+        self.assertEqual([item['id'] for item in self.bob.get('/api/conversations').json()['items']], [theirs])
+        self.assertEqual(len(self.bob.get('/api/messages', params={'conversation_id': theirs}).json()['items']), 2)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM messages WHERE conversation_id=?', (mine,)).fetchone()[0], 0)
+
     def test_conversations_and_messages_are_private(self):
         ident = self.conversation_with_messages(self.alice, 'alice-request')
         self.assertEqual([item['id'] for item in self.alice.get('/api/conversations').json()['items']], [ident])

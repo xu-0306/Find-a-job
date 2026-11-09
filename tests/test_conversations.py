@@ -18,6 +18,62 @@ class ConversationChecks(unittest.TestCase):
     setUp = existing.ChatChecks.setUp
     tearDown = existing.ChatChecks.tearDown
 
+    def test_bulk_delete_messages_validation_and_busy_atomicity(self):
+        first, second = self.create('甲'), self.create('乙')
+        with self.store.connect(write=True) as db:
+            for ident in (first, second, 'legacy'):
+                db.execute('INSERT INTO messages VALUES(?,?,?,?,?,?)',
+                           (ident, ident, 'user', '{"text":"private"}', now().isoformat(), ident))
+        for ids in ([], ['x'] * 501, [''], ['x' * 101]):
+            self.assertEqual(self.client.post('/api/conversations/bulk-delete', json={'ids': ids}).status_code, 422)
+        self.app.state.active_chats = {'default': {'conversation_id': second}}
+        try:
+            result = self.client.post('/api/conversations/bulk-delete', json={'ids': [first, second]})
+            self.assertEqual(result.status_code, 409)
+            self.assertEqual(result.json()['error']['code'], 'chat_busy')
+            with self.store.connect() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM messages WHERE conversation_id IN (?,?)', (first, second)).fetchone()[0], 2)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM conversations WHERE id IN (?,?)', (first, second)).fetchone()[0], 2)
+        finally:
+            self.app.state.active_chats = {}
+        result = self.client.post('/api/conversations/bulk-delete', json={'ids': [first, 'missing', second, first]})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json(), {'deleted': 2})
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM messages WHERE conversation_id IN (?,?)', (first, second)).fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM conversations WHERE id IN (?,?)', (first, second)).fetchone()[0], 0)
+        self.client.headers['X-CSRF-Token'] = 'wrong'
+        self.assertEqual(self.client.post('/api/conversations/bulk-delete', json={'ids': ['legacy']}).status_code, 403)
+        with TestClient(self.app, base_url='http://localhost') as anonymous:
+            for headers, status, code in (({}, 403, 'origin_rejected'),
+                                          ({'Origin': 'http://localhost'}, 401, 'login_required')):
+                with self.subTest(headers=headers):
+                    result = anonymous.post('/api/conversations/bulk-delete', json={'ids': ['legacy']}, headers=headers)
+                    self.assertEqual(result.status_code, status)
+                    self.assertEqual(result.json()['error']['code'], code)
+                    with self.store.connect() as db:
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM conversations WHERE id='legacy'").fetchone()[0], 1)
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id='legacy'").fetchone()[0], 1)
+
+    def test_admin_created_account_can_start_its_first_chat(self):
+        created = self.client.post('/api/admin/users', json={'username': 'first-chat'},
+                                   headers={'X-CSRF-Token': security.csrf(self.admin_token)})
+        self.assertEqual(created.status_code, 201)
+        with TestClient(self.app, base_url='http://localhost', client=('127.0.0.1', 20)) as client:
+            self.assertEqual(client.get(created.json()['access_path'], follow_redirects=False).status_code, 303)
+            bootstrap = client.get('/api/bootstrap').json()
+            client.headers.update({'Origin': 'http://localhost', 'X-CSRF-Token': bootstrap['csrf_token']})
+            self.assertEqual(client.get('/api/conversations').json()['items'], [])
+            conversation = client.post('/api/conversations', json={})
+            self.assertEqual(conversation.status_code, 201)
+            ident = conversation.json()['id']
+            self.app.state.llm_transport = httpx.MockTransport(lambda request: existing.response(text='歡迎開始'))
+            result = client.post('/api/chat', json={'conversation_id': ident, 'request_id': 'first-account', 'text': '你好 hello'})
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(existing.events(result)[-1][1]['status'], 'completed')
+            messages = client.get('/api/messages', params={'conversation_id': ident}).json()['items']
+            self.assertEqual([item['content']['text'] for item in messages], ['你好 hello', '歡迎開始'])
+
     def create(self, title='新對話'):
         result = self.client.post('/api/conversations', json={'title':title})
         self.assertEqual(result.status_code, 201, result.text)
