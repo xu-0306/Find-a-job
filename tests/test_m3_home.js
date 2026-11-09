@@ -82,6 +82,7 @@ class FakeElement {
     if (selector === ".chat-message-meta") return find(this, item => item.className === "chat-message-meta");
     if (selector === ".chat-message-actions") return find(this, item => item.className === "chat-message-actions");
     if (selector === ".chat-time") return find(this, item => item.className === "chat-time");
+    if (selector === "span") return find(this, item => item.tagName === "SPAN");
     if (selector === "input") return find(this, item => item.tagName === "INPUT");
     if (selector === "button[type=submit]") return find(this, item => item.tagName === "BUTTON" && item.type === "submit");
     return null;
@@ -148,6 +149,8 @@ function keyForTest() {
     "new-conversation", "open-conversation-history", "active-conversation-title", "conversation-history-dialog", "conversation-search-form", "conversation-query",
     "conversation-history-status", "conversation-list", "more-conversations", "close-conversation-history",
     "rename-conversation-dialog", "rename-conversation-form", "rename-conversation-input", "rename-conversation-status", "cancel-rename-conversation", "save-conversation-name",
+    "select-conversations", "select-all-conversations", "delete-selected-conversations", "finish-conversation-selection",
+    "bulk-delete-conversation-dialog", "bulk-delete-conversation-name", "bulk-delete-conversation-status", "cancel-bulk-delete-conversation", "confirm-bulk-delete-conversation",
     "delete-conversation-dialog", "delete-conversation-name", "delete-conversation-status", "cancel-delete-conversation", "confirm-delete-conversation",
     "search-results-panel", "search-results-title", "search-results-summary", "search-results-counts", "search-results-controls", "search-results-details", "search-results-actions", "search-results-list",
     "show-chat-view", "show-results-view", "results-count-badge", "preferences", "favorites",
@@ -322,6 +325,14 @@ function keyForTest() {
         const offset = Number(url.searchParams.get("cursor")) || 0;
         const limit = Number(url.searchParams.get("limit")) || 20;
         return {items: matched.slice(offset, offset + limit), next_cursor: offset + limit < matched.length ? String(offset + limit) : null};
+      }
+      if (method === "POST" && id === "bulk-delete") {
+        if (state.bulkDeleteError) throw state.bulkDeleteError;
+        const ids = JSON.parse(options.body).ids;
+        const deleted = state.conversations.filter(item => ids.includes(item.id)).length;
+        state.conversations = state.conversations.filter(item => !ids.includes(item.id));
+        for (const id of ids) state.conversationHistories.delete(id);
+        return {deleted};
       }
       if (method === "POST") {
         const payload = JSON.parse(options.body || "{}");
@@ -1496,6 +1507,151 @@ async function testProposalFocusAndConfirmationBoundary() {
   assert.equal(list.children[0].children[0].focused, true);
 }
 
+async function testFirstSendCreatesConversationAndPreservesFailedDraft() {
+  for (const failed of [false, true]) {
+    const home = createContext(); home.state.conversations = []; await settle();
+    assert.equal(home.state.submit.disabled, false);
+    assert.equal(home.elements.get("refresh-messages").disabled, true);
+    assert.equal(home.state.conversationRequests.filter(item => item.options.method === "POST").length, 0);
+    const file = new File(["resume"], "first.pdf");
+    home.context.acceptAttachmentSelection([file]); home.state.input.value = "第一句 hello";
+    const order = [], api = home.context.api, fetch = home.context.fetch;
+    home.context.api = async (path, options) => {
+      if (path === "/api/conversations" && options?.method === "POST") {
+        order.push(path); if (failed) throw new Error("建立失敗");
+      }
+      return api(path, options);
+    };
+    home.context.fetch = async (path, options) => { order.push(path); return fetch(path, options); };
+    await home.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
+    assert.deepEqual(order, failed ? ["/api/conversations"] : ["/api/conversations", "/api/chat"]);
+    if (failed) {
+      assert.equal(home.state.input.value, "第一句 hello");
+      assert.equal(home.state.fileInput.files[0], file);
+      assert.match(home.elements.get("chat-status").textContent, /建立失敗/);
+      assert.equal(home.state.chatPayloads.length, 0);
+    } else {
+      assert.equal(home.state.chatPayloads[0].conversation_id, home.state.conversations[0].id);
+      assert.equal(home.state.chatPayloads[0].resumes[0], file);
+    }
+  }
+}
+
+async function testFirstSendDuringPendingConversationReloadDoesNotDuplicate() {
+  const home = createContext(); home.state.conversations = []; await settle();
+  home.state.input.value = "第一句連按兩次";
+  let request = 0;
+  home.context.crypto.randomUUID = () => `first-send-${++request}`;
+  const api = home.context.api, read = home.context.ChatSSE.read;
+  let releaseList, releaseReply;
+  const replyPending = new Promise(resolve => { releaseReply = resolve; });
+  home.context.api = async (path, options) => path.startsWith("/api/conversations?")
+    ? new Promise(resolve => { releaseList = () => resolve(api(path, options)); }) : api(path, options);
+  home.context.ChatSSE.read = async (...args) => { await replyPending; return read(...args); };
+  const form = home.elements.get("chat-form");
+  const first = form.dispatch("submit", {preventDefault() {}}); await settle();
+  assert.equal(typeof releaseList, "function", "the conversation list reload is still pending");
+  assert.equal(vm.runInContext("switchingConversation", home.context), false);
+  assert.equal(vm.runInContext("selectedConversationId", home.context), home.state.conversations[0].id);
+  const second = form.dispatch("submit", {preventDefault() {}}); await settle();
+  assert.equal(home.state.chatPayloads.length, 1, "the second submit starts while the first waits for the list");
+  releaseList(); await settle();
+  releaseReply(); await Promise.all([first, second]);
+  assert.equal(home.state.conversationRequests.filter(item => item.options.method === "POST").length, 1);
+  assert.equal(home.state.fetchCalls.filter(item => item.path === "/api/chat" && item.options.method === "POST").length, 1);
+}
+
+async function testBulkDeletionOpensRemainingConversation() {
+  const home = createContext();
+  home.state.conversations = [{id: "first", title: "甲"}, {id: "remaining", title: "乙"}];
+  await settle();
+  await home.elements.get("select-conversations").click();
+  const checkbox = home.elements.get("conversation-list").children[0].querySelector("input");
+  checkbox.checked = true; await checkbox.dispatch("change");
+  await home.elements.get("delete-selected-conversations").click();
+  assert.match(home.elements.get("bulk-delete-conversation-name").textContent, /1 段/);
+  await home.elements.get("confirm-bulk-delete-conversation").click();
+  assert.equal(vm.runInContext("selectedConversationId", home.context), "remaining");
+  assert.equal(home.state.messageRequests.at(-1).id, "remaining");
+  assert.doesNotMatch(home.elements.get("conversation-history-status").textContent, /正在載入這段對話/);
+  assert.equal(home.elements.get("conversation-history-status").textContent, "已載入 1 段對話。");
+  vm.runInContext('csrfToken = ""; updateConversationControls()', home.context);
+  assert.equal(home.state.submit.disabled, true);
+}
+
+async function testBulkConversationSelectionAndDeletion() {
+  for (const id of ["select-conversations", "select-all-conversations", "delete-selected-conversations", "finish-conversation-selection", "bulk-delete-conversation-dialog", "bulk-delete-conversation-status"]) {
+    assert.ok(homeHtml.includes(`id="${id}"`));
+  }
+  const home = createContext();
+  home.state.conversations = Array.from({length: 22}, (_, i) => ({id: `bulk-${i}`, title: `標題 ${i}`}));
+  await settle();
+  const el = id => home.elements.get(id), list = el("conversation-list");
+  const checkboxes = () => all(list, item => item.type === "checkbox");
+  await el("select-conversations").click();
+  assert.equal(checkboxes().length, 20);
+  assert.equal(el("new-conversation").disabled, true);
+  assert.equal(el("delete-selected-conversations").disabled, true);
+  assert.ok(checkboxes()[0].getAttribute("aria-label").includes("標題 0"));
+  assert.equal(checkboxes()[0].getAttribute("aria-describedby"), undefined);
+  assert.equal(home.context.document.activeElement, checkboxes()[0]);
+  assert.equal(list.children[0].querySelector("[data-conversation-open]").parentElement.hidden, true);
+  checkboxes()[1].checked = true; await checkboxes()[1].dispatch("change");
+  assert.match(el("conversation-history-status").textContent, /已選 1 段/);
+  await el("select-all-conversations").click();
+  assert.match(el("conversation-history-status").textContent, /已選 20 段/);
+  await el("more-conversations").click();
+  assert.equal(checkboxes().length, 22);
+  assert.equal(checkboxes().filter(item => item.checked).length, 20);
+  await el("select-all-conversations").click();
+  assert.equal(checkboxes().filter(item => item.checked).length, 22);
+  await el("select-all-conversations").click();
+  assert.equal(checkboxes().filter(item => item.checked).length, 0);
+  vm.runInContext('activeChat = {id: "running"}; updateConversationControls()', home.context);
+  assert.equal(checkboxes()[0].disabled, true);
+  assert.ok(checkboxes()[0].getAttribute("aria-describedby"));
+  assert.equal(checkboxes()[0].parentElement.querySelector("span").hidden, false);
+  await el("select-all-conversations").click();
+  assert.equal(checkboxes()[0].checked, false);
+  vm.runInContext('activeChat = null; updateConversationControls()', home.context);
+  assert.equal(checkboxes()[0].getAttribute("aria-describedby"), undefined);
+  await el("finish-conversation-selection").click();
+  assert.equal(home.context.document.activeElement, el("select-conversations"));
+  assert.equal(el("select-conversations").hidden, false);
+  await el("select-conversations").click();
+  await el("select-all-conversations").click();
+  await el("delete-selected-conversations").click();
+  assert.match(el("bulk-delete-conversation-name").textContent, /22 段/);
+  home.state.bulkDeleteError = Object.assign(new Error("正在回覆，不能刪除"), {status: 409});
+  await el("confirm-bulk-delete-conversation").click();
+  assert.equal(el("bulk-delete-conversation-dialog").open, true);
+  assert.match(el("bulk-delete-conversation-status").textContent, /正在回覆/);
+  assert.equal(checkboxes().filter(item => item.checked).length, 22);
+  home.state.bulkDeleteError = null;
+  const before = home.state.conversationRequests.length;
+  await el("confirm-bulk-delete-conversation").click();
+  const calls = home.state.conversationRequests.slice(before).filter(item => item.path.endsWith("bulk-delete"));
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(calls[0].options.body).ids, Array.from({length: 22}, (_, i) => `bulk-${i}`));
+  assert.equal(el("bulk-delete-conversation-dialog").open, false);
+  assert.equal(el("select-conversations").hidden, false);
+  assert.equal(vm.runInContext("selectedConversationId", home.context), null);
+  assert.equal(home.state.submit.disabled, false);
+  home.state.input.value = "刪光後重新開始";
+  await el("chat-form").dispatch("submit", {preventDefault() {}});
+  assert.equal(home.state.chatPayloads.at(-1).conversation_id, home.state.conversations[0].id);
+
+  await el("select-conversations").click(); await el("select-all-conversations").click();
+  await home.context.loadConversations(false);
+  assert.equal(checkboxes().filter(item => item.checked).length, 0, "reloading clears selection");
+  home.state.conversations = Array.from({length: 501}, (_, i) => ({id: `limit-${i}`, title: `Limit ${i}`}));
+  await home.context.loadConversations(false);
+  while (!el("more-conversations").hidden) await el("more-conversations").click();
+  await el("select-all-conversations").click();
+  assert.equal(el("delete-selected-conversations").disabled, true);
+  assert.match(el("conversation-history-status").textContent, /最多 500/);
+}
+
 async function testConversationLifecycleAndGuards() {
   const home = createContext();
   const makeConversation = (id, title, day) => ({id, title, created_at: `2026-10-${String(day).padStart(2, "0")}T00:00:00Z`, updated_at: `2026-10-${String(day).padStart(2, "0")}T00:00:00Z`, message_count: 1});
@@ -1596,14 +1752,16 @@ async function testConversationLifecycleAndGuards() {
   await home.elements.get("confirm-delete-conversation").click();
   assert.equal(vm.runInContext("selectedConversationId", home.context), "conversation-1", "deleting the selected conversation opens the next available conversation");
   assert.equal(home.state.messageRequests.at(-1).id, "conversation-1");
+  assert.doesNotMatch(home.elements.get("conversation-history-status").textContent, /正在載入這段對話/);
+  assert.match(home.elements.get("conversation-history-status").textContent, /^已載入 \d+ 段對話。$/);
 
   const empty = createContext(); empty.state.conversations = []; await settle();
   assert.equal(vm.runInContext("selectedConversationId", empty.context), null);
   assert.equal(empty.state.conversationRequests.some(item => item.options.method === "POST"), false, "startup never creates an empty conversation implicitly");
-  assert.equal(empty.elements.get("chat-form").querySelector("button[type=submit]").disabled, true);
+  assert.equal(empty.elements.get("chat-form").querySelector("button[type=submit]").disabled, false);
   empty.state.input.value = "尚未建立對話";
   await empty.elements.get("chat-form").dispatch("submit", {preventDefault() {}});
-  assert.equal(empty.state.fetchCalls.some(item => item.path === "/api/chat"), false, "sending without a selected conversation is blocked with a local message");
+  assert.equal(empty.state.chatPayloads.at(-1).conversation_id, empty.state.conversations[0].id, "first send uses the newly created conversation");
   await empty.elements.get("open-conversation-history").click();
   await empty.elements.get("new-conversation").click(); await settle();
   assert(vm.runInContext("selectedConversationId", empty.context));
@@ -3577,6 +3735,10 @@ process.on("exit", () => {
   await testBasicReviewPreservesResultsAndRestoresAbortedLabels();
   await testScrolledAwayQueuedReviewIsSkipped();
   await testProposalFocusAndConfirmationBoundary();
+  await testFirstSendCreatesConversationAndPreservesFailedDraft();
+  await testFirstSendDuringPendingConversationReloadDoesNotDuplicate();
+  await testBulkConversationSelectionAndDeletion();
+  await testBulkDeletionOpensRemainingConversation();
   await testConversationLifecycleAndGuards();
   await testPushSummaryStates();
   await testEnterToSendAndShiftEnterNewline();
@@ -3610,7 +3772,7 @@ process.on("exit", () => {
   await testChatWidthDragFollowsFramesAndStoresOnRelease();
   await testChatWidthSurvivesStorageErrors();
   testRunCompleted = true;
-  console.log("test_m3_home: 83 checks passed");
+  console.log("test_m3_home: 87 checks passed");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

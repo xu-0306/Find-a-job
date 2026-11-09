@@ -5,6 +5,8 @@ let messageCursor = null;
 let selectedConversationId = null;
 let conversationCursor = null;
 let conversationListRequest = 0;
+let selectingConversations = false;
+const selectedConversationIds = new Set();
 let messageLoadRequest = 0;
 let switchingConversation = false;
 let activeChat = null;
@@ -1138,7 +1140,7 @@ function signedOut() {
   dismissedRequestIds.clear();
   conversationListRequest++; messageLoadRequest++;
   if (activeChat) activeChat.controller.abort();
-  activeChat = null; pendingChatAction = null; selectedConversationId = null; conversationCursor = null; messageCursor = null; dailyCursor = null; switchingConversation = false;
+  activeChat = null; pendingChatAction = null; selectingConversations = false; selectedConversationIds.clear(); selectedConversationId = null; conversationCursor = null; messageCursor = null; dailyCursor = null; switchingConversation = false;
   activeSearchId = null; activeSearchState = null; resultSearchId = null; searchStates.clear(); resetConversationWork(); setResultView("chat");
   clearCompanion();
   disableCsrfRecovery();
@@ -1158,7 +1160,7 @@ function signedOut() {
   previousValidAttachments = []; releaseReusableAttachments(); clearChatFileDrag();
   updateResumeSelection(); updateChatCount();
   $("#review-dialog").close(); $("#review-result").replaceChildren();
-  $("#conversation-history-dialog").close(); $("#rename-conversation-dialog").close(); $("#delete-conversation-dialog").close();
+  $("#conversation-history-dialog").close(); $("#rename-conversation-dialog").close(); $("#delete-conversation-dialog").close(); $("#bulk-delete-conversation-dialog").close();
   updateConversationControls();
 }
 function preferencesFeedback(text, failed = false) {
@@ -1583,9 +1585,9 @@ function setConversationHistoryStatus(text, failed = false) {
 }
 function updateConversationControls() {
   const blocked = Boolean(activeChat || switchingConversation);
-  $("#new-conversation").disabled = blocked || !csrfToken;
+  $("#new-conversation").disabled = blocked || !csrfToken || selectingConversations;
   $("#open-conversation-history").disabled = !csrfToken;
-  $("#chat-form button[type=submit]").disabled = blocked || !selectedConversationId;
+  $("#chat-form button[type=submit]").disabled = blocked || !csrfToken;
   $("#refresh-messages").disabled = Boolean(activeChat && !activeChat.awaitingSnapshot) || switchingConversation || !selectedConversationId;
   $("#more-messages").disabled = blocked;
   syncContinueButton();
@@ -1597,15 +1599,62 @@ function updateConversationControls() {
     const id = card.dataset.conversationId;
     const open = card.querySelector("[data-conversation-open]");
     const remove = card.querySelector("[data-conversation-delete]");
+    const checkbox = card.querySelector("input");
+    if (checkbox) {
+      checkbox.disabled = switchingConversation || Boolean(activeChat && id === selectedConversationId);
+      if (checkbox.disabled) selectedConversationIds.delete(id);
+      checkbox.checked = selectedConversationIds.has(id);
+      checkbox.parentElement.hidden = !selectingConversations;
+      const busyHint = checkbox.parentElement.querySelector("span");
+      if (busyHint) {
+        busyHint.hidden = !(activeChat && id === selectedConversationId);
+        if (busyHint.hidden) checkbox.removeAttribute("aria-describedby"); else checkbox.setAttribute("aria-describedby", busyHint.id);
+      }
+    }
+    if (open) open.parentElement.hidden = selectingConversations;
     if (open) open.disabled = blocked || id === selectedConversationId;
     if (remove) remove.disabled = switchingConversation || Boolean(activeChat && id === selectedConversationId);
   }
+  updateConversationSelection();
+}
+function updateConversationSelection() {
+  $("#select-conversations").hidden = selectingConversations;
+  for (const id of ["select-all-conversations", "delete-selected-conversations", "finish-conversation-selection"]) $("#" + id).hidden = !selectingConversations;
+  const count = selectedConversationIds.size;
+  $("#delete-selected-conversations").textContent = `刪除所選（${count}）`;
+  $("#delete-selected-conversations").disabled = !count || count > 500 || switchingConversation;
+  const eligible = [...$("#conversation-list").children].filter(card => card.dataset.conversationId && !card.querySelector("input")?.disabled);
+  $("#select-all-conversations").textContent = eligible.length && eligible.every(card => selectedConversationIds.has(card.dataset.conversationId)) ? "取消全選" : "全選已載入";
+  if (selectingConversations) setConversationHistoryStatus(`已選 ${count} 段。${count > 500 ? "一次最多 500 段，請減少選取。" : ""}`);
+}
+function setConversationsLoadedStatus() {
+  setConversationHistoryStatus(`已載入 ${[...$("#conversation-list").children].filter(card => card.dataset.conversationId).length} 段對話。`);
+}
+function setConversationSelection(enabled) {
+  selectingConversations = enabled; selectedConversationIds.clear(); updateConversationControls();
+  if (!enabled) setConversationsLoadedStatus();
+  if (enabled) {
+    const first = [...$("#conversation-list").children].map(card => card.querySelector("input")).find(input => input && !input.disabled);
+    (first || $("#finish-conversation-selection")).focus();
+  } else $("#select-conversations").focus();
 }
 function renderConversationItem(conversation) {
   const id = String(conversation.id);
   const current = id === selectedConversationId;
   const card = node("article", undefined, "item conversation-item");
   card.dataset.conversationId = id; card.setAttribute("aria-current", String(current));
+  const selection = node("label", undefined, "conversation-selection"); selection.hidden = !selectingConversations;
+  const checkbox = node("input"); checkbox.type = "checkbox";
+  checkbox.setAttribute("aria-label", `選取對話：${conversation.title || "新對話"}`);
+  const busyHint = node("span", "正在回覆，完成或停止後才能選取。", "hint");
+  busyHint.id = `conversation-busy-${id}`; busyHint.hidden = !(activeChat && current);
+  if (activeChat && current) checkbox.setAttribute("aria-describedby", busyHint.id);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.disabled) return;
+    if (checkbox.checked) selectedConversationIds.add(id); else selectedConversationIds.delete(id);
+    updateConversationSelection();
+  });
+  selection.append(checkbox, busyHint); card.append(selection);
   card.append(node("h3", conversation.title || "新對話", "conversation-title"));
   card.append(node("p", `${Number(conversation.message_count) || 0} 則訊息 · 更新 ${formatTaipeiDateTime(conversation.updated_at)}`, "hint"));
   const buttons = node("div", undefined, "row");
@@ -1626,7 +1675,7 @@ async function loadConversations(more = false, query = $("#conversation-query").
   const status = $("#conversation-history-status");
   const list = $("#conversation-list");
   const moreButton = $("#more-conversations");
-  if (!more) { conversationCursor = null; list.replaceChildren(); }
+  if (!more) { selectedConversationIds.clear(); updateConversationSelection(); conversationCursor = null; list.replaceChildren(); }
   status.setAttribute("aria-busy", "true");
   setConversationHistoryStatus(more ? "正在載入更多對話…" : "正在載入對話…");
   moreButton.disabled = true;
@@ -1637,11 +1686,11 @@ async function loadConversations(more = false, query = $("#conversation-query").
     const result = await api(`/api/conversations?${parameters}`);
     if (!csrfToken || requestToken !== csrfToken || request !== conversationListRequest) return null;
     const items = Array.isArray(result?.items) ? result.items : [];
-    if (!more && !items.length) list.append(node("p", query ? "找不到符合的對話。" : "目前沒有對話，按「新對話」開始。", "hint"));
+    if (!more && !items.length) list.append(node("p", query ? "找不到符合的對話。" : "直接輸入訊息即可開始新對話。", "hint"));
     for (const item of items) list.append(renderConversationItem(item));
     conversationCursor = result.next_cursor || null;
     moreButton.hidden = !conversationCursor;
-    setConversationHistoryStatus(`已載入 ${[...list.children].filter(item => item.dataset.conversationId).length} 段對話。`);
+    setConversationsLoadedStatus();
     updateConversationControls();
     return {items, next_cursor: conversationCursor};
   } catch (error) {
@@ -1658,9 +1707,9 @@ function showNoConversations() {
   cancelMessageEdit(false);
   selectedConversationId = null; messageCursor = null; releaseReusableAttachments();
   $("#active-conversation-title").textContent = "尚未選取對話";
-  $("#chat-list").replaceChildren(node("p", "目前沒有對話，按「新對話」開始。", "hint"));
+  $("#chat-list").replaceChildren(node("p", "直接輸入訊息即可開始新對話。", "hint"));
   $("#more-messages").hidden = true; $("#chat-transcript").scrollTop = 0; $("#latest-message").hidden = true;
-  setChatStatus(hadEdit ? "原對話已刪除；編輯文字與附件保留為草稿，新增對話後可另作新訊息。" : "目前沒有對話，請先新增一段對話。", "complete");
+  setChatStatus(hadEdit ? "原對話已刪除；編輯文字與附件保留為草稿，直接送出即可開始新對話。" : "直接輸入訊息即可開始新對話。", "complete");
   updateConversationControls();
 }
 async function openConversation(conversation, closeHistory = true) {
@@ -2480,10 +2529,11 @@ $("#chat-form").addEventListener("submit", async event => {
   event.preventDefault();
   if (activeChat) return;
   if (switchingConversation) { setChatStatus("正在載入另一段對話，請稍候再送出。", "error"); return; }
-  if (!selectedConversationId) { setChatStatus("目前沒有選取的對話，請先新增一段對話。", "error"); return; }
   const input = $("#chat-form [name=text]"); const text = input.value.trim();
   const attachments = [...($("#resume-file").files || [])];
   if (!text) { setChatStatus("請先輸入想說的話。", "error"); return; }
+  if (!selectedConversationId && !await createConversation()) return;
+  if (activeChat || switchingConversation) return;
   if (editOrigin && editOrigin.conversationId !== String(selectedConversationId)) {
     setChatStatus("這則訊息屬於另一段對話；請取消編輯，或切回原對話後再送出。", "error"); return;
   }
@@ -2731,6 +2781,66 @@ $("#rename-conversation-form").addEventListener("submit", async event => {
     }
   } finally { button.disabled = false; }
 });
+async function finishConversationDeletion(ids, requestToken) {
+  const wasSelected = ids.includes(selectedConversationId);
+  if (wasSelected) showNoConversations();
+  let result;
+  try { result = await loadConversations(false); }
+  catch (error) {
+    if (wasSelected) setChatStatus(`對話已刪除，但列表暫時無法更新：${error.message}`, "error");
+    $("#conversation-query").focus(); return;
+  }
+  if (!csrfToken || requestToken !== csrfToken) { return; }
+  if (wasSelected) {
+    let next = result?.items[0];
+    if (!next && $("#conversation-query").value.trim()) {
+      $("#conversation-query").value = "";
+      try { result = await loadConversations(false, ""); next = result?.items[0]; }
+      catch (error) { setChatStatus(`對話已刪除，但列表暫時無法更新：${error.message}`, "error"); }
+    }
+    if (!csrfToken || requestToken !== csrfToken) { return; }
+    if (next) {
+      if (await openConversation(next, false)) setConversationsLoadedStatus();
+    } else showNoConversations();
+  }
+  $("#conversation-query").focus();
+}
+$("#select-conversations").addEventListener("click", () => setConversationSelection(true));
+$("#finish-conversation-selection").addEventListener("click", () => setConversationSelection(false));
+$("#select-all-conversations").addEventListener("click", () => {
+  const eligible = [...$("#conversation-list").children].filter(card => card.dataset.conversationId && !card.querySelector("input")?.disabled);
+  const clear = eligible.every(card => selectedConversationIds.has(card.dataset.conversationId));
+  for (const card of eligible) {
+    if (clear) selectedConversationIds.delete(card.dataset.conversationId); else selectedConversationIds.add(card.dataset.conversationId);
+  }
+  updateConversationControls();
+});
+$("#delete-selected-conversations").addEventListener("click", () => {
+  const count = selectedConversationIds.size;
+  if (!count || count > 500 || switchingConversation) return;
+  $("#bulk-delete-conversation-name").textContent = `確定刪除所選的 ${count} 段對話及其中的訊息嗎？`;
+  $("#bulk-delete-conversation-status").textContent = "";
+  $("#bulk-delete-conversation-dialog").showModal();
+});
+$("#cancel-bulk-delete-conversation").addEventListener("click", () => $("#bulk-delete-conversation-dialog").close());
+$("#confirm-bulk-delete-conversation").addEventListener("click", async () => {
+  const ids = [...selectedConversationIds];
+  if (!ids.length || ids.length > 500 || switchingConversation) return;
+  const requestToken = csrfToken, status = $("#bulk-delete-conversation-status");
+  const button = $("#confirm-bulk-delete-conversation"); button.disabled = true;
+  status.textContent = "正在刪除對話…"; status.classList.toggle("error", false);
+  try {
+    await api("/api/conversations/bulk-delete", {method: "POST", body: JSON.stringify({ids})});
+  } catch (error) {
+    if (csrfToken && requestToken === csrfToken) { status.textContent = error.message; status.classList.toggle("error", true); status.focus(); }
+    button.disabled = false; return;
+  }
+  if (!csrfToken || requestToken !== csrfToken) { button.disabled = false; return; }
+  $("#bulk-delete-conversation-dialog").close();
+  setConversationSelection(false);
+  try { await finishConversationDeletion(ids, requestToken); }
+  finally { button.disabled = false; }
+});
 $("#cancel-delete-conversation").addEventListener("click", () => $("#delete-conversation-dialog").close());
 $("#confirm-delete-conversation").addEventListener("click", async () => {
   const dialog = $("#delete-conversation-dialog");
@@ -2756,27 +2866,8 @@ $("#confirm-delete-conversation").addEventListener("click", async () => {
   }
   if (!csrfToken || requestToken !== csrfToken) { button.disabled = false; return; }
   dialog.close();
-  const wasSelected = String(id) === selectedConversationId;
-  if (wasSelected) showNoConversations();
-  let result;
-  try { result = await loadConversations(false); }
-  catch (error) {
-    if (wasSelected) setChatStatus(`對話已刪除，但列表暫時無法更新：${error.message}`, "error");
-    $("#conversation-query").focus(); button.disabled = false; return;
-  }
-  if (!csrfToken || requestToken !== csrfToken) { button.disabled = false; return; }
-  if (wasSelected) {
-    let next = result?.items[0];
-    if (!next && $("#conversation-query").value.trim()) {
-      $("#conversation-query").value = "";
-      try { result = await loadConversations(false, ""); next = result?.items[0]; }
-      catch (error) { setChatStatus(`對話已刪除，但列表暫時無法更新：${error.message}`, "error"); }
-    }
-    if (!csrfToken || requestToken !== csrfToken) { button.disabled = false; return; }
-    if (next) await openConversation(next, false);
-    else showNoConversations();
-  }
-  $("#conversation-query").focus(); button.disabled = false;
+  try { await finishConversationDeletion([String(id)], requestToken); }
+  finally { button.disabled = false; }
 });
 formAction($("#criteria-form"), async () => {
   try {
