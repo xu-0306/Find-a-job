@@ -118,6 +118,32 @@ class SourceChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError): await task
         self.assertTrue(finished.is_set())
 
+    async def test_104_browser_fallback_after_403_reuses_browser_for_detail(self):
+        from curl_cffi import requests
+        from job104_mcp import server
+        from job104_mcp.browser import BrowserFetcher, BrowserResponse
+
+        with patch('app.sources._bounded_client', None), patch.object(server, '_client'), \
+                patch.object(requests, 'get', side_effect=[BrowserResponse(401, ''), BrowserResponse(403, '')]) as direct, \
+                patch.object(BrowserFetcher, '_fetch_with_retry', side_effect=[
+                    BrowserResponse(200, json.dumps({'data': [], 'metadata': {'pagination': {'total': 0}}})),
+                    BrowserResponse(200, json.dumps({'data': {'header': {'jobName': 'Synthetic'}}})),
+                ]) as browser:
+            service = Sources()
+            with self.assertRaises(SourceError) as caught:
+                await service.call104('search_jobs', {'keyword': 'Python'})
+            self.assertEqual(caught.exception.status, 'blocked')
+            browser.assert_not_called()
+
+            search, raw_search = await service.call104('search_jobs', {'keyword': 'Python'})
+            detail, raw_detail = await service.call104('get_job_detail', {'detail_id': 'abcde'})
+            self.assertEqual(search['jobs'], raw_search['data'])
+            self.assertEqual(detail['job_name'], raw_detail['data']['header']['jobName'])
+            self.assertEqual(direct.call_count, 2)
+            self.assertIn('keyword=Python', browser.call_args_list[0].args[0])
+            browser.assert_called_with('https://www.104.com.tw/job/ajax/content/abcde',
+                                       'https://www.104.com.tw/job/abcde')
+
     async def test_continuation_counts_duplicates_and_advances_pages(self):
         calls = []
 

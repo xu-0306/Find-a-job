@@ -2,7 +2,7 @@
 fastapi
 uvicorn
 httpx
-job104-mcp==0.1.8
+job104-mcp==0.1.10
 APScheduler>=3.11,<4
 Pillow
 pypdf==6.19.0

@@ -111,7 +111,7 @@ def safe_url(url, host, path=None):
 
 def area_catalog():
     from job104_mcp.codes import load_area
-    # Package 0.1.8's published tree includes city and district nodes.
+    # The published tree includes city and district nodes.
     return [{'code': code, 'name': name} for code, name in load_area()._entries]
 
 
@@ -172,7 +172,8 @@ def mcp_once(name, arguments, cancelled):
     """Same-process MCP; its HTTP client is replaced once, never requests.get."""
     global _bounded_client
     from job104_mcp import server
-    from job104_mcp.client import Client, Client104Error
+    from job104_mcp.browser import BrowserFetcher, BrowserResponse
+    from job104_mcp.client import SEARCH_REFERER, Client, Client104Error
     from curl_cffi import requests
 
     while not _mcp_lock.acquire(timeout=.1):
@@ -180,17 +181,70 @@ def mcp_once(name, arguments, cancelled):
             raise SourceError()
     try:
         if _bounded_client is None:
+            class BoundedBrowser(BrowserFetcher):
+                def _call(self, method, **params):
+                    if self.cancelled.is_set() or self.deadline <= time.monotonic():
+                        raise Client104Error('Browser request cancelled or timed out')
+                    self._msg_id += 1
+                    msg_id = self._msg_id
+                    self._ws.send(json.dumps(dict(id=msg_id, method=method, params=params)))
+                    while not self.cancelled.is_set() and (remaining := self.deadline - time.monotonic()) > 0:
+                        try:
+                            message = json.loads(self._ws.recv(timeout=min(remaining, .25)))
+                        except TimeoutError:
+                            continue
+                        if message.get('id') == msg_id:
+                            if 'error' in message:
+                                raise Client104Error('Browser command failed')
+                            return message.get('result', {})
+                    raise Client104Error('Browser request cancelled or timed out')
+
+                def _fetch(self, url, referrer):
+                    # Keep the direct transport's no-redirect boundary in the browser too.
+                    expression = (
+                        "location.origin === 'https://www.104.com.tw' ? "
+                        f"fetch({json.dumps(url)}, {{referrer: {json.dumps(referrer)}, "
+                        "headers: {Accept: 'application/json'}, redirect: 'manual'})"
+                        ".then(async r => ({status: r.status, text: await r.text()})) : null"
+                    )
+                    result = self._call('Runtime.evaluate', expression=expression,
+                                        awaitPromise=True, returnByValue=True)
+                    value = result.get('result', {}).get('value')
+                    return BrowserResponse(value['status'], value['text']) if value else BrowserResponse(403, '')
+
             class BoundedClient(Client):
-                def _get(self, url, params=None):
-                    if not safe_url(url, 'www.104.com.tw'):
+                def _browser_response(self, url, params, referer, deadline):
+                    browser = self._browser
+                    browser.deadline, browser.cancelled = deadline, self.cancelled
+                    if self.cancelled.is_set() or deadline <= time.monotonic():
+                        raise Client104Error('Browser request cancelled or timed out')
+                    if params:
+                        url += '?' + urlencode(params, doseq=True)
+                    try:
+                        response = browser._fetch_with_retry(url, referer)
+                    except Exception:
+                        browser.close()
+                        self._use_browser = False
+                        raise Client104Error('Browser unavailable') from None
+                    self.http_status = response.status_code
+                    if response.status_code != 200:
+                        raise Client104Error('HTTP unavailable')
+                    self._use_browser = True
+                    return response
+
+                def _get(self, url, params=None, referer=SEARCH_REFERER):
+                    if not safe_url(url, 'www.104.com.tw') or not safe_url(referer, 'www.104.com.tw'):
                         raise Client104Error('Unsafe URL')
+                    deadline = time.monotonic() + _HTTP_TIMEOUT_SECONDS
                     for attempt in range(2):
                         if self.cancelled.wait(max(0, 1 - (time.monotonic() - self._last_request))):
                             raise Client104Error('Cancelled')
                         self._last_request = time.monotonic()
+                        if self._use_browser:
+                            return self._browser_response(url, params, referer, deadline)
                         try:
                             response = requests.get(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS, impersonate='chrome',
-                                                    allow_redirects=False, headers={'Referer': 'https://www.104.com.tw/jobs/search/'})
+                                                    allow_redirects=False, headers={'Referer': referer})
                         except Exception:
                             if attempt or self.cancelled.is_set():
                                 raise Client104Error('Network unavailable') from None
@@ -198,6 +252,8 @@ def mcp_once(name, arguments, cancelled):
                         self.http_status = response.status_code
                         if response.status_code == 200:
                             return response
+                        if response.status_code == 403:
+                            return self._browser_response(url, params, referer, deadline)
                         if attempt or response.status_code not in (429, 500, 502, 503, 504):
                             raise Client104Error('HTTP unavailable')
                     raise Client104Error('HTTP unavailable')
@@ -211,7 +267,7 @@ def mcp_once(name, arguments, cancelled):
                         raise Client104Error('Changed pagination')
                     self.raw = raw
                     return raw
-            _bounded_client = BoundedClient()
+            _bounded_client = BoundedClient(browser=BoundedBrowser(start_timeout=5))
             server._client = _bounded_client
         _bounded_client.cancelled = cancelled
         _bounded_client.http_status = None

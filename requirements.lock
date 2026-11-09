@@ -21,7 +21,7 @@ httpcore==1.0.9
 httpx-sse==0.4.3
 httpx==0.28.1
 idna==3.20
-job104-mcp==0.1.8
+job104-mcp==0.1.10
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
 mcp==1.30.0
@@ -51,4 +51,5 @@ tzdata==2026.5
 tzlocal==5.4.4
 urllib3==2.8.0
 uvicorn==0.54.0
+websockets==16.0
 yarl==1.25.1
